@@ -21,6 +21,20 @@ import struct
 import threading
 import subprocess
 import urllib.request
+# Всё нужное грузим сразу: exe из PyInstaller подгружает модули из самого себя по ходу работы,
+# и после самообновления (exe подменён новым) поздняя подгрузка читала бы уже чужой файл.
+import zipfile
+import hashlib
+import random
+import math
+import ctypes
+import ctypes.wintypes
+import webbrowser
+import concurrent.futures
+try:
+    import winreg
+except ImportError:
+    winreg = None
 import urllib.parse
 import urllib.error
 
@@ -1081,7 +1095,6 @@ def merge_usercache(src):
 def backups_dir():
     docs = os.path.join(os.environ.get("USERPROFILE", ""), "Documents")
     try:
-        import winreg
         k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders")
         docs = os.path.expandvars(winreg.QueryValueEx(k, "Personal")[0])
     except Exception:
@@ -1091,7 +1104,6 @@ def backups_dir():
 
 def backup_world(m, log=print):
     """Копия сохранения карты в zip в «Документы\\Minecraft - копии миров»."""
-    import zipfile
     src = os.path.join(SAVES, m["save"])
     if not os.path.isdir(src):
         raise RuntimeError("Карта ещё не установлена: копировать нечего.")
@@ -1139,7 +1151,6 @@ EXE_NAME = "Выбор карты и сборки.exe"
 
 def _shell_folder(name, default):
     try:
-        import winreg
         k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders")
         return os.path.expandvars(winreg.QueryValueEx(k, name)[0])
     except Exception:
@@ -1234,7 +1245,6 @@ def fetch_remote_manifest(timeout=15, tries=6):
 
 
 def _sha1_file(path):
-    import hashlib
     h = hashlib.sha1()
     with open(lp(path), "rb") as fh:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
@@ -1299,7 +1309,6 @@ def block_files(block, root=ROOT, skip=()):
 
 
 def block_hash(files, cache):
-    import hashlib
     h = hashlib.sha1()
     for f in files:
         h.update(("%s\t%s\n" % (f, cache.sha1(f))).encode("utf-8"))
@@ -1378,7 +1387,6 @@ def load_manifest_at(root):
 
 
 def _fetch_to(url, dst, progress=None, expect_sha1=None, cancel=None):
-    import hashlib
     last = None
     for attempt in range(4):
         try:
@@ -1407,11 +1415,21 @@ def _fetch_to(url, dst, progress=None, expect_sha1=None, cancel=None):
     raise RuntimeError("не удалось скачать %s: %s" % (url.rsplit("/", 1)[-1], last))
 
 
-def recycle(path):
-    """В Корзину. Возвращает True, если получилось."""
+def recycle(path, tries=4, log=None):
+    """В Корзину. Свежие файлы бывают заняты антивирусом, поэтому несколько попыток с паузой."""
+    for i in range(tries):
+        code = _recycle_once(path)
+        if code == 0 and not os.path.exists(path):
+            return True
+        if log:
+            log("Корзина пока не принимает старые файлы (код %s), пробую ещё раз" % code)
+        time.sleep(1.5 * (i + 1))
+    return False
+
+
+def _recycle_once(path):
     try:
-        import ctypes
-        from ctypes import wintypes
+        wintypes = ctypes.wintypes
 
         class SHFILEOPSTRUCTW(ctypes.Structure):
             _fields_ = [("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT), ("pFrom", wintypes.LPCWSTR),
@@ -1419,9 +1437,9 @@ def recycle(path):
                         ("hNameMappings", ctypes.c_void_p), ("lpszProgressTitle", wintypes.LPCWSTR)]
         op = SHFILEOPSTRUCTW(None, 3, os.path.abspath(path) + "\0\0", None, 0x0040 | 0x0010 | 0x0004 | 0x0400, False,
                              None, None)
-        return ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op)) == 0 and not os.path.exists(path)
-    except Exception:
-        return False
+        return ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+    except Exception as e:
+        return str(e)
 
 
 def _move(src, dst):
@@ -1431,7 +1449,6 @@ def _move(src, dst):
 
 def apply_update(remote, plan, root=ROOT, log=print, progress=None, cancel=None):
     """Скачивает и раскладывает обновление. Возвращает {'restart': bool, 'trash': путь или None}."""
-    import zipfile
     upd = os.path.join(root, "_update")
     dl = os.path.join(upd, "dl")
     stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
@@ -1458,7 +1475,7 @@ def apply_update(remote, plan, root=ROOT, log=print, progress=None, cancel=None)
     files = plan["files"]
     if files:
         log("Скачиваю моды с Modrinth: %d" % len(files))
-        from concurrent.futures import ThreadPoolExecutor
+        ThreadPoolExecutor = concurrent.futures.ThreadPoolExecutor
         lock = threading.Lock()
 
         def one(f):
@@ -1482,19 +1499,10 @@ def apply_update(remote, plan, root=ROOT, log=print, progress=None, cancel=None)
     restart = False
     skip = _skip_set(remote)
     for b in plan["blocks"]:
+        if b["kind"] == "app":
+            continue  # программу меняем последней, см. ниже
         log("Устанавливаю: %s" % b["title"])
         src = os.path.join(dl, b["asset"])
-        if b["kind"] == "app":
-            target = os.path.join(root, b["path"])
-            running = getattr(sys, "frozen", False) and os.path.abspath(sys.executable) == os.path.abspath(target)
-            if os.path.exists(target):
-                if running:
-                    os.replace(target, target + ".old")
-                    restart = True
-                else:
-                    _move(target, os.path.join(old_dir, b["path"]))
-            shutil.copy2(src, target)
-            continue
         stage = os.path.join(upd, "new")
         if os.path.isdir(stage):
             shutil.rmtree(lp(stage), ignore_errors=True)
@@ -1528,12 +1536,32 @@ def apply_update(remote, plan, root=ROOT, log=print, progress=None, cancel=None)
             pass
     with open(os.path.join(root, "manifest.json"), "w", encoding="utf-8") as fh:
         json.dump(remote, fh, ensure_ascii=False, indent=1)
-    shutil.rmtree(lp(dl), ignore_errors=True)
     trash = None
     if os.path.isdir(old_dir):
-        if not recycle(old_dir):
+        if not recycle(old_dir, log=log):
             trash = os.path.join(root, "_Старое после обновления " + stamp)
             os.replace(old_dir, trash)
+    for b in plan["blocks"]:
+        if b["kind"] != "app":
+            continue
+        log("Устанавливаю: %s" % b["title"])
+        target = os.path.join(root, b["path"])
+        running = getattr(sys, "frozen", False) and os.path.abspath(sys.executable) == os.path.abspath(target)
+        if os.path.exists(target):
+            if running:
+                if os.path.exists(target + ".old"):
+                    os.remove(target + ".old")
+                os.replace(target, target + ".old")
+                restart = True
+            else:
+                os.replace(target, target + ".old")
+        shutil.copy2(os.path.join(dl, b["asset"]), target)
+        if not running:
+            try:
+                os.remove(target + ".old")
+            except OSError:
+                pass
+    shutil.rmtree(lp(dl), ignore_errors=True)
     log("Обновление %s установлено" % remote.get("version"))
     return {"restart": restart, "trash": trash}
 
@@ -1815,8 +1843,6 @@ def gui():
         head.create_text(28 + dx, 52 + dy, text="MINECRAFT", font=(FONT, 26, "bold"), fill=color, anchor="w")
     head.create_text(31, 89, text="карты  ·  сборки  ·  серверы", font=(FONT, 12), fill="#000000", anchor="w")
     head.create_text(30, 88, text="карты  ·  сборки  ·  серверы", font=(FONT, 12), fill="#d7deea", anchor="w")
-    import random
-    import math
     rnd = random.Random(7)
     stars = []
     for _ in range(16):
@@ -2975,7 +3001,6 @@ def gui():
                 show("launchers")
 
             def site(x=x):
-                import webbrowser
                 webbrowser.open(x["site"])
                 toast("Открываю официальный сайт: " + x["site"], "info")
             big_button(row, "Скачать с сайта", site, color=CARD_HI, hover=LINE).pack(side="right")
@@ -3260,6 +3285,12 @@ def gui():
         def gone():
             splash.destroy()
             win.deiconify()
+            win.state("normal")  # Windows иногда показывает первое окно свёрнутым (зависит от того, кто запустил)
+            win.lift()
+            try:
+                win.focus_force()
+            except tk.TclError:
+                pass
             try:
                 win.attributes("-alpha", 0.0)
             except tk.TclError:
@@ -3289,5 +3320,6 @@ def gui():
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
+        cleanup_after_update()
         sys.exit(cli(sys.argv[1:]))
     gui()
