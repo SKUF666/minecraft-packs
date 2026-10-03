@@ -352,6 +352,12 @@ def find_packs():
             m["path"] = os.path.join(vp, pdir)
             m["version_dir"] = vdir
             m["count"] = len(jars(os.path.join(vp, pdir, "mods")))
+            if not m["count"]:
+                try:
+                    with open(os.path.join(vp, pdir, "mods.json"), encoding="utf-8") as fh:
+                        m["count"] = len(json.load(fh).get("mods", []))
+                except Exception:
+                    pass
             packs.append(m)
     return packs
 
@@ -373,7 +379,26 @@ def known_files(packs):
     return known
 
 
+def missing_items(m=None, pack=None, packs=None):
+    """Какие части (карта, сборка) ещё не скачаны: их id из описи."""
+    man = load_local_manifest()
+    ids = []
+    if m is not None:
+        it = manifest_item(man, map_item_id(m))
+        if it and not item_downloaded(it):
+            ids.append(it["id"])
+        if not pack and m.get("requires_pack"):
+            pack = next((p for p in (packs or find_packs()) if p["name"] == m.get("recommended")), None)
+    if pack is not None:
+        it = manifest_item(man, pack_item_id(pack))
+        if it and not item_downloaded(it):
+            ids.append(it["id"])
+    return ids
+
+
 def switch(pack, packs, copy_configs=True, log=print):
+    if missing_items(pack=pack):
+        raise RuntimeError("Сборка «%s» ещё не скачана." % pack["name"])
     os.makedirs(MODS, exist_ok=True)
     known = known_files(packs)
 
@@ -502,6 +527,8 @@ def packs_for_map(m, packs):
 
 def install_map(m, pack=None, fresh=False, packs=None, log=print):
     """Ставит мир в saves, включает сборку или чистую версию и выбирает её в TLauncher."""
+    if missing_items(m, pack, packs):
+        raise RuntimeError("Карта «%s» или её сборка ещё не скачана." % m["title"])
     os.makedirs(SAVES, exist_ok=True)
     dst = os.path.join(SAVES, m["save"])
     if os.path.isdir(dst) and fresh:
@@ -1197,18 +1224,27 @@ def create_shortcuts():
     return made
 
 
-# ---------- обновления через GitHub ----------
+# ---------- каталог и загрузки ----------
 #
-# В релизе на GitHub лежат manifest.json (опись версии) и архивы «блоков»: core (файлы в корне),
-# app (сама программа), по одному на каждую сборку и карту. Моды, которые есть на Modrinth,
-# качаются прямо оттуда (manifest["files"]). Программа сравнивает хеши своих файлов с описью
-# и скачивает только изменившиеся блоки. Старое уносит в Корзину.
+# Описания карт и сборок (map.json, pack.json, mods.json, обложки) лежат рядом с программой всегда:
+# это каталог. Содержимое карты или сборки скачивается, только когда её выбирают, и берётся из
+# исходных мест: моды - с Modrinth и CurseForge, карты - с сайтов авторов (minecraft-inside.ru,
+# skyblock.net, ijaminecraft.com, minecraftmaps.com), клиент Minecraft - с серверов Mojang.
+# В релизе на GitHub лежат только наши файлы: программа, описания, конфиги сборок.
+# manifest.json - опись версии: items (core, app, pack:<папка>, map:<id>) и archives (исходные архивы).
+# У каждой части свой список файлов list-*.json: путь, sha1, размер и откуда взять (src):
+#   own - из нашего архива части на GitHub, url - прямая ссылка, arc - файл внутри исходного архива,
+#   arcfile - сам исходный архив, zpatch - скачать оригинал и заменить в нём несколько файлов.
 
 REPO = "SKUF666/minecraft-packs"
 REMOTE_MANIFEST = "https://github.com/%s/releases/latest/download/manifest.json" % REPO
 LOCAL_MANIFEST = os.path.join(ROOT, "manifest.json")
 UPD_DIR = os.path.join(ROOT, "_update")
 _JUNK = ("__pycache__", "desktop.ini", "thumbs.db", ".ds_store", "switcher_cli.log")
+UA_BROWSER = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/140.0 Safari/537.36")
+META_NAMES = ("map.json", "pack.json", "mods.json", "cover.png", "cover_big.png")
+ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
 
 
 def vtuple(v):
@@ -1218,30 +1254,43 @@ def vtuple(v):
         return (0,)
 
 
-def load_local_manifest():
+def load_local_manifest(root=ROOT):
     try:
-        with open(LOCAL_MANIFEST, encoding="utf-8") as fh:
+        with open(os.path.join(root, "manifest.json"), encoding="utf-8") as fh:
             return json.load(fh)
     except Exception:
         return {}
 
 
-def fetch_remote_manifest(timeout=15, tries=6):
-    """Опись последней версии. GitHub иногда отвечает 503, поэтому несколько попыток."""
+load_manifest_at = load_local_manifest
+
+
+def _get(url, timeout=30, tries=6, headers=None):
+    """Небольшой файл целиком. GitHub иногда отвечает 503, поэтому несколько попыток разными путями."""
     last = None
     for i in range(tries):
-        req = urllib.request.Request(REMOTE_MANIFEST + "?t=%d" % int(time.time() * 1000),
-                                     headers={"User-Agent": "MinecraftPacks/3.0", "Cache-Control": "no-cache"})
+        req = urllib.request.Request(url, headers=dict({"User-Agent": "MinecraftPacks/4.0"}, **(headers or {})))
         try:
-            return json.loads(urlopen(req, timeout, i).read().decode("utf-8"))
+            return urlopen(req, timeout, i).read()
         except urllib.error.HTTPError as e:
             last = e
             if e.code == 404:
-                raise RuntimeError("на GitHub ещё нет ни одной версии")
+                raise RuntimeError("на GitHub нет файла %s" % url.rsplit("/", 1)[-1].split("?")[0])
         except Exception as e:
             last = e
         time.sleep(1.0 + i)
     raise RuntimeError(str(last))
+
+
+def fetch_remote_manifest(timeout=15, tries=6):
+    """Опись последней версии с GitHub."""
+    data = _get(REMOTE_MANIFEST + "?t=%d" % int(time.time() * 1000), timeout, tries, {"Cache-Control": "no-cache"})
+    return json.loads(data.decode("utf-8"))
+
+
+def asset_url(man, name):
+    return "https://github.com/%s/releases/download/%s/%s" % (man.get("repo", REPO), man.get("tag", "library"),
+                                                               urllib.parse.quote(name))
 
 
 def _sha1_file(path):
@@ -1287,8 +1336,8 @@ class HashCache:
 def _walk_rel(root, base):
     """Файлы папки base (относительно root) в виде путей через «/»."""
     out = []
-    top = os.path.join(root, base)
-    if os.path.isfile(lp(top)):
+    top = os.path.join(root, base) if base else root
+    if base and os.path.isfile(lp(top)):
         return [base.replace("\\", "/")]
     for d, dirs, files in os.walk(lp(top)):
         dirs[:] = [x for x in dirs if x.lower() not in _JUNK]
@@ -1300,97 +1349,274 @@ def _walk_rel(root, base):
     return out
 
 
-def block_files(block, root=ROOT, skip=()):
-    """Файлы блока без внешних (Modrinth) и личных (local_only)."""
-    files = []
-    for p in block.get("paths") or [block["path"]]:
-        files += _walk_rel(root, p)
-    return sorted(f for f in files if f not in skip)
-
-
 def block_hash(files, cache):
+    """Хеш набора файлов: sha1 от строк «путь<TAB>sha1» по порядку путей."""
     h = hashlib.sha1()
-    for f in files:
+    for f in sorted(files):
         h.update(("%s\t%s\n" % (f, cache.sha1(f))).encode("utf-8"))
     return h.hexdigest()
 
 
-def _skip_set(man):
-    return {f["path"] for f in man.get("files", [])} | set(man.get("local_only", []))
-
-
-def plan_update(remote, root=ROOT, log=print):
-    """Что скачать и что убрать, чтобы папка совпала с описью remote."""
-    cache = HashCache(root)
-    skip = _skip_set(remote)
-    blocks, files = [], []
-    local_only = set(remote.get("local_only", []))
-    for b in remote.get("blocks", []):
-        if b.get("local_only") or b.get("path") in local_only:
-            continue
-        log("Проверяю: %s" % b["title"])
-        have = block_files(b, root, skip)
-        if not have or block_hash(have, cache) != b["hash"]:
-            blocks.append(b)
-    for f in remote.get("files", []):
-        full = os.path.join(root, f["path"])
-        try:
-            ok = os.path.isfile(lp(full)) and cache.sha1(f["path"]) == f["sha1"]
-        except OSError:
-            ok = False
-        if not ok:
-            files.append(f)
-    cache.save()
-    # Сборки и карты, которые были в прошлой версии, а в новой их нет.
-    old = load_manifest_at(root)
-    new_dirs = {b["path"] for b in remote.get("blocks", []) if b["kind"] in ("pack", "map")}
-    old_dirs = set()
-    for b in old.get("blocks", []):
-        if b["kind"] in ("pack", "map"):
-            old_dirs.add(b["path"])
-    old_dirs |= set(old.get("packs", {}))
-    old_dirs |= {"Карты/" + k for k in old.get("maps", {})}
-    if not new_dirs:
-        raise RuntimeError("опись на GitHub пустая или повреждена, обновление пропущено")
-    remove = sorted(d for d in old_dirs - new_dirs - local_only if os.path.isdir(lp(os.path.join(root, d))))
-    # Файлы и папки в корне, которые прошлая версия раскладывала, а новая уже нет.
-    core_new = set()
-    for b in remote.get("blocks", []):
-        if b["kind"] in ("core", "app"):
-            core_new |= set(b.get("paths") or [b["path"]])
-    core_old = set(old.get("root", []))
-    for b in old.get("blocks", []):
-        if b["kind"] == "core":
-            core_old |= set(b.get("paths", []))
-    keep = {"manifest.json", EXE_NAME}
-    remove += sorted(p for p in core_old - core_new - keep - new_dirs
-                     if "/" not in p and not p.startswith("_") and os.path.exists(lp(os.path.join(root, p)))
-                     and not any(p == d.split("/")[0] for d in new_dirs))
-    # Лишние моды в сборках, которые сами не изменились (мод убрали из сборки).
-    for b in remote.get("blocks", []):
-        if b["kind"] != "pack" or "jars" not in b or b in blocks:
-            continue
-        pre = b["path"] + "/mods/"
-        allowed = set(b["jars"]) | {f["path"][len(pre):] for f in remote.get("files", []) if f["path"].startswith(pre)}             | {x[len(pre):] for x in local_only if x.startswith(pre)}
-        remove += [pre + j for j in jars(os.path.join(root, b["path"], "mods")) if j not in allowed]
-    size = sum(b.get("size", 0) for b in blocks) + sum(f.get("size", 0) for f in {x["sha1"]: x for x in files}.values())
-    return {"version": remote.get("version"), "blocks": blocks, "files": files, "remove": remove, "size": size,
-            "changes": remote.get("changes", [])}
-
-
-def load_manifest_at(root):
+def zip_member_name(info):
+    """Имя файла в zip. Старые архивы хранят русские имена в cp866 без пометки utf-8."""
+    if info.flag_bits & 0x800:
+        return info.filename
     try:
-        with open(os.path.join(root, "manifest.json"), encoding="utf-8") as fh:
-            return json.load(fh)
+        return info.filename.encode("cp437").decode("cp866")
     except Exception:
-        return {}
+        return info.filename
 
 
-def _fetch_to(url, dst, progress=None, expect_sha1=None, cancel=None):
-    last = None
-    for attempt in range(4):
+def zpatch_build(src, dst, setmap):
+    """Пересобирает zip с заменой файлов. Без сжатия и с фиксированной датой, чтобы sha1 у всех совпадал."""
+    with zipfile.ZipFile(lp(src)) as zin, zipfile.ZipFile(lp(dst), "w", zipfile.ZIP_STORED) as zout:
+        for i in zin.infolist():
+            if i.is_dir():
+                continue
+            data = setmap[i.filename].encode("utf-8") if i.filename in setmap else zin.read(i)
+            zi = zipfile.ZipInfo(i.filename, date_time=ZIP_EPOCH)
+            zi.compress_type = zipfile.ZIP_STORED
+            zi.create_system = 0
+            zi.external_attr = 0
+            zout.writestr(zi, data)
+
+
+# --- части библиотеки ---
+
+def manifest_item(man, item_id):
+    return next((i for i in man.get("items", []) if i["id"] == item_id), None)
+
+
+def map_item_id(m):
+    return "map:" + os.path.basename(m["path"])
+
+
+def pack_item_id(p):
+    return "pack:" + os.path.relpath(p["path"], ROOT).replace("\\", "/")
+
+
+def item_content(item, root=ROOT):
+    """Файлы содержимого карты или сборки: всё в её папке, кроме описаний (map.json, pack.json, обложки)."""
+    base = item["path"]
+    depth = base.count("/") + 1
+    return sorted(f for f in _walk_rel(root, base)
+                  if not (f.count("/") == depth and f.rsplit("/", 1)[1] in META_NAMES))
+
+
+def item_downloaded(item, root=ROOT):
+    if not item or item["kind"] in ("core", "app"):
+        return True
+    p = os.path.join(root, item["path"])
+    try:
+        return any(f not in META_NAMES for f in os.listdir(lp(p)))
+    except OSError:
+        return False
+
+
+def downloaded_ids(man, root=ROOT):
+    return {i["id"] for i in man.get("items", []) if i["kind"] in ("pack", "map") and item_downloaded(i, root)}
+
+
+def fetch_list(man, item, root=ROOT):
+    """Список файлов части (кэшируется в _update/lists)."""
+    d = os.path.join(root, "_update", "lists")
+    os.makedirs(d, exist_ok=True)
+    p = os.path.join(d, item["list"])
+    if os.path.isfile(p):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "MinecraftPacks/3.0"})
+            with open(p, encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception:
+            pass
+    data = _get(asset_url(man, item["list"]))
+    if item.get("list_sha1") and hashlib.sha1(data).hexdigest() != item["list_sha1"]:
+        raise RuntimeError("список файлов «%s» скачался с ошибкой" % item["title"])
+    lst = json.loads(data.decode("utf-8"))
+    with open(p, "wb") as fh:
+        fh.write(data)
+    return lst
+
+
+def plan_items(man, items, root=ROOT, log=print):
+    """Какие файлы скачать и какие лишние убрать, чтобы части items совпали с описью man."""
+    cache = HashCache(root)
+    need, extra = [], []
+    for it in items:
+        log("Проверяю: %s" % it["title"])
+        lst = fetch_list(man, it, root)["files"]
+        want = {f["p"] for f in lst}
+        for f in lst:
+            try:
+                ok = os.path.isfile(lp(os.path.join(root, f["p"]))) and cache.sha1(f["p"]) == f["s"]
+            except OSError:
+                ok = False
+            if not ok:
+                need.append(dict(f, item=it["id"]))
+        if it["kind"] in ("pack", "map"):
+            extra += [rel for rel in item_content(it, root) if rel not in want]
+    cache.save()
+    return {"need": need, "extra": extra, "remove": [], "items": [i["id"] for i in items]}
+
+
+def plan_size(man, plan):
+    """Сколько примерно скачивать: исходные архивы целиком, прямые ссылки, наши архивы частей."""
+    archives = {a["id"]: a for a in man.get("archives", [])}
+    urls, arcs, own = {}, set(), set()
+    for f in plan["need"]:
+        s = f["src"]
+        if s["t"] == "url":
+            urls[f["s"]] = f["z"]
+        elif s["t"] in ("arc", "arcfile"):
+            arcs.add(s["a"])
+        elif s["t"] == "zpatch":
+            urls[s["us"]] = s.get("uz", f["z"])
+        else:
+            own.add(f["item"])
+    return (sum(urls.values()) + sum(archives[a]["size"] for a in arcs if a in archives)
+            + sum((manifest_item(man, i) or {}).get("own_size", 0) for i in own))
+
+
+def plan_sources(man, plan):
+    """Откуда будет скачиваться: для окна «Скачаю ...»."""
+    archives = {a["id"]: a for a in man.get("archives", [])}
+    hosts = []
+    for f in plan["need"]:
+        s = f["src"]
+        if s["t"] in ("arc", "arcfile") and s["a"] in archives:
+            u = archives[s["a"]].get("url") or archives[s["a"]].get("page", "")
+        elif s["t"] in ("url", "zpatch"):
+            u = s.get("u", "")
+        else:
+            u = "github.com"
+        h = urllib.parse.urlparse(u).netloc or u
+        h = {"cdn.modrinth.com": "Modrinth", "mediafilez.forgecdn.net": "CurseForge",
+             "piston-data.mojang.com": "Mojang", "api.skyblock.net": "skyblock.net"}.get(h, h.replace("www.", ""))
+        if h not in hosts:
+            hosts.append(h)
+    return hosts
+
+
+def plan_update(remote, root=ROOT, log=print, extra_items=()):
+    """Обновление: файлы программы, каталог и уже скачанные карты и сборки (+ extra_items)."""
+    old = load_manifest_at(root)
+    if not remote.get("items"):
+        raise RuntimeError("опись на GitHub пустая или повреждена, обновление пропущено")
+    have = downloaded_ids(remote, root) | set(extra_items)
+    # Прошлая версия программы (до 2026.10.05) хранила части по-другому: считаем скачанным всё, что лежит.
+    items = [i for i in remote["items"] if i["kind"] in ("core", "app") or i["id"] in have]
+    plan = plan_items(remote, items, root, log)
+    new_ids = {i["id"] for i in remote["items"]}
+    new_dirs = {i["path"] for i in remote["items"] if i["kind"] in ("pack", "map")}
+    # Карты и сборки, которых в новой версии нет: целиком в Корзину (только те, что были нашими).
+    old_dirs = {i["path"] for i in old.get("items", []) if i["kind"] in ("pack", "map") and i["id"] not in new_ids}
+    old_dirs |= {b["path"] for b in old.get("blocks", []) if b["kind"] in ("pack", "map")}
+    old_dirs |= set(old.get("packs", {})) | {"Карты/" + k for k in old.get("maps", {})}
+    remove = sorted(d for d in old_dirs - new_dirs if os.path.isdir(lp(os.path.join(root, d))))
+    # Файлы каталога и корня, которые прошлая версия раскладывала, а новая нет.
+    core = manifest_item(remote, "core")
+    new_core = {f["p"] for f in fetch_list(remote, core, root)["files"]} if core else set()
+    old_core = set()
+    oc = manifest_item(old, "core")
+    if oc:
+        p = os.path.join(root, "_update", "lists", oc.get("list", "-"))
+        try:
+            with open(p, encoding="utf-8") as fh:
+                old_core = {f["p"] for f in json.load(fh)["files"]}
+        except Exception:
+            pass
+    tops_new = {p.split("/")[0] for p in new_core} | {d.split("/")[0] for d in new_dirs} | {"manifest.json", EXE_NAME}
+    for name in old.get("root", []):
+        # Из старой описи корня убираем только файлы (например «Переключатель сборок.exe»), не папки:
+        # в папке версии может лежать своя сборка друга.
+        if "/" not in name and name not in tops_new and not name.startswith("_") \
+                and os.path.isfile(lp(os.path.join(root, name))):
+            old_core.add(name)
+    for p in sorted(old_core - new_core):
+        if p in ("manifest.json", EXE_NAME) or any(p == d or p.startswith(d + "/") for d in new_dirs):
+            continue
+        if os.path.isfile(lp(os.path.join(root, p))):
+            remove.append(p)
+    plan["remove"] = sorted(set(remove))
+    plan["version"] = remote.get("version")
+    plan["changes"] = remote.get("changes", [])
+    plan["size"] = plan_size(remote, plan)
+    return plan
+
+
+def plan_download(remote, item_ids, root=ROOT, log=print):
+    """Скачать карты и сборки item_ids. Если вышла новая версия, заодно обновить всё остальное."""
+    local = load_manifest_at(root)
+    if local.get("version") != remote.get("version") or not local.get("items"):
+        plan = plan_update(remote, root, log, item_ids)
+        plan["with_update"] = True
+        return plan
+    items = [manifest_item(remote, i) for i in item_ids]
+    plan = plan_items(remote, [i for i in items if i], root, log)
+    plan["size"] = plan_size(remote, plan)
+    plan["version"] = remote.get("version")
+    return plan
+
+
+def downloads_dir():
+    return _shell_folder("{374DE290-123F-4565-9164-39C4925E467B}",
+                         os.path.join(os.environ.get("USERPROFILE", ""), "Downloads"))
+
+
+def find_archive_copy(a, root=ROOT):
+    """Исходный архив, который уже есть: в кэше программы или в «Загрузках» (под любым именем)."""
+    cands = [os.path.join(root, "_update", "archives", a["name"])]
+    dl = downloads_dir()
+    try:
+        for f in os.listdir(dl):
+            p = os.path.join(dl, f)
+            if f == a["name"] or (f.lower().endswith(".zip") and os.path.getsize(p) == a["size"]):
+                cands.append(p)
+    except OSError:
+        pass
+    for p in cands:
+        try:
+            if os.path.isfile(p) and os.path.getsize(p) == a["size"] and _sha1_file(p) == a["sha1"]:
+                return p
+        except OSError:
+            pass
+    return None
+
+
+def wait_archive_in_downloads(a, cancel=None, timeout=1800, manual=None):
+    """Ждёт, пока человек скачает архив в браузере: файл нужного размера в «Загрузках» (или выбранный вручную)."""
+    t0 = time.time()
+    seen = set()
+    while time.time() - t0 < timeout:
+        if cancel and cancel.is_set():
+            raise RuntimeError("отменено")
+        if manual and manual.get("file"):
+            p = manual.pop("file")
+            if os.path.isfile(p) and _sha1_file(p) == a["sha1"]:
+                return p
+            manual["bad"] = p
+        dl = downloads_dir()
+        try:
+            for f in os.listdir(dl):
+                p = os.path.join(dl, f)
+                if p in seen or f.endswith((".crdownload", ".part", ".tmp")):
+                    continue
+                if os.path.getsize(p) == a["size"]:
+                    seen.add(p)
+                    if _sha1_file(p) == a["sha1"]:
+                        return p
+        except OSError:
+            pass
+        time.sleep(2)
+    raise RuntimeError("не дождался файла %s в «Загрузках»" % a["name"])
+
+
+def _fetch_to(url, dst, progress=None, expect_sha1=None, cancel=None, headers=None):
+    last = None
+    os.makedirs(os.path.dirname(lp(dst)), exist_ok=True)
+    for attempt in range(4):
+        got = 0
+        try:
+            req = urllib.request.Request(url, headers=dict({"User-Agent": "MinecraftPacks/4.0"}, **(headers or {})))
             h = hashlib.sha1()
             with urlopen(req, 60, attempt) as r, open(lp(dst) + ".part", "wb") as out:
                 while True:
@@ -1401,6 +1627,7 @@ def _fetch_to(url, dst, progress=None, expect_sha1=None, cancel=None):
                         break
                     out.write(chunk)
                     h.update(chunk)
+                    got += len(chunk)
                     if progress:
                         progress(len(chunk))
             if expect_sha1 and h.hexdigest() != expect_sha1:
@@ -1409,10 +1636,37 @@ def _fetch_to(url, dst, progress=None, expect_sha1=None, cancel=None):
             return
         except Exception as e:
             last = e
+            if progress and got:
+                progress(-got)
             if cancel and cancel.is_set():
                 raise
             time.sleep(1 + attempt * 2)
-    raise RuntimeError("не удалось скачать %s: %s" % (url.rsplit("/", 1)[-1], last))
+    raise RuntimeError("не удалось скачать %s: %s" % (urllib.parse.unquote(url.rsplit("/", 1)[-1]), last))
+
+
+def get_archive(man, a, root, tick, cancel, ask_browser, log):
+    hit = find_archive_copy(a, root)
+    if hit:
+        log("Беру уже скачанный %s" % os.path.basename(hit))
+        tick(a["size"])
+        return hit
+    dst = os.path.join(root, "_update", "archives", a["name"])
+    err = None
+    if a.get("url") and not a.get("browser"):
+        site = urllib.parse.urlparse(a["url"]).netloc.replace("www.", "")
+        log("Скачиваю с %s: %s (%s)" % (site, a["name"], fmt_mb(a["size"])))
+        try:
+            _fetch_to(a["url"], dst, tick, a["sha1"], cancel, {"User-Agent": UA_BROWSER, "Referer": a.get("page", "")})
+            return dst
+        except Exception as e:
+            if cancel and cancel.is_set():
+                raise
+            err = e
+    if ask_browser:
+        p = ask_browser(a, err)
+        tick(a["size"])
+        return p
+    raise RuntimeError("архив %s нужно скачать вручную со страницы %s (%s)" % (a["name"], a.get("page"), err or ""))
 
 
 def recycle(path, tries=4, log=None):
@@ -1447,123 +1701,199 @@ def _move(src, dst):
     os.replace(lp(src), lp(dst))
 
 
-def apply_update(remote, plan, root=ROOT, log=print, progress=None, cancel=None):
-    """Скачивает и раскладывает обновление. Возвращает {'restart': bool, 'trash': путь или None}."""
+def _write(path, data):
+    os.makedirs(os.path.dirname(lp(path)), exist_ok=True)
+    with open(lp(path), "wb") as fh:
+        fh.write(data)
+
+
+def apply_plan(man, plan, root=ROOT, log=print, progress=None, cancel=None, ask_browser=None):
+    """Скачивает нужные файлы из всех источников, проверяет sha1 и раскладывает. Старое - в Корзину.
+    Возвращает {'restart': exe заменён, нужен перезапуск; 'trash': папка со старым, если Корзина не приняла}."""
+    ThreadPoolExecutor = concurrent.futures.ThreadPoolExecutor
     upd = os.path.join(root, "_update")
-    dl = os.path.join(upd, "dl")
     stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+    stage = os.path.join(upd, "new_" + stamp)
+    dl = os.path.join(upd, "dl")
     old_dir = os.path.join(upd, "old_" + stamp)
-    os.makedirs(dl, exist_ok=True)
-    tag = remote.get("tag", "library")
-    base = "https://github.com/%s/releases/download/%s/" % (remote.get("repo", REPO), tag)
-    total = max(1, plan["size"])
+    total = max(1, plan_size(man, plan))
     done = [0]
+    lock = threading.Lock()
 
     def tick(n):
-        done[0] += n
-        if progress:
-            progress(done[0], total)
+        with lock:
+            done[0] += n
+            if progress:
+                progress(max(0, done[0]), total)
 
-    # 1. Скачать всё заранее: если связь оборвётся, папка останется как была.
-    for i, b in enumerate(plan["blocks"], 1):
-        log("Скачиваю %d из %d: %s (%.0f МБ)" % (i, len(plan["blocks"]), b["title"], b.get("size", 0) / 1048576))
-        dst = os.path.join(dl, b["asset"])
-        if os.path.isfile(dst) and _sha1_file(dst) == b.get("asset_sha1"):
-            tick(b.get("size", 0))
-            continue
-        _fetch_to(base + urllib.parse.quote(b["asset"]), dst, tick, b.get("asset_sha1"), cancel)
-    files = plan["files"]
-    if files:
-        log("Скачиваю моды с Modrinth: %d" % len(files))
-        ThreadPoolExecutor = concurrent.futures.ThreadPoolExecutor
-        lock = threading.Lock()
+    archives = {a["id"]: a for a in man.get("archives", [])}
+    need = plan["need"]
+    staged = {}
 
-        def one(f):
-            dst = os.path.join(dl, "f_" + f["sha1"])
-            if not (os.path.isfile(dst) and _sha1_file(dst) == f["sha1"]):
-                def t(n):
-                    with lock:
-                        tick(n)
-                _fetch_to(f["url"], dst, t, f["sha1"], cancel)
+    def put(f, data):
+        if hashlib.sha1(data).hexdigest() != f["s"]:
+            raise RuntimeError("файл %s не совпал с описью (источник изменился?)" % f["p"])
+        _write(os.path.join(stage, f["p"]), data)
+        staged[f["p"]] = True
+
+    try:
+        # 1. Наши файлы: архив части с GitHub.
+        own = {}
+        for f in need:
+            if f["src"]["t"] == "own":
+                own.setdefault(f["item"], []).append(f)
+        for iid, files in own.items():
+            it = manifest_item(man, iid)
+            log("Скачиваю с GitHub: %s" % it["title"])
+            zp = os.path.join(dl, it["own"])
+            if not (os.path.isfile(zp) and _sha1_file(zp) == it.get("own_sha1")):
+                _fetch_to(asset_url(man, it["own"]), zp, tick, it.get("own_sha1"), cancel)
             else:
-                with lock:
-                    tick(f.get("size", 0))
-        uniq = list({f["sha1"]: f for f in files}.values())  # один и тот же мод бывает в нескольких сборках
-        with ThreadPoolExecutor(4) as ex:
-            for r in ex.map(one, uniq):
-                pass
-    if cancel and cancel.is_set():
-        raise RuntimeError("отменено")
+                tick(it.get("own_size", 0))
+            with zipfile.ZipFile(lp(zp)) as z:
+                for f in files:
+                    put(f, z.read(f["p"]))
+        # 2. Прямые ссылки (Modrinth, CurseForge, Mojang): каждый файл один раз, по 4 сразу.
+        urls = {}
+        for f in need:
+            if f["src"]["t"] == "url":
+                urls.setdefault(f["s"], []).append(f)
+        if urls:
+            log("Скачиваю моды и файлы с Modrinth, CurseForge и Mojang: %d" % len(urls))
 
-    # 2. Разложить. Старые версии файлов уходят в _update/old_<время>, потом в Корзину.
-    restart = False
-    skip = _skip_set(remote)
-    for b in plan["blocks"]:
-        if b["kind"] == "app":
-            continue  # программу меняем последней, см. ниже
-        log("Устанавливаю: %s" % b["title"])
-        src = os.path.join(dl, b["asset"])
-        stage = os.path.join(upd, "new")
-        if os.path.isdir(stage):
-            shutil.rmtree(lp(stage), ignore_errors=True)
-        with zipfile.ZipFile(src) as z:
-            z.extractall(lp(stage))
-        new_files = set(_walk_rel(stage, ""))  # пути относительно stage
-        for p in (b.get("paths") or [b["path"]]):
-            for rel in _walk_rel(root, p):
-                if rel not in new_files and rel not in skip:
-                    _move(os.path.join(root, rel), os.path.join(old_dir, rel))
-        for rel in new_files:
-            dst = os.path.join(root, rel)
-            if os.path.exists(lp(dst)):
-                _move(dst, os.path.join(old_dir, rel))
-            _move(os.path.join(stage, rel), dst)
+            def one(fs):
+                f = fs[0]
+                p = os.path.join(dl, "f_" + f["s"])
+                if not (os.path.isfile(p) and _sha1_file(p) == f["s"]):
+                    _fetch_to(f["src"]["u"], p, tick, f["s"], cancel, {"User-Agent": UA_BROWSER})
+                else:
+                    tick(f["z"])
+                return fs
+            with ThreadPoolExecutor(4) as ex:
+                for fs in ex.map(one, list(urls.values())):
+                    with open(os.path.join(dl, "f_" + fs[0]["s"]), "rb") as fh:
+                        data = fh.read()
+                    for f in fs:
+                        put(f, data)
+        # 3. Исходные архивы карт с сайтов авторов.
+        by_arc = {}
+        for f in need:
+            if f["src"]["t"] in ("arc", "arcfile"):
+                by_arc.setdefault(f["src"]["a"], []).append(f)
+        for aid, files in by_arc.items():
+            a = archives[aid]
+            path = get_archive(man, a, root, tick, cancel, ask_browser, log)
+            log("Распаковываю %s" % a["name"])
+            with zipfile.ZipFile(lp(path)) as z:
+                names = {zip_member_name(i): i for i in z.infolist() if not i.is_dir()}
+                for f in files:
+                    if f["src"]["t"] == "arcfile":
+                        with open(lp(path), "rb") as fh:
+                            put(f, fh.read())
+                    else:
+                        info = names.get(f["src"]["m"])
+                        if info is None:
+                            raise RuntimeError("в архиве %s нет файла %s" % (a["name"], f["src"]["m"]))
+                        put(f, z.read(info))
+        # 4. Оригинал с заменой нескольких файлов (Faithful с поправленным pack.mcmeta).
+        for f in need:
+            s = f["src"]
+            if s["t"] != "zpatch":
+                continue
+            log("Скачиваю %s" % f["p"].rsplit("/", 1)[-1])
+            orig = os.path.join(dl, "z_" + s["us"])
+            if not (os.path.isfile(orig) and _sha1_file(orig) == s["us"]):
+                _fetch_to(s["u"], orig, tick, s["us"], cancel, {"User-Agent": UA_BROWSER})
+            else:
+                tick(s.get("uz", 0))
+            out = os.path.join(stage, f["p"])
+            os.makedirs(os.path.dirname(lp(out)), exist_ok=True)
+            zpatch_build(orig, out, s["set"])
+            if _sha1_file(out) != f["s"]:
+                raise RuntimeError("файл %s после правки не совпал с описью" % f["p"])
+            staged[f["p"]] = True
+        if cancel and cancel.is_set():
+            raise RuntimeError("отменено")
+        missing = [f["p"] for f in need if f["p"] not in staged]
+        if missing:
+            raise RuntimeError("не нашёл источник для %d файлов, например %s" % (len(missing), missing[0]))
+    except Exception:
         shutil.rmtree(lp(stage), ignore_errors=True)
-    for f in files:
-        dst = os.path.join(root, f["path"])
+        raise
+
+    # 5. Раскладка. Программу меняем последней.
+    restart = False
+    app_files = [f for f in need if f["p"] == EXE_NAME]
+    for f in need:
+        if f["p"] == EXE_NAME:
+            continue
+        dst = os.path.join(root, f["p"])
         if os.path.exists(lp(dst)):
-            _move(dst, os.path.join(old_dir, f["path"]))
-        os.makedirs(os.path.dirname(lp(dst)), exist_ok=True)
-        shutil.copy2(lp(os.path.join(dl, "f_" + f["sha1"])), lp(dst))
-    for p in plan["remove"]:
-        log("Убираю старое: %s" % p)
-        _move(os.path.join(root, p), os.path.join(old_dir, p))
-        parent = os.path.dirname(os.path.join(root, p))
-        try:
-            if os.path.abspath(parent) != os.path.abspath(root) and not os.listdir(parent):
-                os.rmdir(parent)
-        except OSError:
-            pass
-    with open(os.path.join(root, "manifest.json"), "w", encoding="utf-8") as fh:
-        json.dump(remote, fh, ensure_ascii=False, indent=1)
+            _move(dst, os.path.join(old_dir, f["p"]))
+        _move(os.path.join(stage, f["p"]), dst)
+    for p in plan.get("extra", []) + plan.get("remove", []):
+        if os.path.exists(lp(os.path.join(root, p))):
+            log("Убираю старое: %s" % p)
+            _move(os.path.join(root, p), os.path.join(old_dir, p))
+            parent = os.path.dirname(os.path.join(root, p))
+            try:
+                while os.path.abspath(parent) != os.path.abspath(root) and not os.listdir(lp(parent)):
+                    os.rmdir(lp(parent))
+                    parent = os.path.dirname(parent)
+            except OSError:
+                pass
+    if plan.get("with_update") or "core" in plan.get("items", []):
+        with open(os.path.join(root, "manifest.json"), "w", encoding="utf-8") as fh:
+            json.dump(man, fh, ensure_ascii=False, indent=1)
     trash = None
     if os.path.isdir(old_dir):
         if not recycle(old_dir, log=log):
             trash = os.path.join(root, "_Старое после обновления " + stamp)
             os.replace(old_dir, trash)
-    for b in plan["blocks"]:
-        if b["kind"] != "app":
-            continue
-        log("Устанавливаю: %s" % b["title"])
-        target = os.path.join(root, b["path"])
+    for f in app_files:
+        target = os.path.join(root, EXE_NAME)
         running = getattr(sys, "frozen", False) and os.path.abspath(sys.executable) == os.path.abspath(target)
-        if os.path.exists(target):
-            if running:
-                if os.path.exists(target + ".old"):
-                    os.remove(target + ".old")
-                os.replace(target, target + ".old")
-                restart = True
-            else:
-                os.replace(target, target + ".old")
-        shutil.copy2(os.path.join(dl, b["asset"]), target)
-        if not running:
+        if os.path.exists(target + ".old"):
             try:
                 os.remove(target + ".old")
             except OSError:
                 pass
+        if os.path.exists(target):
+            os.replace(target, target + ".old")
+        _move(os.path.join(stage, EXE_NAME), target)
+        if running:
+            restart = True
+        else:
+            try:
+                os.remove(target + ".old")
+            except OSError:
+                pass
+    shutil.rmtree(lp(stage), ignore_errors=True)
     shutil.rmtree(lp(dl), ignore_errors=True)
-    log("Обновление %s установлено" % remote.get("version"))
+    shutil.rmtree(lp(os.path.join(upd, "archives")), ignore_errors=True)
+    log("Готово: версия %s" % man.get("version"))
     return {"restart": restart, "trash": trash}
+
+
+apply_update = apply_plan
+
+
+def remove_item(item, root=ROOT, log=print):
+    """Убрать скачанное содержимое карты или сборки (описание остаётся в каталоге)."""
+    stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+    old_dir = os.path.join(root, "_update", "old_" + stamp)
+    files = item_content(item, root)
+    for rel in files:
+        _move(os.path.join(root, rel), os.path.join(old_dir, rel))
+    base = os.path.join(root, item["path"])
+    for d, dirs, fs in sorted(os.walk(lp(base)), key=lambda x: -len(x[0])):
+        if d != lp(base) and not os.listdir(d):
+            os.rmdir(d)
+    if os.path.isdir(old_dir) and not recycle(old_dir, log=log):
+        trash = os.path.join(root, "_Старое после обновления " + stamp)
+        os.replace(old_dir, trash)
+    log("Убрано файлов: %d" % len(files))
+    return len(files)
 
 
 def cleanup_after_update():
@@ -1573,19 +1903,23 @@ def cleanup_after_update():
             os.remove(os.path.join(ROOT, EXE_NAME + ".old"))
     except OSError:
         pass
-    if os.path.isdir(os.path.join(UPD_DIR, "new")):
-        shutil.rmtree(lp(os.path.join(UPD_DIR, "new")), ignore_errors=True)
+    try:
+        for name in os.listdir(UPD_DIR):
+            if name.startswith("new_") or name == "new":
+                shutil.rmtree(lp(os.path.join(UPD_DIR, name)), ignore_errors=True)
+    except OSError:
+        pass
+
+
+def lists_cached(man, root=ROOT):
+    """Есть ли у нас список файлов каталога этой версии (его кладут обновление и выпуск версии)."""
+    core = manifest_item(man, "core")
+    return bool(core) and os.path.isfile(os.path.join(root, "_update", "lists", core["list"]))
 
 
 def update_available(remote, local=None):
     local = local if local is not None else load_local_manifest()
-    if vtuple(remote.get("version")) > vtuple(local.get("version", "0")):
-        return True
-    # Версия та же, но чего-то не хватает (например, скачан только архив с программой).
-    for b in remote.get("blocks", []):
-        if b["kind"] in ("pack", "map") and not b.get("local_only") and not os.path.isdir(os.path.join(ROOT, b["path"])):
-            return True
-    return False
+    return vtuple(remote.get("version")) > vtuple(local.get("version", "0")) or not local.get("items")
 
 
 def fmt_mb(n):
@@ -1625,17 +1959,34 @@ def cli(argv):
             log("Адрес: %s | код: %s | версия: %s | сборка: %s" % (h["address"], h["code"], h["tl"], h["pack"]))
         except Exception as e:
             log("Ошибка:", e); return 1
-    elif cmd in ("--check-update", "--update"):
+    elif cmd in ("--check-update", "--update", "--download", "--remove"):
         remote = fetch_remote_manifest()
         log("Версия у меня: %s, на GitHub: %s" % (load_local_manifest().get("version"), remote.get("version")))
-        plan = plan_update(remote, log=lambda *a: None)
-        log("Скачать блоков: %d (%s), файлов с Modrinth: %d, убрать: %d, всего %s" % (
-            len(plan["blocks"]), ", ".join(b["title"] for b in plan["blocks"]), len(plan["files"]),
-            len(plan["remove"]), fmt_mb(plan["size"])))
-        for p in plan["remove"]:
+        if cmd in ("--download", "--remove"):
+            key = argv[1] if len(argv) > 1 else ""
+            ids = [i["id"] for i in remote.get("items", []) if i["kind"] in ("pack", "map") and (
+                key == "all" or i["id"] == key or i["id"].endswith(":" + key) or key.lower() in i["title"].lower())]
+            if not ids:
+                log("Не нашёл карту или сборку:", key); return 1
+            if cmd == "--remove":
+                for i in ids:
+                    remove_item(manifest_item(remote, i), log=log)
+                return 0
+            plan = plan_download(remote, ids, log=lambda *a: None)
+        else:
+            plan = plan_update(remote, log=lambda *a: None)
+        log("Скачать файлов: %d (%s), откуда: %s, убрать: %d" % (
+            len(plan["need"]), fmt_mb(plan["size"]), ", ".join(plan_sources(remote, plan)) or "-",
+            len(plan["extra"]) + len(plan["remove"])))
+        for p in plan["extra"] + plan["remove"]:
             log("  убрать: " + p)
-        if cmd == "--update" and (plan["blocks"] or plan["files"] or plan["remove"]):
-            res = apply_update(remote, plan, log=log)
+        if cmd != "--check-update" and (plan["need"] or plan["extra"] or plan["remove"] or plan.get("with_update")):
+            def ask(a, err):
+                log("Сайт не отдал %s (%s). Открываю страницу, скачай файл - программа подхватит его из «Загрузок»."
+                    % (a["name"], err or "только через браузер"))
+                webbrowser.open(a["page"])
+                return wait_archive_in_downloads(a)
+            res = apply_plan(remote, plan, log=log, ask_browser=ask)
             log("Готово:", res)
     elif cmd == "--shortcut":
         log("Ярлыки:", create_shortcuts())
@@ -1666,6 +2017,20 @@ def cli(argv):
             pack = next((p for p in packs if p["name"] == m["recommended"]), None)
         if game_running():
             log("Игра запущена. Закройте Minecraft."); return 2
+        ids = missing_items(m, pack, packs)
+        if ids:
+            remote = fetch_remote_manifest()
+            plan = plan_download(remote, ids, log=lambda *a: None)
+            log("Сначала скачаю: %s (%s)" % (", ".join(ids), fmt_mb(plan["size"])))
+
+            def ask(a, err):
+                log("Открываю страницу %s: скачай файл, программа подхватит его из «Загрузок»." % a["page"])
+                webbrowser.open(a["page"])
+                return wait_archive_in_downloads(a)
+            apply_plan(remote, plan, log=log, ask_browser=ask)
+            packs = find_packs()
+            if pack:
+                pack = next((p for p in packs if p["path"] == pack["path"]), pack)
         install_map(m, pack, "--fresh" in argv, packs, log)
         log("Готово:", m["title"])
     return 0
@@ -1693,7 +2058,7 @@ TAB_ORDER = ["maps", "packs", "servers", "friend", "launchers"]
 
 def gui():
     import tkinter as tk
-    from tkinter import messagebox, simpledialog
+    from tkinter import messagebox, simpledialog, filedialog
 
     cleanup_after_update()
     win = tk.Tk()
@@ -2392,7 +2757,44 @@ def gui():
                 return
             fresh = not ans
         pack = next((p for p in packs if p["name"] == pick), None)
-        run_task("Готовлю «%s»" % m["title"], lambda log: install_map(m, pack, fresh, packs, log), finish)
+
+        def go():
+            ps2 = find_packs()
+            pk = next((q for q in ps2 if pack and q["path"] == pack["path"]), None)
+            run_task("Готовлю «%s»" % m["title"], lambda log: install_map(m, pk, fresh, ps2, log), finish)
+        ensure_items(missing_items(m, pack, packs), go, "Скачать «%s»" % m["title"])
+
+    def not_downloaded(item_id):
+        """Часть из описи, если она ещё не скачана (иначе None)."""
+        it = manifest_item(load_local_manifest(), item_id)
+        return it if it and not item_downloaded(it) else None
+
+    def dl_badge(parent, it, bg=CARD):
+        if it:
+            badge(parent, "не скачана · %s" % fmt_mb(it.get("dl", 0)), "#4a3f17", "#f3d27a").pack(side="left", padx=(0, 6))
+
+    def remove_button(row, it, title, t=None):
+        """«Удалить скачанное»: содержимое в Корзину, в каталоге карта или сборка остаётся."""
+        if not it or not item_downloaded(it):
+            return
+
+        def go():
+            if not messagebox.askyesno("Удалить скачанное", "Убрать скачанные файлы «%s» в Корзину?\n\n"
+                                       "В списке она останется, скачать можно снова в любой момент. "
+                                       "Миры в игре это не трогает." % title, parent=t or win):
+                return
+            if t:
+                t.destroy()
+            run_task("Убираю «%s»" % title, lambda log: remove_item(it, log=log),
+                     lambda n, logs: toast("«%s» убрана, место освобождено." % title))
+        small_button(row, "Удалить скачанное", go, bg=row["bg"]).pack(side="left", padx=(8, 0))
+
+    def enable_pack(p):
+        def go():
+            ps2 = find_packs()
+            pk = next((q for q in ps2 if q["path"] == p["path"]), p)
+            run_task("Включаю «%s»" % pk["name"], lambda log: switch(pk, ps2, True, log), finish)
+        ensure_items(missing_items(pack=p), go, "Скачать «%s»" % p["name"].rsplit(" (", 1)[0])
 
     def open_map(m):
         packs = find_packs()
@@ -2403,6 +2805,9 @@ def gui():
             badges.append(("ресурс-пак встроен", "#5a4c1c", "#f3d27a"))
         if map_installed(m):
             badges.append(("установлена", "#2f6b34", "white"))
+        miss = not_downloaded(map_item_id(m))
+        if miss:
+            badges.append(("не скачана · %s" % fmt_mb(miss.get("dl", 0)), "#4a3f17", "#f3d27a"))
         sub = m["players"]
         if m.get("author"):
             sub += "\nАвтор: %s" % m["author"]
@@ -2422,17 +2827,26 @@ def gui():
         dsection(body, "Технически")
         opts = packs_for_map(m, packs)
         mb, nf = folder_size(os.path.join(m["path"], "world"))
+        it = manifest_item(load_local_manifest(), map_item_id(m))
+        if miss:
+            dpara(body, "Карта ещё не скачана: %s, программа скачает её с %s при нажатии «Играть»." % (
+                fmt_mb(miss.get("dl", 0)), ", ".join(miss.get("sites", [])) or "сайта автора"), bullet=True, color=GOLD)
+        elif it and it.get("sites"):
+            dpara(body, "Скачана с: %s." % ", ".join(it["sites"]), bullet=True)
         dpara(body, "Версия игры: %s. Программа сама скачает её и выберет в TLauncher." % m["version"], bullet=True)
         dpara(body, "Сборки, с которыми можно играть: %s." % (", ".join(p["name"].rsplit(" (", 1)[0] for p in opts)
                                                               if opts else "только без модов"), bullet=True)
-        dpara(body, "Размер мира: %s МБ, файлов %d." % (("%.1f" if mb < 10 else "%.0f") % mb, nf), bullet=True)
+        if nf:
+            dpara(body, "Размер мира: %s МБ, файлов %d." % (("%.1f" if mb < 10 else "%.0f") % mb, nf), bullet=True)
         dpara(body, "Сохранение в игре: saves\\%s" % m["save"], bullet=True)
         row = dbuttons(body)
         choices = ([] if m.get("requires_pack") and opts else ["%s (чистая %s)" % (NO_MODS, m["version"])]) + \
             [p["name"] for p in opts]
         var = tk.StringVar(value=m.get("recommended") if m.get("recommended") in choices else choices[0])
         dropdown(row, var, choices, BG).pack(side="left")
-        big_button(row, "Играть", lambda: start_map(m, var.get(), packs)).pack(side="right")
+        big_button(row, "Скачать и играть" if miss else "Играть",
+                   lambda: (t.destroy(), start_map(m, var.get(), packs))).pack(side="right")
+        remove_button(row, it, m["title"], t)
         if map_installed(m):
             small_button(row, "Папка мира", lambda: os.startfile(os.path.join(SAVES, m["save"])),
                          bg=BG).pack(side="right", padx=8)
@@ -2454,6 +2868,9 @@ def gui():
         badges = [(p["version_dir"], BLUE, "white"), ("%d модов" % p["count"] if p["count"] else "без модов", LINE, TEXT)]
         if active:
             badges.append(("включена", "#2f6b34", "white"))
+        miss = not_downloaded(pack_item_id(p))
+        if miss:
+            badges.append(("не скачана · %s" % fmt_mb(miss.get("dl", 0)), "#4a3f17", "#f3d27a"))
         detail_header(t, body, img, p["name"].rsplit(" (", 1)[0], badges, p.get("description", ""))
         try:
             with open(os.path.join(p["path"], "mods.json"), encoding="utf-8") as fh:
@@ -2500,14 +2917,23 @@ def gui():
         if fit:
             dpara(body, "Подходит к картам: %s." % ", ".join(fit), bullet=True)
         mb, nf = folder_size(os.path.join(p["path"], "mods"))
-        dpara(body, "Размер модов: %s МБ." % (("%.1f" if mb < 10 else "%.0f") % mb), bullet=True)
+        it = manifest_item(load_local_manifest(), pack_item_id(p))
+        if miss:
+            dpara(body, "Сборка ещё не скачана: %s. Моды программа скачает с %s при нажатии «Включить»." % (
+                fmt_mb(miss.get("dl", 0)), ", ".join(miss.get("sites", [])) or "Modrinth"), bullet=True, color=GOLD)
+        else:
+            dpara(body, "Размер модов: %s МБ." % (("%.1f" if mb < 10 else "%.0f") % mb), bullet=True)
+            if it and it.get("sites"):
+                dpara(body, "Моды и файлы скачаны с: %s." % ", ".join(it["sites"]), bullet=True)
         row = dbuttons(body)
 
         def enable():
             if not check_game():
                 return
-            run_task("Включаю «%s»" % p["name"], lambda log: switch(p, packs, True, log), finish)
-        big_button(row, "Включена" if active else "Включить", enable,
+            t.destroy()
+            enable_pack(p)
+        remove_button(row, it, p["name"].rsplit(" (", 1)[0], t)
+        big_button(row, "Включена" if active else ("Скачать и включить" if miss else "Включить"), enable,
                    color=CARD_HI if active else ACCENT, hover=LINE if active else ACCENT_HI).pack(side="right")
         small_button(row, "Папка сборки", lambda: os.startfile(p["path"]), bg=BG).pack(side="right", padx=8)
         auto_wrap(body)
@@ -2626,6 +3052,8 @@ def gui():
             bl.pack(fill="x", pady=(4, 6))
             badge(bl, m["version"], BLUE, "white").pack(side="left", padx=(0, 6))
             badge(bl, m["genre"]).pack(side="left", padx=(0, 6))
+            miss = not_downloaded(map_item_id(m))
+            dl_badge(bl, miss)
             pl = tk.Frame(info, bg=CARD)
             pl.pack(fill="x")
             tk.Label(pl, text=m["players"], font=(FONT, 9), fg=MUTED, bg=CARD).pack(side="left")
@@ -2640,22 +3068,8 @@ def gui():
             var = tk.StringVar(value=m["recommended"] if m.get("recommended") in opts else choices[0])
             dropdown(row, var, choices).pack(side="left")
 
-            def play(m=m, var=var, packs=packs):
-                if not check_game():
-                    return
-                fresh = False
-                if map_installed(m):
-                    ans = messagebox.askyesnocancel(
-                        m["title"], "Карта уже установлена.\n\nДа: продолжить своё сохранение\n"
-                                    "Нет: начать заново (старое сохранение останется копией)")
-                    if ans is None:
-                        return
-                    fresh = not ans
-                pick = var.get()
-                pack = next((p for p in packs if p["name"] == pick), None)
-                run_task("Готовлю «%s»" % m["title"],
-                         lambda log: install_map(m, pack, fresh, packs, log), finish)
-            big_button(row, "Играть", play).pack(side="right")
+            big_button(row, "Скачать и играть" if miss else "Играть",
+                       lambda m=m, var=var, packs=packs: start_map(m, var.get(), packs)).pack(side="right")
             small_button(row, "Подробнее", lambda m=m: open_map(m), bg=CARD).pack(side="right", padx=8)
             clickable(c, lambda m=m: open_map(m))
 
@@ -2699,16 +3113,18 @@ def gui():
             active = cur.get("name") == p["name"] and cur.get("version_dir") == p["version_dir"]
             if active:
                 badge(bl, "включена", "#2f6b34", "white").pack(side="left")
+            miss = not_downloaded(pack_item_id(p))
+            dl_badge(bl, miss)
             tk.Label(c, text=p.get("description", ""), font=(FONT, 10), fg="#c3c7d1", bg=CARD,
                      justify="left", anchor="w", wraplength=400).pack(fill="x", pady=(10, 10))
             row = tk.Frame(c, bg=CARD)
             row.pack(fill="x", side="bottom")
 
-            def enable(p=p, packs=packs):
+            def enable(p=p):
                 if not check_game():
                     return
-                run_task("Включаю «%s»" % p["name"], lambda log: switch(p, packs, True, log), finish)
-            big_button(row, "Включена" if active else "Включить", enable,
+                enable_pack(p)
+            big_button(row, "Включена" if active else ("Скачать и включить" if miss else "Включить"), enable,
                        color=CARD_HI if active else ACCENT, hover=LINE if active else ACCENT_HI).pack(side="right")
             small_button(row, "Подробнее: моды", lambda p=p: open_pack(p), bg=CARD).pack(side="right", padx=8)
             clickable(c, lambda p=p: open_pack(p))
@@ -2888,12 +3304,17 @@ def gui():
             if not text:
                 messagebox.showinfo("Код", "Вставь код приглашения от друга."); return
             try:
-                parse_invite(text)
+                _addr, _tl, pack_name = parse_invite(text)
             except Exception as e:
                 messagebox.showwarning("Код", str(e)); return
             if not check_game():
                 return
             state["join_text"] = text
+            pk = next((p for p in find_packs() if p["name"] == pack_name), None) if pack_name else None
+            ids = missing_items(pack=pk) if pk else []
+            if ids:  # у друга сборка, которую ещё не скачивали: сначала скачать
+                ensure_items(ids, join, "Скачать «%s»" % pack_name.rsplit(" (", 1)[0])
+                return
 
             def after(ok, logs):
                 state["join_logs"] = logs
@@ -3038,23 +3459,22 @@ def gui():
             w.destroy()
         ubg = upd_bar["bg"]
         tk.Label(upd_bar, image=art("tab_update.png", 1, 1), bg=ubg).pack(side="left", padx=(12, 6), pady=8)
-        fresh = not load_local_manifest() or not library_found()
-        title = ("Скачать библиотеку: карты, сборки и моды" if fresh else
-                 "Вышло обновление %s" % remote.get("version"))
-        tk.Label(upd_bar, text=title, font=(FONT, 11, "bold"), fg="white", bg=ubg).pack(side="left")
+        tk.Label(upd_bar, text="Вышло обновление %s" % remote.get("version"), font=(FONT, 11, "bold"), fg="white",
+                 bg=ubg).pack(side="left")
         ch = remote.get("changes") or []
-        if ch and not fresh:
+        if ch:
             tk.Label(upd_bar, text="   " + ch[0] + ("  и ещё %d" % (len(ch) - 1) if len(ch) > 1 else ""),
                      font=(FONT, 10), fg="#b9d9bd", bg=ubg).pack(side="left")
 
         def later():
             upd_bar.pack_forget()
         small_button(upd_bar, "Позже", later, bg=ubg).pack(side="right", padx=(4, 12))
-        big_button(upd_bar, "Скачать" if fresh else "Обновить", lambda: open_update(remote)).pack(side="right", pady=6)
+        big_button(upd_bar, "Обновить", lambda: open_update(remote)).pack(side="right", pady=6)
         if not upd_bar.winfo_ismapped():
             upd_bar.pack(fill="x", padx=24, pady=(10, 0), before=body)
 
-    def check_updates(manual=False):
+    def with_remote(fn, quiet=False):
+        """Опись с GitHub в фоне, потом fn(remote) в окне. Без связи - сообщение."""
         box = {}
 
         def work():
@@ -3064,47 +3484,76 @@ def gui():
                 box["err"] = str(e)
         th = threading.Thread(target=work, daemon=True)
         th.start()
-        if manual:
-            toast("Проверяю обновления на GitHub...", "info", ms=2500)
 
         def poll():
             if th.is_alive():
                 win.after(200, poll)
                 return
             if "err" in box:
-                if manual:
-                    toast("Не удалось проверить обновления: нет связи с GitHub (%s)." % box["err"][:80], "err", ms=6000)
-                elif not library_found():
-                    messagebox.showwarning("Не вижу файлов", LIBRARY_NOTE + "\n\nСейчас программа запущена из:\n" + ROOT)
+                if not quiet:
+                    toast("Нет связи с GitHub (%s). Проверь интернет и попробуй ещё раз." % box["err"][:80], "err", ms=7000)
                 return
-            remote = box["remote"]
-            state["remote"] = remote
-            if update_available(remote):
-                show_update_bar(remote)
-                if manual or not library_found():
-                    open_update(remote)
-            elif manual:
-                toast("У тебя последняя версия библиотеки: %s." % remote.get("version"), "ok")
+            state["remote"] = box["remote"]
+            fn(box["remote"])
         poll()
 
-    def open_update(remote):
+    def ensure_items(ids, then, title="Скачать"):
+        """Если карта или сборка ещё не скачана - окно загрузки, а после неё then()."""
+        if not ids:
+            then()
+            return
+        toast("Узнаю, откуда скачивать...", "info", ms=2500)
+        with_remote(lambda remote: open_update(remote, ids, then, title))
+
+    def check_updates(manual=False):
+        if manual:
+            toast("Проверяю обновления на GitHub...", "info", ms=2500)
+
+        def got(remote):
+            if update_available(remote):
+                show_update_bar(remote)
+                if manual:
+                    open_update(remote)
+            elif not lists_cached(remote) and not state["busy"]:
+                # Версия та же, но каталог мог прийти не целиком (программу обновила старая версия): сверим тихо.
+                box = {}
+
+                def work():
+                    try:
+                        box["plan"] = plan_update(remote, log=lambda m: None)
+                    except Exception as e:
+                        box["err"] = str(e)
+                th = threading.Thread(target=work, daemon=True)
+                th.start()
+
+                def poll():
+                    if th.is_alive():
+                        win.after(300, poll)
+                    elif box.get("plan") and (box["plan"]["need"] or box["plan"]["remove"]):
+                        show_update_bar(remote)
+                    elif manual:
+                        toast("У тебя последняя версия: %s." % remote.get("version"), "ok")
+                poll()
+            elif manual:
+                toast("У тебя последняя версия: %s." % remote.get("version"), "ok")
+        with_remote(got, quiet=not manual)
+
+    def open_update(remote, items=None, then=None, title=None):
+        """Окно загрузки: обновление (items=None) или скачивание карт и сборок items."""
         if state["busy"]:
             toast("Подожди, программа сейчас занята.", "warn")
             return
         if state.get("upd_win") is not None and state["upd_win"].winfo_exists():
-            state["upd_win"].lift()
-            return
+            state["upd_win"].destroy()
         local = load_local_manifest()
-        fresh = not local or not library_found()
         t = tk.Toplevel(win)
         state["upd_win"] = t
-        t.title("Обновление библиотеки")
+        t.title(title or "Обновление библиотеки")
         t.configure(bg=BG)
         t.transient(win)
-        W, H = 660, 620
-        t.geometry("%dx%d+%d+%d" % (W, H, win.winfo_rootx() + (win.winfo_width() - W) // 2,
-                                    win.winfo_rooty() + 50))
-        t.minsize(560, 480)
+        W, H = 680, 640
+        t.geometry("%dx%d+%d+%d" % (W, H, win.winfo_rootx() + (win.winfo_width() - W) // 2, win.winfo_rooty() + 40))
+        t.minsize(560, 500)
         fr = tk.Frame(t, bg=BG, padx=26, pady=22)
         fr.pack(fill="both", expand=True)
         top = tk.Frame(fr, bg=BG)
@@ -3112,21 +3561,26 @@ def gui():
         tk.Label(top, image=art("update.png", 1, 1), bg=BG).pack(side="left", anchor="n")
         info = tk.Frame(top, bg=BG, padx=18)
         info.pack(side="left", fill="both", expand=True)
-        tk.Label(info, text="Скачать библиотеку" if fresh else "Обновление библиотеки", font=(FONT, 20, "bold"),
-                 fg=TEXT, bg=BG, anchor="w").pack(fill="x")
-        tk.Label(info, text=("Версия %s с GitHub" % remote.get("version")) if fresh else
-                 "У тебя: %s   →   новая: %s" % (local.get("version", "?"), remote.get("version")),
-                 font=(FONT, 11), fg=ACCENT_HI, bg=BG, anchor="w").pack(fill="x", pady=(6, 0))
-        tk.Label(info, text="Программа скачает только то, что изменилось. Твои миры и настройки игры "
-                            "не трогаются: обновляется только папка с картами и сборками.",
-                 font=(FONT, 10), fg=MUTED, bg=BG, anchor="w", justify="left", wraplength=360).pack(fill="x", pady=(8, 0))
+        names = [(manifest_item(remote, i) or {}).get("title", i) for i in (items or [])]
+        tk.Label(info, text=title or "Обновление библиотеки", font=(FONT, 19, "bold"), fg=TEXT, bg=BG, anchor="w",
+                 justify="left", wraplength=400).pack(fill="x")
+        if items:
+            line = ", ".join(names)
+        else:
+            line = "У тебя: %s   →   новая: %s" % (local.get("version", "?"), remote.get("version"))
+        tk.Label(info, text=line, font=(FONT, 11), fg=ACCENT_HI, bg=BG, anchor="w", justify="left",
+                 wraplength=400).pack(fill="x", pady=(6, 0))
+        tk.Label(info, text=("Файлы берутся с сайтов авторов: карты - оттуда, где их выложили, моды - с Modrinth "
+                             "и CurseForge. Если что-то уже есть в «Загрузках», программа возьмёт оттуда." if items else
+                             "Программа скачает только то, что изменилось. Твои миры и настройки игры не трогаются."),
+                 font=(FONT, 10), fg=MUTED, bg=BG, anchor="w", justify="left", wraplength=400).pack(fill="x", pady=(8, 0))
         ch = remote.get("changes") or []
-        if ch:
+        if ch and not items:
             tk.Label(fr, text="Что нового", font=(FONT, 13, "bold"), fg=TEXT, bg=BG, anchor="w").pack(fill="x", pady=(16, 4))
-            for line in ch[:8]:
-                tk.Label(fr, text="•  " + line, font=(FONT, 10), fg="#c3c7d1", bg=BG, anchor="w", justify="left",
+            for ln in ch[:8]:
+                tk.Label(fr, text="•  " + ln, font=(FONT, 10), fg="#c3c7d1", bg=BG, anchor="w", justify="left",
                          wraplength=W - 80).pack(fill="x")
-        msg = tk.Label(fr, text="Сверяю файлы с новой версией...", font=(FONT, 10, "bold"), fg=GOLD, bg=BG, anchor="w",
+        msg = tk.Label(fr, text="Сверяю файлы...", font=(FONT, 10, "bold"), fg=GOLD, bg=BG, anchor="w",
                        justify="left", wraplength=W - 80)
         msg.pack(fill="x", pady=(16, 6))
         bar = tk.Canvas(fr, height=12, bg=LINE, highlightthickness=0, bd=0)
@@ -3135,9 +3589,11 @@ def gui():
         shine = bar.create_rectangle(-60, 0, -20, 12, fill=ACCENT_HI, width=0)
         sub = tk.Label(fr, text="", font=(FONT, 9), fg=MUTED, bg=BG, anchor="w", justify="left", wraplength=W - 80)
         sub.pack(fill="x", pady=(6, 0))
+        # Подсказка для сайтов, которые не отдают файл программе: человек скачивает в браузере.
+        brow = tk.Frame(fr, bg=PANEL, padx=14, pady=10)
         row = tk.Frame(fr, bg=BG)
         row.pack(fill="x", side="bottom", pady=(14, 0))
-        box = {"cancel": threading.Event(), "done": 0, "total": 1, "logs": []}
+        box = {"cancel": threading.Event(), "done": 0, "total": 1, "logs": [], "manual": {}}
         prog = {"shown": 0.0}
 
         def set_bar(frac):
@@ -3148,17 +3604,18 @@ def gui():
 
         def shimmer():
             if not t.winfo_exists() or box.get("finished"):
-                bar.coords(shine, -60, 0, -20, 12)
+                if t.winfo_exists():
+                    bar.coords(shine, -60, 0, -20, 12)
                 return
             w = max(1, bar.winfo_width())
             animate(("shine", str(bar)), 1300, lambda k: bar.coords(shine, -60 + (w + 80) * k, 0, -20 + (w + 80) * k, 12),
                     done=shimmer, ease=lambda x: x)
         shimmer()
 
-        def buttons(*items):
+        def buttons(*btns):
             for w in row.winfo_children():
                 w.destroy()
-            for kind, text, cmd in items:
+            for kind, text, cmd in btns:
                 if kind == "big":
                     big_button(row, text, cmd).pack(side="right")
                 else:
@@ -3166,8 +3623,7 @@ def gui():
 
         def close():
             if box.get("applying"):
-                if messagebox.askyesno("Прервать?", "Обновление ещё идёт. Прервать скачивание?\n"
-                                                     "Папка останется как была.", parent=t):
+                if messagebox.askyesno("Прервать?", "Загрузка ещё идёт. Прервать?\nПапка останется как была.", parent=t):
                     box["cancel"].set()
                 return
             t.destroy()
@@ -3175,9 +3631,38 @@ def gui():
         t.protocol("WM_DELETE_WINDOW", close)
         buttons(("small", "Закрыть", close))
 
+        def show_browser(a, err):
+            for w in brow.winfo_children():
+                w.destroy()
+            site = urllib.parse.urlparse(a.get("page", "")).netloc.replace("www.", "")
+            tk.Label(brow, text="Сайт %s не отдаёт файл программе%s. Я открыл страницу карты в браузере: "
+                                "нажми там кнопку скачивания (Download). Программа сама найдёт файл «%s» в «Загрузках» "
+                                "и продолжит." % (site, "" if a.get("browser") else " (%s)" % str(err)[:60], a["name"]),
+                     font=(FONT, 10), fg=TEXT, bg=PANEL, anchor="w", justify="left", wraplength=W - 110).pack(fill="x")
+            br = tk.Frame(brow, bg=PANEL)
+            br.pack(fill="x", pady=(8, 0))
+            small_button(br, "Открыть страницу ещё раз", lambda: webbrowser.open(a["page"]), bg=PANEL).pack(side="left")
+
+            def pick():
+                f = filedialog.askopenfilename(parent=t, title="Где лежит %s?" % a["name"],
+                                               filetypes=[("Архив", "*.zip"), ("Все файлы", "*.*")])
+                if f:
+                    box["manual"]["file"] = f
+            small_button(br, "Указать файл вручную...", pick, bg=PANEL).pack(side="left", padx=(8, 0))
+            brow.pack(fill="x", pady=(12, 0), before=row)
+
+        def ask_browser(a, err):
+            box["browser"] = (a, err)
+            webbrowser.open(a["page"])
+            try:
+                return wait_archive_in_downloads(a, box["cancel"], manual=box["manual"])
+            finally:
+                box["browser_done"] = True
+
         def planning():
             try:
-                box["plan"] = plan_update(remote, log=lambda m: box.__setitem__("step", m))
+                box["plan"] = (plan_download(remote, items, log=lambda m: box.__setitem__("step", m)) if items else
+                               plan_update(remote, log=lambda m: box.__setitem__("step", m)))
             except Exception as e:
                 box["err"] = str(e)
         th = threading.Thread(target=planning, daemon=True)
@@ -3192,27 +3677,33 @@ def gui():
                 return
             box["finished"] = True
             if "err" in box:
-                msg.configure(text="Не получилось сверить файлы: " + box["err"], fg="#e05a5a")
+                msg.configure(text="Не получилось: " + box["err"], fg="#e05a5a")
                 return
             plan = box["plan"]
-            if not plan["blocks"] and not plan["files"] and not plan["remove"]:
-                apply_update(remote, plan, log=lambda m: None)
+            if not plan["need"] and not plan["extra"] and not plan["remove"]:
+                if not items:
+                    apply_plan(remote, plan, log=lambda m: None)
                 set_bar(1.0)
-                msg.configure(text="Всё уже на месте: у тебя версия %s." % remote.get("version"), fg=ACCENT_HI)
-                sub.configure(text="")
                 upd_bar.pack_forget()
+                if items and then:
+                    t.destroy()
+                    then()
+                    return
+                msg.configure(text="Всё уже на месте: версия %s." % remote.get("version"), fg=ACCENT_HI)
+                sub.configure(text="")
                 return
-            names = [b["title"] for b in plan["blocks"]]
-            text = "Скачаю %s: %s" % (fmt_mb(plan["size"]), ", ".join(names[:10]) + (
-                " и ещё %d" % (len(names) - 10) if len(names) > 10 else ""))
-            if plan["files"]:
-                text += ("; " if names else "") + "моды с Modrinth: %d" % len(plan["files"])
+            sites = plan_sources(remote, plan)
+            text = "Скачаю %s (файлов: %d) с: %s" % (fmt_mb(plan["size"]), len(plan["need"]), ", ".join(sites) or "-")
+            if plan.get("with_update") and items:
+                text += ".\nЗаодно обновлю библиотеку до версии %s." % remote.get("version")
             msg.configure(text=text, fg=TEXT)
-            rm = plan["remove"]
-            sub.configure(text=("Уберу в Корзину старое: " + ", ".join(rm[:8]) + (
+            rm = plan["extra"] + plan["remove"]
+            sub.configure(text=("Уберу в Корзину старое: " + ", ".join(x.rsplit("/", 1)[-1] for x in rm[:8]) + (
                 " и ещё %d" % (len(rm) - 8) if len(rm) > 8 else "")) if rm else "", fg="#e0a45a")
-            label = ("Скачать  (%s)" if fresh else "Обновить  (%s)") % fmt_mb(plan["size"])
+            label = ("Скачать  (%s)" if items else "Обновить  (%s)") % fmt_mb(plan["size"])
             buttons(("big", label, lambda: start(plan)), ("small", "Позже", close))
+            if items:
+                start(plan)  # человек уже нажал «Играть» или «Включить»: сразу качаем
 
         def start(plan):
             if state["busy"]:
@@ -3227,8 +3718,9 @@ def gui():
 
             def work():
                 try:
-                    box["res"] = apply_update(remote, plan, log=lambda m: box["logs"].append(m),
-                                              progress=lambda d, tot: box.update(done=d, total=tot), cancel=box["cancel"])
+                    box["res"] = apply_plan(remote, plan, log=lambda m: box["logs"].append(m),
+                                            progress=lambda d, tot: box.update(done=d, total=tot),
+                                            cancel=box["cancel"], ask_browser=ask_browser)
                 except Exception as e:
                     box["err2"] = str(e)
             th2 = threading.Thread(target=work, daemon=True)
@@ -3237,40 +3729,59 @@ def gui():
 
             def poll():
                 if th2.is_alive():
-                    if t.winfo_exists() and time.perf_counter() - last["t"] > 0.25:
-                        last["t"] = time.perf_counter()
-                        frac = min(1.0, box["done"] / float(box["total"]))
-                        set_bar(frac * 0.97)
-                        msg.configure(text="%s   %d%%   (%s из %s)" % (
-                            box["logs"][-1] if box["logs"] else "Скачиваю", frac * 100,
-                            fmt_mb(box["done"]), fmt_mb(box["total"])))
+                    if t.winfo_exists():
+                        if box.get("browser") and not box.get("browser_shown"):
+                            box["browser_shown"] = True
+                            show_browser(*box["browser"])
+                        if box.pop("browser_done", None):
+                            brow.pack_forget()
+                            box["browser_shown"] = False
+                            box.pop("browser", None)
+                        if box["manual"].pop("bad", None):
+                            toast("Это не тот файл: не совпала контрольная сумма.", "err")
+                        if time.perf_counter() - last["t"] > 0.25:
+                            last["t"] = time.perf_counter()
+                            frac = min(1.0, box["done"] / float(box["total"]))
+                            set_bar(frac * 0.97)
+                            msg.configure(text="%s   %d%%   (%s из %s)" % (
+                                box["logs"][-1] if box["logs"] else "Скачиваю", frac * 100,
+                                fmt_mb(box["done"]), fmt_mb(box["total"])))
                     win.after(150, poll)
                     return
                 state["busy"] = False
                 box.update(applying=False, finished=True)
                 if not t.winfo_exists():
                     return
+                brow.pack_forget()
                 if "err2" in box:
-                    msg.configure(text=("Обновление прервано. Папка осталась как была." if "отменено" in box["err2"]
+                    msg.configure(text=("Прервано. Папка осталась как была." if "отменено" in box["err2"]
                                         else "Не получилось: " + box["err2"]), fg="#e05a5a")
-                    buttons(("big", "Ещё раз", lambda: (t.destroy(), open_update(remote))), ("small", "Закрыть", close))
+                    buttons(("big", "Ещё раз", lambda: (t.destroy(), open_update(remote, items, then, title))),
+                            ("small", "Закрыть", close))
                     return
                 set_bar(1.0)
                 res = box["res"]
-                upd_bar.pack_forget()
-                msg.configure(text="Готово! Установлена версия %s." % remote.get("version"), fg=ACCENT_HI)
-                sub.configure(text=("Старые файлы убраны в Корзину." if not res.get("trash") else
-                                    "Старые файлы сложены в папку «%s», её можно удалить." % os.path.basename(res["trash"])),
-                              fg=MUTED)
+                if plan.get("with_update") or not items:
+                    upd_bar.pack_forget()
                 if res.get("restart"):
+                    msg.configure(text="Готово! Программа тоже обновилась: перезапусти её.", fg=ACCENT_HI)
+
                     def restart():
                         subprocess.Popen([os.path.join(ROOT, EXE_NAME)], cwd=ROOT)
                         win.destroy()
-                    tk.Label(fr, text="Программа тоже обновилась: перезапусти её.", font=(FONT, 10, "bold"),
-                             fg=GOLD, bg=BG, anchor="w").pack(fill="x", pady=(8, 0))
                     buttons(("big", "Перезапустить программу", restart))
-                else:
-                    buttons(("big", "Закрыть", close))
+                    return
+                if items and then:
+                    t.destroy()
+                    toast("Скачано: %s." % ", ".join(names), "ok")
+                    show(state["tab"], animated=False)
+                    then()
+                    return
+                msg.configure(text="Готово! Версия %s." % remote.get("version"), fg=ACCENT_HI)
+                sub.configure(text=("Старые файлы убраны в Корзину." if not res.get("trash") else
+                                    "Старые файлы сложены в папку «%s», её можно удалить." % os.path.basename(res["trash"])),
+                              fg=MUTED)
+                buttons(("big", "Закрыть", close))
                 toast("Библиотека обновлена до версии %s." % remote.get("version"), "ok")
             poll()
         poll_plan()
@@ -3304,9 +3815,8 @@ def gui():
 
     def after_start():
         if not library_found():
-            check_updates()
-        else:
-            win.after(1500, check_updates)
+            messagebox.showwarning("Не вижу файлов", LIBRARY_NOTE + "\n\nСейчас программа запущена из:\n" + ROOT)
+        win.after(1500, check_updates)
         if getattr(sys, "frozen", False) and not shortcuts_exist() and not settings.get("shortcut_offered"):
             s = load_settings()
             s["shortcut_offered"] = True

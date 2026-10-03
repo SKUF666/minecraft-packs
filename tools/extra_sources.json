@@ -1,0 +1,18 @@
+{
+ "note": "Источники файлов, которых нет на Modrinth и в архивах карт. url - по sha1 файла; zpatch - скачать оригинал и заменить в нём файлы (архив пересобирается без сжатия и с фиксированными датами, поэтому у всех получается одинаковый sha1).",
+ "url": {
+  "fa3b506a45d3": "https://mediafilez.forgecdn.net/files/5468/648/twilightforest-1.20.1-4.3.2508-universal.jar",
+  "b752181fa17c": "https://mediafilez.forgecdn.net/files/6534/716/Stay%20True%201.21.5.zip",
+  "4e618f09a0c6": "https://piston-data.mojang.com/v1/objects/4e618f09a0c649dde3fdf829df443ce0b8831e65/client.jar"
+ },
+ "zpatch": [
+  {
+   "name": "Faithful 32x - 26.2.zip",
+   "url": "https://cdn.modrinth.com/data/w0TnApzs/versions/jtTqgLTy/Faithful%2032x%20-%2026.2.zip",
+   "sha1": "48dc52a6bbceab45fe385451372d7e1633eb3bf4",
+   "size": 10450190,
+   "why": "игра 26.1.2 отвергает пак без min_format/max_format",
+   "set": {"pack.mcmeta": "{\n  \"pack\": {\n    \"description\": \"The go-to 32x resource pack.\",\n    \"pack_format\": 88,\n    \"min_format\": 84,\n    \"max_format\": 88\n  }\n}"}
+  }
+ ]
+}
