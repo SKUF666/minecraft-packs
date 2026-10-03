@@ -12,7 +12,6 @@
 перезаливать, OptiFine). У тех, у кого они уже есть, программа их не трогает.
 """
 import argparse
-import glob
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -40,8 +39,14 @@ def load_ps(lib):
     return mod
 
 
-def gh(*args, check=True):
-    r = subprocess.run(['gh', *args], capture_output=True, text=True, encoding='utf-8', errors='replace')
+def gh(*args, check=True, timeout=None):
+    try:
+        r = subprocess.run(['gh', *args], capture_output=True, text=True, encoding='utf-8', errors='replace',
+                           timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if check:
+            raise RuntimeError('gh %s: зависло дольше %d с' % (' '.join(args[:3]), timeout))
+        return subprocess.CompletedProcess(args, 1, '', 'зависло, повторяю')
     if check and r.returncode:
         raise RuntimeError('gh %s: %s' % (' '.join(args[:3]), r.stderr.strip()[-800:]))
     return r
@@ -241,8 +246,9 @@ def main():
     for i, p in enumerate(upload, 1):
         print('Загружаю %d/%d %s (%.0f МБ)' % (i, len(upload), os.path.basename(p), os.path.getsize(p) / 1048576),
               flush=True)
-        for attempt in range(3):
-            r = gh('release', 'upload', TAG, p, '--repo', REPO, '--clobber', check=False)
+        for attempt in range(5):
+            r = gh('release', 'upload', TAG, p, '--repo', REPO, '--clobber', check=False,
+                   timeout=180 + os.path.getsize(p) // 150000)
             if r.returncode == 0:
                 break
             print('  повтор:', r.stderr.strip()[-200:])

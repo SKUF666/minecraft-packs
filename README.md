@@ -2,6 +2,8 @@
 
 Программа для Windows, которая одной кнопкой ставит карты и сборки модов Minecraft, выбирает нужную версию в TLauncher, добавляет серверы и помогает играть с другом через Hamachi или Radmin VPN.
 
+![Окно программы](docs/screenshot.png)
+
 ## Как скачать
 
 1. Скачай **[Minecraft-Packs.zip](https://github.com/SKUF666/minecraft-packs/releases/latest/download/Minecraft-Packs.zip)**.

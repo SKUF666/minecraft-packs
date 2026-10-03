@@ -22,6 +22,7 @@ import threading
 import subprocess
 import urllib.request
 import urllib.parse
+import urllib.error
 
 ROOT = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 MC = os.path.join(os.environ["APPDATA"], ".minecraft")
@@ -260,12 +261,25 @@ def set_tlauncher_version(version):
     return True
 
 
+_DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+_NET = {"direct": False}
+
+
+def urlopen(req, timeout, attempt=0):
+    """Через системный прокси (VPN) или напрямую; при неудаче следующая попытка идёт другим путём,
+    удачный путь запоминается. Через некоторые VPN GitHub отвечает 503 на скачивание из релизов."""
+    direct = bool(urllib.request.getproxies()) and (_NET["direct"] != bool(attempt % 2))
+    r = _DIRECT.open(req, timeout=timeout) if direct else urllib.request.urlopen(req, timeout=timeout)
+    _NET["direct"] = direct
+    return r
+
+
 def _download(url, tries=4):
     last = None
-    for _ in range(tries):
+    for i in range(tries):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "MinecraftPacks/2.0"})
-            return urllib.request.urlopen(req, timeout=90).read()
+            return urlopen(req, 90, i).read()
         except Exception as e:
             last = e
             time.sleep(2)
@@ -1201,10 +1215,22 @@ def load_local_manifest():
         return {}
 
 
-def fetch_remote_manifest(timeout=15):
-    req = urllib.request.Request(REMOTE_MANIFEST + "?t=%d" % int(time.time()),
-                                 headers={"User-Agent": "MinecraftPacks/3.0", "Cache-Control": "no-cache"})
-    return json.loads(urllib.request.urlopen(req, timeout=timeout).read().decode("utf-8"))
+def fetch_remote_manifest(timeout=15, tries=6):
+    """Опись последней версии. GitHub иногда отвечает 503, поэтому несколько попыток."""
+    last = None
+    for i in range(tries):
+        req = urllib.request.Request(REMOTE_MANIFEST + "?t=%d" % int(time.time() * 1000),
+                                     headers={"User-Agent": "MinecraftPacks/3.0", "Cache-Control": "no-cache"})
+        try:
+            return json.loads(urlopen(req, timeout, i).read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code == 404:
+                raise RuntimeError("на GitHub ещё нет ни одной версии")
+        except Exception as e:
+            last = e
+        time.sleep(1.0 + i)
+    raise RuntimeError(str(last))
 
 
 def _sha1_file(path):
@@ -1358,7 +1384,7 @@ def _fetch_to(url, dst, progress=None, expect_sha1=None, cancel=None):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "MinecraftPacks/3.0"})
             h = hashlib.sha1()
-            with urllib.request.urlopen(req, timeout=60) as r, open(lp(dst) + ".part", "wb") as out:
+            with urlopen(req, 60, attempt) as r, open(lp(dst) + ".part", "wb") as out:
                 while True:
                     if cancel and cancel.is_set():
                         raise RuntimeError("отменено")
@@ -1377,7 +1403,7 @@ def _fetch_to(url, dst, progress=None, expect_sha1=None, cancel=None):
             last = e
             if cancel and cancel.is_set():
                 raise
-            time.sleep(2 + attempt * 3)
+            time.sleep(1 + attempt * 2)
     raise RuntimeError("не удалось скачать %s: %s" % (url.rsplit("/", 1)[-1], last))
 
 
