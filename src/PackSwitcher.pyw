@@ -1364,7 +1364,7 @@ def plan_update(remote, root=ROOT, log=print):
         pre = b["path"] + "/mods/"
         allowed = set(b["jars"]) | {f["path"][len(pre):] for f in remote.get("files", []) if f["path"].startswith(pre)}             | {x[len(pre):] for x in local_only if x.startswith(pre)}
         remove += [pre + j for j in jars(os.path.join(root, b["path"], "mods")) if j not in allowed]
-    size = sum(b.get("size", 0) for b in blocks) + sum(f.get("size", 0) for f in files)
+    size = sum(b.get("size", 0) for b in blocks) + sum(f.get("size", 0) for f in {x["sha1"]: x for x in files}.values())
     return {"version": remote.get("version"), "blocks": blocks, "files": files, "remove": remove, "size": size,
             "changes": remote.get("changes", [])}
 
@@ -1471,8 +1471,9 @@ def apply_update(remote, plan, root=ROOT, log=print, progress=None, cancel=None)
             else:
                 with lock:
                     tick(f.get("size", 0))
+        uniq = list({f["sha1"]: f for f in files}.values())  # один и тот же мод бывает в нескольких сборках
         with ThreadPoolExecutor(4) as ex:
-            for r in ex.map(one, files):
+            for r in ex.map(one, uniq):
                 pass
     if cancel and cancel.is_set():
         raise RuntimeError("отменено")
@@ -1514,7 +1515,8 @@ def apply_update(remote, plan, root=ROOT, log=print, progress=None, cancel=None)
         dst = os.path.join(root, f["path"])
         if os.path.exists(lp(dst)):
             _move(dst, os.path.join(old_dir, f["path"]))
-        _move(os.path.join(dl, "f_" + f["sha1"]), dst)
+        os.makedirs(os.path.dirname(lp(dst)), exist_ok=True)
+        shutil.copy2(lp(os.path.join(dl, "f_" + f["sha1"])), lp(dst))
     for p in plan["remove"]:
         log("Убираю старое: %s" % p)
         _move(os.path.join(root, p), os.path.join(old_dir, p))
