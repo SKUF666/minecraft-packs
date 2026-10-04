@@ -2,7 +2,7 @@
     python tools/test_launchers.py"""
 import importlib.machinery, importlib.util, json, os, sys, tempfile, zipfile
 sys.stdout.reconfigure(encoding='utf-8')
-LIB = os.path.join(os.environ['LOCALAPPDATA'], 'Portalis')
+LIB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'library')
 L = importlib.machinery.SourceFileLoader('ps', os.path.join(LIB, 'PackSwitcher.pyw'))
 ps = importlib.util.module_from_spec(importlib.util.spec_from_loader('ps', L)); L.exec_module(ps)
 tmp = tempfile.mkdtemp(prefix='kubo-test-')

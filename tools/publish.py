@@ -1,4 +1,4 @@
-"""Выпуск новой версии Portalis (библиотека в папке %LOCALAPPDATA%/Portalis) в релиз GitHub (тег library).
+"""Выпуск новой версии Portalis (рабочая библиотека - папка library рядом с tools) в релиз GitHub (тег library).
 
     python tools/publish.py [--dry] [--note "текст для «Что нового»"] [--lib "путь к библиотеке"]
 
@@ -142,6 +142,8 @@ def library_files(ps, lib):
             continue
         if '/natives/' in rel and '/versions/' in rel:
             continue  # лаунчер распаковывает их сам при запуске
+        if top in ('Скины',):
+            continue  # личные скины пользователя
         out.append(rel)
     return sorted(out)
 
@@ -154,7 +156,7 @@ def host_name(url):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--lib', default=os.path.join(os.environ['LOCALAPPDATA'], 'Portalis'))
+    ap.add_argument('--lib', default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'library'))
     ap.add_argument('--dry', action='store_true', help='всё посчитать и собрать, но не загружать')
     ap.add_argument('--note', action='append', default=[], help='строка в «Что нового»')
     ap.add_argument('--version', help='номер версии (по умолчанию дата)')
@@ -171,7 +173,8 @@ def main():
     idx = archive_index(ps, archives)
 
     # 1. Части библиотеки.
-    packs = ps.find_packs()
+    packs = [p for p in ps.find_packs() if not p.get('user')]  # свои сборки из конструктора не публикуются
+    user_dirs = {os.path.relpath(p['path'], lib).replace('\\', '/') for p in ps.find_packs() if p.get('user')}
     pack_dirs = {os.path.relpath(p['path'], lib).replace('\\', '/'): p for p in packs}
     maps = ps.find_maps()
     map_dirs = {os.path.relpath(m['path'], lib).replace('\\', '/'): m for m in maps}
@@ -203,7 +206,7 @@ def main():
         return {x['id'] for x in archives if x['id'] in key.lower().replace(' ', '-')}
 
     cache = ps.HashCache(lib)
-    files = library_files(ps, lib)
+    files = [f for f in library_files(ps, lib) if not any(f.startswith(d + '/') for d in user_dirs)]
     # Faithful и подобные: пересобрать из оригинала, чтобы у всех получался одинаковый файл.
     zrules = {z['name']: z for z in extra.get('zpatch', [])}
     for rel in files:
@@ -435,6 +438,10 @@ def main():
     upload(mpath)
     used = {i['list'] for i in mitems} | {i['own'] for i in mitems if i['own']} | {STARTER, ps.EXE_NAME, 'manifest.json'} | set(STARTERS_OLD) \
         | {b['asset'] for b in blocks if b.get('asset')}
+    # Файлы прошлой версии не удаляем: GitHub ещё пару минут раздаёт старую опись из кэша, а у кого-то
+    # скачивание уже идёт по ней. Удаляется только то, что не нужно ни новой, ни прошлой описи.
+    used |= {i.get('list') for i in remote.get('items', [])} | {i.get('own') for i in remote.get('items', [])} \
+        | {b.get('asset') for b in remote.get('blocks', [])}
     for name in assets:
         if name not in used:
             gh('release', 'delete-asset', TAG, name, '--repo', REPO, '--yes', check=False)

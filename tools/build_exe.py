@@ -2,7 +2,7 @@
 import os, sys, shutil, subprocess, time
 from PIL import Image
 sys.stdout.reconfigure(encoding='utf-8')
-LIB = os.path.join(os.environ['LOCALAPPDATA'], 'Portalis')
+LIB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'library')
 B = os.path.join(os.environ.get('TEMP', '.'), 'minecraft-packs-build')
 os.makedirs(B, exist_ok=True)
 shutil.copy2(os.path.join(LIB, 'PackSwitcher.pyw'), os.path.join(B, 'PackSwitcher.pyw'))
@@ -24,7 +24,10 @@ open(os.path.join(B, 'version.txt'), 'w', encoding='utf-8').write('''VSVersionIn
   VarFileInfo([VarStruct('Translation', [1049, 1200])])])
 ''' % (ver, ver, '.'.join(v), '.'.join(v)))
 r = subprocess.run([sys.executable, '-m', 'PyInstaller', '--noconfirm', '--onefile', '--windowed', '--icon', 'app.ico',
-                    '--version-file', 'version.txt', '--name', 'PackSwitcher', 'PackSwitcher.pyw'], cwd=B,
+                    '--version-file', 'version.txt', '--name', 'PackSwitcher',
+                    *sum((['--exclude-module', m] for m in ('numpy', 'scipy', 'pandas', 'matplotlib', 'IPython', 'PyQt5',
+                                                              'PySide6', 'cv2', 'olefile', 'defusedxml')), []),
+                    'PackSwitcher.pyw'], cwd=B,
                    capture_output=True, text=True)
 if r.returncode:
     print(r.stdout[-2000:], r.stderr[-3000:])

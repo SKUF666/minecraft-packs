@@ -3,7 +3,7 @@ import os, sys
 from PIL import Image, ImageDraw
 HERE = os.path.dirname(os.path.abspath(__file__))
 RAW = os.path.join(os.path.dirname(HERE), 'art-src')
-OUT = os.path.join(os.environ['LOCALAPPDATA'], 'Portalis', 'Оформление')
+OUT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'library', 'Оформление')
 os.makedirs(OUT, exist_ok=True)
 BG = (0x15, 0x16, 0x1a)
 Y0 = int(sys.argv[1]) if len(sys.argv) > 1 else 330
@@ -86,3 +86,51 @@ for n, sz in (('appicon_72.png', 72), ('appicon_96.png', 96)):
     sq.resize((sz, sz), Image.LANCZOS).save(os.path.join(OUT, n))
 sq.resize((256, 256), Image.LANCZOS).save(os.path.join(os.path.dirname(OUT), 'icon.png'))
 print('значки и иллюстрации готовы')
+
+
+# --- конструктор и скины (2026-10-04) ---
+sh = Image.open(os.path.join(RAW, '30_tabs2.png')).convert('RGBA')
+cw, ch = sh.width // 3, sh.height // 2
+for i, n in enumerate(['tab_builder', 'tab_skins', 'ic_cape', 'ic_mannequin', 'ic_add', 'ic_palette']):
+    cell = sh.crop(((i % 3) * cw, (i // 3) * ch, (i % 3 + 1) * cw, (i // 3 + 1) * ch))
+    bbox = cell.getchannel('A').point(lambda a: 255 if a > 24 else 0).getbbox()
+    cell = cell.crop(bbox)
+    side = max(cell.size)
+    sq = Image.new('RGBA', (side, side), (0, 0, 0, 0))
+    sq.paste(cell, ((side - cell.width) // 2, (side - cell.height) // 2), cell)
+    sq.resize((26 if n.startswith('tab_') else 18,) * 2, Image.LANCZOS).save(os.path.join(OUT, n + '.png'))
+    sq.resize((48, 48), Image.LANCZOS).save(os.path.join(OUT, n + '_48.png'))
+for src, dst, y0 in (('31_builder_hero.png', 'builder_wide.png', 245), ('32_skins_hero.png', 'skins_wide.png', 235)):
+    im = Image.open(os.path.join(RAW, src)).convert('RGB')
+    im = im.resize((1400, int(im.height * 1400 / im.width)), Image.LANCZOS)
+    im.crop((0, y0, 1400, y0 + 200)).save(os.path.join(OUT, dst))
+print('конструктор и скины: картинки готовы')
+
+
+# Левая часть широких картинок затемняется плавно: на ней заголовок и подпись.
+def darken_left(name, upto=0.62, strength=0.72):
+    p = os.path.join(OUT, name)
+    im = Image.open(p).convert('RGB')
+    w, h = im.size
+    mask = Image.new('L', (w, 1))
+    for x in range(w):
+        t = x / (w * upto)
+        mask.putpixel((x, 0), int(255 * strength * max(0.0, 1 - t) ** 1.2))
+    mask = mask.resize((w, h))
+    dark = Image.new('RGB', (w, h), (12, 13, 17))
+    Image.composite(dark, im, mask).save(p)
+
+
+for n in ('friends_wide.png', 'builder_wide.png', 'skins_wide.png'):
+    darken_left(n)
+print('затемнение готово')
+
+
+# Полупрозрачная тень слева для шапок вкладок: подпись читается при любой ширине окна.
+sh = Image.new('RGBA', (760, 220), (0, 0, 0, 0))
+for x in range(760):
+    a = int(215 * max(0.0, 1 - x / 760) ** 1.15)
+    for y in range(220):
+        sh.putpixel((x, y), (10, 11, 15, a))
+sh.save(os.path.join(OUT, 'shade_left.png'))
+print('тень готова')

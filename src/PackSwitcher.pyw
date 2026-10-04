@@ -31,6 +31,8 @@ import ctypes
 import ctypes.wintypes
 import webbrowser
 import concurrent.futures
+import traceback
+from PIL import Image as PILImage, ImageTk, ImageDraw  # значки Modrinth (webp) и превью скинов
 try:
     import winreg
 except ImportError:
@@ -359,6 +361,13 @@ def jars(d):
     return [f for f in os.listdir(d) if f.lower().endswith(".jar")]
 
 
+def n_mods(n):
+    """«1 мод», «3 мода», «21 мод», «129 модов»."""
+    n = int(n)
+    w = "мод" if n % 10 == 1 and n % 100 != 11 else ("мода" if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else "модов")
+    return "%d %s" % (n, w)
+
+
 def _listdir(d):
     try:
         return sorted(os.listdir(d))
@@ -440,7 +449,7 @@ def switch(pack, packs, copy_configs=True, log=print):
     known = known_files(packs)
 
     # 1. Моды, которых нет ни в одной сборке, не удаляем, а уносим в «_Несортированное».
-    stray = [f for f in jars(MODS) if (f, os.path.getsize(os.path.join(MODS, f))) not in known]
+    stray = [f for f in jars(MODS) if (f, os.path.getsize(os.path.join(MODS, f))) not in known and f != CSL["name"]]
     if stray:
         dst = os.path.join(UNSORTED, time.strftime("%Y-%m-%d_%H-%M-%S"))
         os.makedirs(dst, exist_ok=True)
@@ -455,6 +464,14 @@ def switch(pack, packs, copy_configs=True, log=print):
     for f in jars(src):
         shutil.copy2(os.path.join(src, f), os.path.join(MODS, f))
     log("Скопировано модов: %d" % len(jars(src)))
+    if pack.get("loader") in ("Fabric", "Forge", "NeoForge", "Quilt") and load_settings().get("offline_skins"):
+        try:
+            os.makedirs(os.path.dirname(MARKER), exist_ok=True)
+            with open(MARKER, "w", encoding="utf-8") as fh:  # put_csl_in_mods смотрит на текущую сборку
+                json.dump({"name": pack["name"], "version_dir": pack["version_dir"]}, fh, ensure_ascii=False)
+            put_csl_in_mods(log)
+        except Exception as e:
+            log("Мод для своих скинов не добавлен: %s" % e)
 
     # 3. Конфиги поверх текущих. Недостающие паки ресурсов и шейдеров.
     if copy_configs:
@@ -1049,12 +1066,12 @@ def join_friend(text, packs=None, log=print):
     host, _, port = address.rpartition(":")
     vpn = vpn_addresses()
     if not vpn:
-        log("Внимание: Hamachi не запущен. Включи его и войди в сеть друга.")
+        log("Внимание: не нашёл подключённую VPN-сеть (Hamachi, Radmin VPN или ZeroTier). Включи её и войди в сеть друга.")
     try:
         info = ping_server(host, int(port))
         log("Игра друга отвечает: версия %s, игроков %s из %s" % (info["version"], info["online"], info["max"]))
     except Exception as e:
-        log("Игра друга пока не отвечает (%s). Проверь, что вы в одной сети Hamachi и мир открыт для сети." % e)
+        log("Игра друга пока не отвечает (%s). Проверь, что вы в одной сети и мир открыт для сети." % e)
     return ok
 
 
@@ -1252,7 +1269,7 @@ def select_version(version, title="", log=print):
     missing = not os.path.isfile(os.path.join(vdir, version + ".json"))
     if mode == "tl":
         ok = set_tlauncher_version(version)
-        log("Версия в TLauncher: %s%s" % (version, "" if ok else " (TLauncher открыт, выберите версию в нём вручную)"))
+        log("Версия в TLauncher: %s%s" % (version, "" if ok else " (TLauncher открыт, выбери версию в нём вручную)"))
         return ok, "" if ok else "TLauncher был открыт, поэтому версию «%s» выбери в нём сам." % version
     if mode == "legacy":
         p = legacy_props()
@@ -1373,6 +1390,10 @@ def export_mrpack(m=None, pack=None, log=print):
                     urls[f["p"]] = f["src"]["u"]
         except Exception:
             pass
+    if pack and pack.get("mr_files"):
+        base = os.path.relpath(pack["path"], ROOT).replace("\\", "/")
+        for k, u in pack["mr_files"].items():
+            urls[base + "/" + k] = u
     mc_ver = pack["minecraft"] if pack else m["version"]
     deps = {"minecraft": mc_ver}
     if pack and pack.get("loader") in ("Fabric", "Forge") and pack.get("loader_version"):
@@ -1710,6 +1731,10 @@ def load_local_manifest(root=ROOT):
 load_manifest_at = load_local_manifest
 
 
+class AssetGone(RuntimeError):
+    """Файла уже нет в релизе GitHub: пока качали, вышла новая версия (или GitHub ещё отдаёт старую опись)."""
+
+
 def _get(url, timeout=30, tries=6, headers=None):
     """Небольшой файл целиком. GitHub иногда отвечает 503, поэтому несколько попыток разными путями."""
     last = None
@@ -1720,7 +1745,7 @@ def _get(url, timeout=30, tries=6, headers=None):
         except urllib.error.HTTPError as e:
             last = e
             if e.code == 404:
-                raise RuntimeError("на GitHub нет файла %s" % url.rsplit("/", 1)[-1].split("?")[0])
+                raise AssetGone("на GitHub нет файла %s" % url.rsplit("/", 1)[-1].split("?")[0])
         except Exception as e:
             last = e
         time.sleep(1.0 + i)
@@ -2102,6 +2127,8 @@ def _fetch_to(url, dst, progress=None, expect_sha1=None, cancel=None, headers=No
                 progress(-got)
             if cancel and cancel.is_set():
                 raise
+            if isinstance(e, urllib.error.HTTPError) and e.code == 404 and "/releases/download/" in url:
+                raise AssetGone("на GitHub уже нет файла %s" % urllib.parse.unquote(url.rsplit("/", 1)[-1]))
             time.sleep(1 + attempt * 2)
     raise RuntimeError("не удалось скачать %s: %s" % (urllib.parse.unquote(url.rsplit("/", 1)[-1]), last))
 
@@ -2188,7 +2215,32 @@ def _lay_out(need, root, stage, old_dir):
 
 def apply_plan(man, plan, root=ROOT, log=print, progress=None, cancel=None, ask_browser=None):
     with PLAN_LOCK:
-        return _apply_plan(man, plan, root, log, progress, cancel, ask_browser)
+        try:
+            return _apply_plan(man, plan, root, log, progress, cancel, ask_browser)
+        except AssetGone:
+            fresh = fresh_manifest_after(man, cancel)
+            if not fresh:
+                raise
+        log("Пока качал, на GitHub вышла версия %s - докачиваю её" % fresh.get("version"))
+        ids = [i for i in plan.get("items", []) if (manifest_item(man, i) or {}).get("kind") in ("pack", "map")]
+        plan2 = plan_download(fresh, ids, root, lambda *a: None) if ids else plan_update(fresh, root, lambda *a: None)
+        return _apply_plan(fresh, plan2, root, log, progress, cancel, ask_browser)
+
+
+def fresh_manifest_after(man, cancel=None, wait=150):
+    """Опись новее, чем man. GitHub раздаёт manifest.json через кэш, свежая опись появляется до пары минут."""
+    t0 = time.time()
+    while time.time() - t0 < wait:
+        if cancel and cancel.is_set():
+            return None
+        try:
+            fresh = fetch_remote_manifest()
+            if fresh.get("version") != man.get("version") and fresh.get("items"):
+                return fresh
+        except Exception:
+            pass
+        time.sleep(10)
+    return None
 
 
 def _apply_plan(man, plan, root=ROOT, log=print, progress=None, cancel=None, ask_browser=None):
@@ -2421,6 +2473,651 @@ def fmt_mb(n):
         return "%.1f ГБ" % (mb / 1024)
     return "%.0f МБ" % max(1, mb) if mb >= 1 else "меньше 1 МБ"
 
+# ---------- конструктор сборок (Modrinth) ----------
+#
+# Поиск любых модов, шейдеров и текстур на Modrinth под выбранную версию игры и загрузчик.
+# Обязательные зависимости подбираются сами (рекурсивно), несовместимые моды показываются заранее.
+# Готовая сборка сохраняется в библиотеку как обычная: <Загрузчик> <версия>\<название> (N)\mods + pack.json.
+
+MR_API = "https://api.modrinth.com/v2/"
+MR_UA = {"User-Agent": "SKUF666/portalis (github.com/SKUF666/minecraft-packs)"}
+LOADER_TITLES = {"fabric": "Fabric", "quilt": "Quilt", "forge": "Forge", "neoforge": "NeoForge"}
+MR_CATEGORIES = [("optimization", "Оптимизация"), ("utility", "Удобства"), ("adventure", "Приключения"),
+                 ("magic", "Магия"), ("technology", "Техника"), ("mobs", "Мобы"), ("worldgen", "Генерация мира"),
+                 ("equipment", "Снаряжение"), ("decoration", "Декор"), ("food", "Еда"), ("storage", "Хранение"),
+                 ("transportation", "Транспорт"), ("game-mechanics", "Механики"), ("library", "Библиотеки")]
+MR_TYPES = [("mod", "Моды"), ("shader", "Шейдеры"), ("resourcepack", "Текстуры")]
+TYPE_DIRS = {"mod": "mods", "shader": "shaderpacks", "resourcepack": "resourcepacks"}
+# Шейдерам нужен загрузчик шейдеров: его конструктор добавляет сам.
+SHADER_LOADERS = {"fabric": ["iris"], "quilt": ["iris"], "neoforge": ["iris"], "forge": ["oculus"]}
+
+
+def mr_get(path, params=None):
+    url = MR_API + path + ("?" + urllib.parse.urlencode(params) if params else "")
+    return json.loads(_get(url, 30, 4, MR_UA).decode("utf-8"))
+
+
+def mr_game_versions():
+    """Релизные версии игры, для которых на Modrinth есть моды (новые сверху)."""
+    try:
+        return [t["version"] for t in mr_get("tag/game_version") if t["version_type"] == "release"]
+    except Exception:
+        return ["26.2", "26.1.2", "1.21.8", "1.21.1", "1.20.1", "1.19.2", "1.18.2", "1.16.5", "1.12.2"]
+
+
+def mr_search(query, gv, loader, ptype="mod", category=None, index="downloads", offset=0, limit=20):
+    facets = [["project_type:%s" % ptype], ["versions:%s" % gv]]
+    if ptype == "mod":
+        facets.append(["categories:%s" % loader] + (["categories:fabric"] if loader == "quilt" else []))
+    if category:
+        facets.append(["categories:%s" % category])
+    r = mr_get("search", {"query": query or "", "facets": json.dumps(facets), "index": index,
+                          "offset": offset, "limit": limit})
+    return r["hits"], r["total_hits"]
+
+
+def _loaders_for(loader, ptype):
+    if ptype == "mod":
+        return [loader] + (["fabric"] if loader == "quilt" else [])
+    if ptype == "shader":
+        return None  # у шейдеров «загрузчик» - iris/optifine/canvas, фильтровать по нему не нужно
+    return None
+
+
+def pick_version(project_id, gv, loader, ptype="mod"):
+    """Лучшая версия проекта для версии игры и загрузчика: сначала релизы, потом беты, свежие выше."""
+    params = {"game_versions": json.dumps([gv])}
+    lds = _loaders_for(loader, ptype)
+    if lds:
+        params["loaders"] = json.dumps(lds)
+    vs = mr_get("project/%s/version" % project_id, params)
+    if not vs:
+        return None
+    rank = {"release": 0, "beta": 1, "alpha": 2}
+    vs.sort(key=lambda v: v.get("date_published", ""), reverse=True)
+    vs.sort(key=lambda v: rank.get(v.get("version_type"), 3))
+    return vs[0]
+
+
+def resolve_build(selection, gv, loader, log=print):
+    """selection: [{project_id, title, type}]. Возвращает (список файлов сборки, список проблем).
+    Обязательные зависимости добавляются рекурсивно; несовместимые пары и моды без версии - в проблемы."""
+    chosen, problems, incompat = {}, [], []
+    queue = [(dict(p), None) for p in selection]
+    if any(p.get("type") == "shader" for p in selection):
+        for slug in SHADER_LOADERS.get(loader, []):
+            queue.append(({"project_id": slug, "title": None, "type": "mod"}, "шейдеры"))
+    seen_slugs = set()
+    while queue:
+        proj, reason = queue.pop(0)
+        pid = proj["project_id"]
+        if pid in chosen or pid in seen_slugs:
+            continue
+        seen_slugs.add(pid)
+        log("Проверяю: %s" % (proj.get("title") or pid))
+        try:
+            v = pick_version(pid, gv, loader, proj.get("type", "mod"))
+        except Exception as e:
+            problems.append("«%s»: не удалось узнать версии (%s)" % (proj.get("title") or pid, str(e)[:60]))
+            continue
+        if not v:
+            problems.append("«%s» нет для %s %s — пропущен" % (proj.get("title") or pid, LOADER_TITLES[loader], gv)
+                            + ("" if not reason else " (нужен для «%s»)" % reason))
+            continue
+        real = v["project_id"]
+        if real in chosen:
+            continue
+        f = next((x for x in v["files"] if x.get("primary")), v["files"][0])
+        chosen[real] = {"project_id": real, "title": proj.get("title"), "type": proj.get("type", "mod"),
+                        "version_id": v["id"], "version": v["version_number"], "file": f["filename"], "url": f["url"],
+                        "sha1": f["hashes"]["sha1"], "sha512": f["hashes"].get("sha512"), "size": f["size"],
+                        "reason": reason, "picked": reason is None}
+        for d in v.get("dependencies", []):
+            dpid = d.get("project_id")
+            if not dpid and d.get("version_id"):
+                try:
+                    dpid = mr_get("version/%s" % d["version_id"])["project_id"]
+                except Exception:
+                    dpid = None
+            if not dpid:
+                continue
+            if d["dependency_type"] == "required":
+                queue.append(({"project_id": dpid, "title": None, "type": "mod"},
+                              proj.get("title") or real))
+            elif d["dependency_type"] == "incompatible":
+                incompat.append((real, dpid))
+    # Названия и категории (библиотеки отдельно).
+    ids = list(chosen)
+    for i in range(0, len(ids), 80):
+        try:
+            for pr in mr_get("projects", {"ids": json.dumps(ids[i:i + 80])}):
+                c = chosen.get(pr["id"])
+                if c:
+                    c["title"] = c["title"] or pr["title"]
+                    c["slug"] = pr.get("slug")
+                    c["desc"] = pr.get("description", "")
+                    c["icon"] = pr.get("icon_url")
+                    c["categories"] = pr.get("categories", [])
+                    c["client_side"], c["server_side"] = pr.get("client_side"), pr.get("server_side")
+        except Exception:
+            pass
+    for c in chosen.values():
+        if c.get("reason") and c["reason"] in chosen:
+            c["reason"] = chosen[c["reason"]]["title"]
+    for a, b in incompat:
+        if b in chosen:
+            problems.append("«%s» несовместим с «%s»: оставь что-то одно" % (chosen[a]["title"], chosen[b]["title"]))
+    return list(chosen.values()), problems
+
+
+def loader_version(loader, gv):
+    """Свежая стабильная версия загрузчика для версии игры."""
+    if loader == "fabric":
+        lst = json.loads(_get("https://meta.fabricmc.net/v2/versions/loader/%s" % gv).decode("utf-8"))
+        st = [x for x in lst if x["loader"].get("stable")] or lst
+        return st[0]["loader"]["version"]
+    if loader == "quilt":
+        lst = json.loads(_get("https://meta.quiltmc.org/v3/versions/loader/%s" % gv).decode("utf-8"))
+        return lst[0]["loader"]["version"]
+    if loader == "forge":
+        pr = json.loads(_get("https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json").decode("utf-8"))
+        v = pr["promos"].get("%s-recommended" % gv) or pr["promos"].get("%s-latest" % gv)
+        if not v:
+            raise RuntimeError("для %s нет Forge" % gv)
+        return v
+    if loader == "neoforge":
+        vs = json.loads(_get("https://maven.neoforged.net/api/maven/versions/releases/net/neoforged/neoforge").decode("utf-8"))["versions"]
+        parts = gv.split(".")
+        pre = ".".join(parts[1:]) + "." if parts[0] == "1" else gv + "."  # 1.21.1 -> 21.1.x, 26.1.2 -> 26.1.2.x
+        cand = [v for v in vs if v.startswith(pre)]
+        stable = [v for v in cand if "beta" not in v and "alpha" not in v]
+        if not (stable or cand):
+            raise RuntimeError("для %s нет NeoForge" % gv)
+        return (stable or cand)[-1]
+    raise RuntimeError("неизвестный загрузчик " + loader)
+
+
+def _safe_name(name):
+    name = re.sub(r'[\\/:*?"<>|]', "", name).strip().rstrip(".")
+    return name[:60] or "Моя сборка"
+
+
+def _cover_from_icon(url, folder):
+    """Обложка сборки из значка первого мода (Modrinth отдаёт webp - переводим в PNG)."""
+    try:
+        data = _get(url, 30, 3, MR_UA)
+        im = PILImage.open(io.BytesIO(data)).convert("RGBA")
+        for name, size in (("cover.png", 120), ("cover_big.png", 220)):
+            bg = PILImage.new("RGBA", (size, size), (36, 38, 45, 255))
+            ic = im.resize((size, size), PILImage.NEAREST if im.width <= 64 else PILImage.LANCZOS)
+            bg.alpha_composite(ic)
+            bg.save(os.path.join(folder, name))
+        return True
+    except Exception:
+        return False
+
+
+def save_build(name, gv, loader, files, selection, description="", replace=False, log=print, progress=None, cancel=None):
+    """Скачивает файлы сборки с Modrinth (с проверкой sha1) и сохраняет её в библиотеку. Возвращает папку."""
+    name = _safe_name(name)
+    n_mods_count = sum(1 for f in files if f["type"] == "mod")
+    vdir = "%s %s" % (LOADER_TITLES[loader], gv)
+    folder = os.path.join(ROOT, vdir, "%s (%d)" % (name, n_mods_count))
+    old = [p for p in find_packs() if p.get("name", "").rsplit(" (", 1)[0] == name and p["version_dir"] == vdir]
+    if old and not replace:
+        raise RuntimeError("Сборка «%s» для %s уже есть. Выбери другое название." % (name, vdir))
+    log("Узнаю версию %s для %s" % (LOADER_TITLES[loader], gv))
+    lv = loader_version(loader, gv)
+    tmp = folder + ".tmp"
+    shutil.rmtree(lp(tmp), ignore_errors=True)
+    os.makedirs(tmp)
+    total = max(1, sum(f["size"] for f in files))
+    done = [0]
+
+    def tick(n):
+        done[0] += n
+        if progress:
+            progress(done[0], total)
+    mr_files = {}
+    for i, f in enumerate(files, 1):
+        sub = TYPE_DIRS.get(f["type"], "mods")
+        log("Скачиваю %d из %d: %s" % (i, len(files), f["title"] or f["file"]))
+        _fetch_to(f["url"], os.path.join(tmp, sub, f["file"]), tick, f["sha1"], cancel, MR_UA)
+        mr_files["%s/%s" % (sub, f["file"])] = f["url"]
+    if loader in ("fabric", "quilt"):
+        meta = ("https://meta.fabricmc.net/v2/versions/loader/%s/%s/profile/json" if loader == "fabric"
+                else "https://meta.quiltmc.org/v3/versions/loader/%s/%s/profile/json") % (gv, lv)
+        prof = json.loads(_get(meta).decode("utf-8"))
+        tl = prof["id"]
+        os.makedirs(os.path.join(tmp, "versions", tl), exist_ok=True)
+        with open(os.path.join(tmp, "versions", tl, tl + ".json"), "w", encoding="utf-8") as fh:
+            json.dump(prof, fh, indent=1)
+    else:
+        tl = "%s %s" % (LOADER_TITLES[loader], gv)  # так версии с Forge и NeoForge называет TLauncher
+    picked = [f for f in files if f.get("picked")]
+    icon = next((f.get("icon") for f in picked if f.get("icon")), None) or next((f.get("icon") for f in files if f.get("icon")), None)
+    if not (icon and _cover_from_icon(icon, tmp)):
+        try:
+            shutil.copy2(os.path.join(ROOT, "Оформление", "tab_packs_64.png"), os.path.join(tmp, "cover.png"))
+        except OSError:
+            pass
+    cats = dict(MR_CATEGORIES)
+    mods = []
+    for f in files:
+        cat = "Библиотеки" if "library" in (f.get("categories") or []) or (f.get("reason") and not f.get("picked")) else \
+            next((cats[c] for c in (f.get("categories") or []) if c in cats), "Моды")
+        if f["type"] != "mod":
+            cat = "Шейдеры" if f["type"] == "shader" else "Текстур-паки"
+        ru = f.get("desc", "")
+        if f.get("reason") and not f.get("picked"):
+            ru = ("Нужен для «%s». " % f["reason"]) + ru
+        mods.append({"name": f["title"] or f["file"], "version": f["version"], "file": f["file"], "cat": cat, "ru": ru,
+                     "mb": round(f["size"] / 1048576, 1)})
+    order = [c for _k, c in MR_CATEGORIES if c != "Библиотеки"] + ["Моды", "Шейдеры", "Текстур-паки", "Библиотеки"]
+    with open(os.path.join(tmp, "mods.json"), "w", encoding="utf-8") as fh:
+        json.dump({"order": [c for c in order if any(m["cat"] == c for m in mods)], "mods": mods}, fh,
+                  ensure_ascii=False, indent=1)
+    pj = {"name": "%s (%d)" % (name, n_mods_count), "loader": LOADER_TITLES[loader], "minecraft": gv, "tl_version": tl,
+          "loader_version": lv, "description": description or "Своя сборка из конструктора: %s." % n_mods(n_mods_count),
+          "is_pack": True, "user": True, "mr_files": mr_files,
+          "constructor": {"loader": loader, "gv": gv, "projects": [{"project_id": f["project_id"], "title": f["title"],
+                                                                    "type": f["type"], "icon": f.get("icon")} for f in picked]}}
+    with open(os.path.join(tmp, "pack.json"), "w", encoding="utf-8") as fh:
+        json.dump(pj, fh, ensure_ascii=False, indent=1)
+    if loader in ("fabric", "quilt"):
+        try:
+            ensure_vanilla(gv, log)
+        except Exception as e:
+            log("Minecraft %s скачается лаунчером при запуске (%s)" % (gv, str(e)[:60]))
+    stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+    for p in old:  # прежняя версия этой сборки - в Корзину
+        dst = os.path.join(ROOT, "_update", "old_" + stamp, os.path.basename(p["path"]))
+        _move(p["path"], dst)
+    os.replace(lp(tmp), lp(folder))
+    if old:
+        cleanup_after_update()
+    log("Сборка «%s» сохранена: %s, %s" % (name, vdir, n_mods(n_mods_count)))
+    return folder
+
+
+def delete_user_pack(pack, log=print):
+    """Своя сборка из конструктора - в Корзину (сборки из каталога так не удаляются)."""
+    if not pack.get("user"):
+        raise RuntimeError("Это сборка из каталога: её можно только «Удалить скачанное».")
+    stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+    _move(pack["path"], os.path.join(ROOT, "_update", "old_" + stamp, os.path.basename(pack["path"])))
+    cleanup_after_update()
+    log("Сборка «%s» убрана в Корзину" % pack["name"])
+
+
+# ---------- скины и плащи ----------
+#
+# Скин по нику ищется сразу в трёх местах: TLauncher, Ely.by (им пользуется Legacy Launcher) и Mojang (лицензия).
+# «Мои скины» - PNG в папке «Скины» (+ skins.json: модель руки и плащ). Стандартные скины берутся из файла игры,
+# галерея - с MineSkin (скины, загруженные игроками). Носить свой скин и плащ без интернета помогает мод
+# CustomSkinLoader: программа кладёт его в mods и раскладывает файлы в .minecraft\CustomSkinLoader\LocalSkin.
+
+SKINS_DIR = os.path.join(ROOT, "Скины")
+CSL = {"name": "CustomSkinLoader_Universal-15.0.1.jar",
+       "url": "https://cdn.modrinth.com/data/idMHQ4n2/versions/OLaesh5y/CustomSkinLoader_Universal-15.0.1.jar",
+       "sha1": "ab8dd841cafc3b4ecbf0250d3f5aee8a1fdb506a"}
+SKIN_UA = {"User-Agent": "Portalis/1.0 (+https://github.com/SKUF666/minecraft-packs)"}
+
+
+def _get_json_or_none(url):
+    try:
+        data = _get(url, 15, 2, SKIN_UA)
+    except Exception:
+        return None
+    if not data.strip():
+        return None
+    try:
+        return json.loads(data.decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _first_cape_frame(png, cape_height=None):
+    """Анимированный плащ TLauncher - вертикальная полоса кадров; берём первый кадр."""
+    try:
+        im = PILImage.open(io.BytesIO(png))
+        if cape_height and im.height > cape_height:
+            im = im.crop((0, 0, im.width, cape_height))
+            out = io.BytesIO()
+            im.save(out, "PNG")
+            return out.getvalue()
+    except Exception:
+        pass
+    return png
+
+
+def skin_lookup(nick):
+    """Скины и плащи игрока по нику: [{source, skin(bytes), cape(bytes|None), slim}]."""
+    nick = nick.strip()
+    out = []
+
+    def tl():
+        j = _get_json_or_none("https://auth.tlauncher.org/skin/v1/profile/texture/login/" + urllib.parse.quote(nick))
+        if not j or "SKIN" not in j:
+            return None
+        def full(u):
+            return u if u.startswith("http") else "https://auth.tlauncher.org/" + u.lstrip("/")
+        skin = _get(full(j["SKIN"]["url"]), 20, 2, SKIN_UA)
+        cape = None
+        if j.get("CAPE"):
+            try:
+                cape = _first_cape_frame(_get(full(j["CAPE"]["url"]), 20, 2, SKIN_UA), j["CAPE"].get("capeHeight"))
+            except Exception:
+                cape = None
+        return {"source": "TLauncher", "skin": skin, "cape": cape,
+                "slim": (j["SKIN"].get("metadata") or {}).get("model") == "slim"}
+
+    def ely():
+        j = _get_json_or_none("https://skinsystem.ely.by/textures/" + urllib.parse.quote(nick))
+        if not j or "SKIN" not in j or "textures.minecraft.net" in j["SKIN"]["url"]:
+            return None  # Ely.by для незнакомых ников отдаёт скины Mojang - их покажет источник Mojang
+        skin = _get(j["SKIN"]["url"], 20, 2, SKIN_UA)
+        cape = _get(j["CAPE"]["url"], 20, 2, SKIN_UA) if j.get("CAPE") else None
+        return {"source": "Ely.by", "skin": skin, "cape": cape,
+                "slim": (j["SKIN"].get("metadata") or {}).get("model") == "slim"}
+
+    def mojang():
+        j = _get_json_or_none("https://api.mojang.com/users/profiles/minecraft/" + urllib.parse.quote(nick))
+        if not j or "id" not in j:
+            return None
+        prof = _get_json_or_none("https://sessionserver.mojang.com/session/minecraft/profile/" + j["id"])
+        if not prof:
+            return None
+        tex = json.loads(base64.b64decode(prof["properties"][0]["value"]).decode("utf-8"))["textures"]
+        if "SKIN" not in tex:
+            return None
+        skin = _get(tex["SKIN"]["url"].replace("http://", "https://"), 20, 2, SKIN_UA)
+        cape = _get(tex["CAPE"]["url"].replace("http://", "https://"), 20, 2, SKIN_UA) if tex.get("CAPE") else None
+        return {"source": "Mojang (лицензия)", "skin": skin, "cape": cape,
+                "slim": (tex["SKIN"].get("metadata") or {}).get("model") == "slim"}
+
+    def safe(f):
+        try:
+            return f()
+        except Exception:
+            return None
+    with concurrent.futures.ThreadPoolExecutor(3) as ex:
+        out = [r for r in ex.map(safe, (tl, ely, mojang)) if r]
+    return out
+
+
+def skin_is_slim(im):
+    """Тонкие руки (Alex): у них прозрачна полоска справа от руки на развёртке."""
+    k = im.width // 64
+    try:
+        return im.height == im.width and im.getpixel((54 * k, 20 * k))[3] == 0
+    except Exception:
+        return False
+
+
+def render_skin(png, slim=None, scale=6):
+    """Превью скина спереди и сзади (как в игре, с вторым слоем). Возвращает PIL-картинку RGBA."""
+    im = PILImage.open(io.BytesIO(png)).convert("RGBA")
+    k = max(1, im.width // 64)
+    legacy = im.height * 2 == im.width
+    if slim is None:
+        slim = skin_is_slim(im)
+    aw = 3 if slim else 4
+
+    def part(x, y, w, h, flip=False):
+        p = im.crop((x * k, y * k, (x + w) * k, (y + h) * k))
+        return p.transpose(PILImage.FLIP_LEFT_RIGHT) if flip else p
+
+    def face(front):
+        c = PILImage.new("RGBA", (16 * k, 32 * k), (0, 0, 0, 0))
+        f = 0 if front else 1
+
+        def put(img, x, y):
+            c.alpha_composite(img, (x * k, y * k))
+        # (передняя, задняя) развёртки
+        head = [(8, 8), (24, 8)][f]
+        hat = [(40, 8), (56, 8)][f]
+        body = [(20, 20), (32, 20)][f]
+        jacket = [(20, 36), (32, 36)][f]
+        rarm = [(44, 20), (44 + aw + 4, 20)][f]
+        rsleeve = [(44, 36), (44 + aw + 4, 36)][f]
+        rleg = [(4, 20), (12, 20)][f]
+        rpants = [(4, 36), (12, 36)][f]
+        larm = [(36, 52), (36 + aw + 4, 52)][f]
+        lsleeve = [(52, 52), (52 + aw + 4, 52)][f]
+        lleg = [(20, 52), (28, 52)][f]
+        lpants = [(4, 52), (12, 52)][f]
+        # спереди правая рука игрока слева от зрителя, сзади - наоборот
+        rx, lx = (4 - aw, 12) if front else (12, 4 - aw)
+        rlx, llx = (4, 8) if front else (8, 4)
+        put(part(*head, 8, 8), 4, 0)
+        put(part(*body, 8, 12), 4, 8)
+        put(part(*rarm, aw, 12), rx, 8)
+        put(part(*rleg, 4, 12), rlx, 20)
+        if legacy:
+            put(part(*rarm, aw, 12, True), lx, 8)
+            put(part(*rleg, 4, 12, True), llx, 20)
+            hatimg = part(*hat, 8, 8)
+            if hatimg.getextrema()[3][0] < 255:  # в старых скинах полностью непрозрачная «шапка» не рисуется
+                put(hatimg, 4, 0)
+        else:
+            put(part(*larm, aw, 12), lx, 8)
+            put(part(*lleg, 4, 12), llx, 20)
+            for src, w, h, x, y in ((hat, 8, 8, 4, 0), (jacket, 8, 12, 4, 8), (rsleeve, aw, 12, rx, 8),
+                                    (lsleeve, aw, 12, lx, 8), (rpants, 4, 12, rlx, 20), (lpants, 4, 12, llx, 20)):
+                put(part(*src, w, h), x, y)
+        return c
+    a, b = face(True), face(False)
+    out = PILImage.new("RGBA", (36 * k, 32 * k), (0, 0, 0, 0))
+    out.alpha_composite(a, (0, 0))
+    out.alpha_composite(b, (20 * k, 0))
+    z = max(1, scale // k)
+    return out.resize((out.width * z, out.height * z), PILImage.NEAREST)
+
+
+def render_cape(png, scale=6):
+    """Внешняя сторона плаща (как видно со спины)."""
+    im = PILImage.open(io.BytesIO(png)).convert("RGBA")
+    if im.width % 64 == 0 and im.height * 2 == im.width:
+        k = im.width // 64
+    else:  # HD-плащи TLauncher: только развёртка 22x17 в масштабе
+        k = max(1, im.width // 22)
+    c = im.crop((1 * k, 1 * k, 11 * k, 17 * k))
+    z = max(1, scale // k)
+    return c.resize((c.width * z, c.height * z), PILImage.NEAREST)
+
+
+def make_cape(c1, c2, pattern="полосы", emblem=None):
+    """Плащ 64x32 для CustomSkinLoader: два цвета и узор. Возвращает PNG (bytes)."""
+    im = PILImage.new("RGBA", (64, 32), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    col1 = tuple(int(c1[i:i + 2], 16) for i in (1, 3, 5)) + (255,)
+    col2 = tuple(int(c2[i:i + 2], 16) for i in (1, 3, 5)) + (255,)
+    edge = tuple(max(0, v - 50) for v in col1[:3]) + (255,)
+    # вся развёртка плаща (22x17) - основной цвет, края темнее
+    d.rectangle((0, 0, 21, 16), fill=col1)
+    for x0 in (1, 12):  # внешняя и внутренняя стороны 10x16
+        for y in range(16):
+            for x in range(10):
+                c = col1
+                if pattern == "полосы" and (y // 2) % 2:
+                    c = col2
+                elif pattern == "шахматка" and (x // 2 + y // 2) % 2:
+                    c = col2
+                elif pattern == "градиент":
+                    t = y / 15.0
+                    c = tuple(int(col1[i] + (col2[i] - col1[i]) * t) for i in range(3)) + (255,)
+                elif pattern == "кайма" and (x in (0, 9) or y in (0, 15)):
+                    c = col2
+                elif pattern == "звёзды" and (x, y) in ((2, 3), (6, 5), (3, 9), (7, 11), (5, 14), (8, 2), (1, 13)):
+                    c = col2
+                im.putpixel((x0 + x, 1 + y), c)
+    d.line((0, 1, 0, 16), fill=edge)
+    d.line((11, 1, 11, 16), fill=edge)
+    d.line((1, 0, 10, 0), fill=edge)
+    if emblem:
+        try:
+            em = PILImage.open(emblem).convert("RGBA").resize((6, 6), PILImage.LANCZOS)
+            im.alpha_composite(em, (3, 6))
+        except Exception:
+            pass
+    out = io.BytesIO()
+    im.save(out, "PNG")
+    return out.getvalue()
+
+
+def _versions_jars():
+    vroot = os.path.join(MC, "versions")
+    out = []
+    for v in _listdir(vroot):
+        j = os.path.join(vroot, v, v + ".jar")
+        if os.path.isfile(j):
+            out.append(j)
+    return out
+
+
+def default_skins():
+    """Стандартные скины Minecraft из файла игры (Steve, Alex и ещё семь, в двух вариантах рук)."""
+    for j in sorted(_versions_jars(), reverse=True):
+        try:
+            with zipfile.ZipFile(j) as z:
+                names = [n for n in z.namelist() if re.match(r"assets/minecraft/textures/entity/player/(wide|slim)/\w+\.png$", n)]
+                if names:
+                    res = []
+                    for n in sorted(names):
+                        kind, file = n.rsplit("/", 2)[-2:]
+                        res.append({"name": file[:-4].capitalize(), "slim": kind == "slim", "skin": z.read(n),
+                                    "source": "стандартный"})
+                    return res
+        except Exception:
+            continue
+    return []
+
+
+def mineskin_popular(after=None, size=24):
+    """Популярные скины с MineSkin (их загружают игроки). Возвращает (список, курсор следующей страницы)."""
+    q = {"size": size}
+    if after:
+        q["after"] = after
+    j = json.loads(_get("https://api.mineskin.org/v2/skins?" + urllib.parse.urlencode(q), 20, 3, SKIN_UA).decode("utf-8"))
+    items = [{"name": s.get("name") or "без названия", "texture": s.get("texture"), "uuid": s.get("uuid")}
+             for s in j.get("skins", []) if s.get("texture")]
+    nxt = (((j.get("pagination") or {}).get("next") or {}).get("after"))
+    return items, nxt
+
+
+def texture_png(texture_hash):
+    return _get("https://textures.minecraft.net/texture/" + texture_hash, 20, 3, SKIN_UA)
+
+
+def _skins_meta():
+    try:
+        with open(os.path.join(SKINS_DIR, "skins.json"), encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def _skins_meta_save(meta):
+    os.makedirs(SKINS_DIR, exist_ok=True)
+    with open(os.path.join(SKINS_DIR, "skins.json"), "w", encoding="utf-8") as fh:
+        json.dump(meta, fh, ensure_ascii=False, indent=1)
+
+
+def save_my_skin(name, skin, slim=None, cape=None, source=""):
+    """Сохраняет скин (и плащ) в «Мои скины». Возвращает имя файла."""
+    os.makedirs(SKINS_DIR, exist_ok=True)
+    base = _safe_name(name) or "Скин"
+    fn, i = base + ".png", 2
+    while os.path.exists(os.path.join(SKINS_DIR, fn)):
+        fn, i = "%s (%d).png" % (base, i), i + 1
+    with open(os.path.join(SKINS_DIR, fn), "wb") as fh:
+        fh.write(skin)
+    meta = _skins_meta()
+    if slim is None:
+        slim = skin_is_slim(PILImage.open(io.BytesIO(skin)).convert("RGBA"))
+    entry = {"slim": bool(slim), "source": source}
+    if cape:
+        cf = fn[:-4] + " - плащ.png"
+        with open(os.path.join(SKINS_DIR, cf), "wb") as fh:
+            fh.write(cape)
+        entry["cape"] = cf
+    meta[fn] = entry
+    _skins_meta_save(meta)
+    return fn
+
+
+def my_skins():
+    meta = _skins_meta()
+    capes = {e.get("cape") for e in meta.values() if e.get("cape")}
+    out = []
+    for f in _listdir(SKINS_DIR):
+        if f.lower().endswith(".png") and f not in capes and not f.startswith("_"):
+            e = meta.get(f, {})
+            out.append({"file": f, "name": f[:-4], "slim": e.get("slim"), "cape": e.get("cape"), "source": e.get("source", "")})
+    return out
+
+
+def delete_my_skin(fn):
+    meta = _skins_meta()
+    e = meta.pop(fn, {})
+    for f in (fn, e.get("cape")):
+        if f and os.path.isfile(os.path.join(SKINS_DIR, f)):
+            if not recycle(os.path.join(SKINS_DIR, f), tries=1):
+                os.remove(os.path.join(SKINS_DIR, f))
+    _skins_meta_save(meta)
+
+
+def csl_jar():
+    """CustomSkinLoader (один файл для Fabric, Forge и NeoForge всех наших версий) - из кэша или с Modrinth."""
+    p = os.path.join(ROOT, "_update", "extra", CSL["name"])
+    if not (os.path.isfile(p) and _sha1_file(p) == CSL["sha1"]):
+        _fetch_to(CSL["url"], p, None, CSL["sha1"], None, MR_UA)
+    return p
+
+
+def install_offline_skin(nick, skin_file, cape_file=None, log=print):
+    """Скин (и плащ) для ника без интернета: файлы в CustomSkinLoader\\LocalSkin, локальные - первыми в списке."""
+    base = os.path.join(MC, "CustomSkinLoader")
+    for sub, src in (("skins", skin_file), ("capes", cape_file)):
+        if src:
+            os.makedirs(os.path.join(base, "LocalSkin", sub), exist_ok=True)
+            shutil.copy2(src, os.path.join(base, "LocalSkin", sub, nick + ".png"))
+    cfg_path = os.path.join(base, "CustomSkinLoader.json")
+    try:
+        with open(cfg_path, encoding="utf-8") as fh:
+            cfg = json.load(fh)
+    except Exception:
+        cfg = {"enableCape": True, "loadlist": []}
+    local = {"name": "LocalSkin", "type": "Legacy", "checkPNG": False, "skin": "LocalSkin/skins/{USERNAME}.png",
+             "model": "auto", "cape": "LocalSkin/capes/{USERNAME}.png", "elytra": "LocalSkin/elytras/{USERNAME}.png"}
+    cfg["loadlist"] = [local] + [e for e in cfg.get("loadlist", []) if e.get("name") != "LocalSkin"]
+    cfg["enableCape"] = True
+    with open(cfg_path, "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh, ensure_ascii=False, indent=2)
+    s = load_settings()
+    s["offline_skins"] = True
+    s["skin_nick"] = nick
+    save_settings(s)
+    put_csl_in_mods(log)
+    log("Скин для «%s» поставлен в папку CustomSkinLoader" % nick)
+
+
+def put_csl_in_mods(log=print):
+    """Если включены офлайн-скины и сейчас включена сборка с Fabric/Forge, кладём мод CustomSkinLoader в mods."""
+    if not load_settings().get("offline_skins"):
+        return False
+    cur = current() or {}
+    if cur.get("version_dir", "").split(" ")[0] not in ("Fabric", "Forge", "NeoForge", "Quilt"):
+        log("Скин заработает, когда включишь сборку с модами (Fabric или Forge): без модов игра свои скины не грузит.")
+        return False
+    os.makedirs(MODS, exist_ok=True)
+    if not os.path.isfile(os.path.join(MODS, CSL["name"])):
+        shutil.copy2(csl_jar(), os.path.join(MODS, CSL["name"]))
+        log("В сборку добавлен мод CustomSkinLoader (нужен для своих скинов без интернета)")
+    return True
+
+
 # ---------- командная строка ----------
 
 def cli(argv):
@@ -2433,7 +3130,7 @@ def cli(argv):
     cmd = argv[0]
     if cmd == "--list":
         for p in packs:
-            log("%s | %s | %d модов | %s" % (p["version_dir"], p["name"], p["count"], p.get("tl_version")))
+            log("%s | %s | %s | %s" % (p["version_dir"], p["name"], n_mods(p["count"]), p.get("tl_version")))
     elif cmd == "--maps":
         for m in find_maps():
             log("%s | %s | %s | %s | установлена: %s" % (m["id"], m["title"], m["version"], m["genre"], map_installed(m)))
@@ -2475,7 +3172,7 @@ def cli(argv):
             log("  убрать: " + p)
         if cmd != "--check-update" and (plan["need"] or plan["extra"] or plan["remove"] or plan.get("with_update")):
             def ask(a, err):
-                log("Сайт не отдал %s (%s). Открываю страницу, скачай файл - программа подхватит его из «Загрузок»."
+                log("Сайт не отдал %s (%s). Открываю страницу, скачай файл — программа подхватит его из «Загрузок»."
                     % (a["name"], err or "только через браузер"))
                 webbrowser.open(a["page"])
                 return wait_archive_in_downloads(a)
@@ -2490,7 +3187,7 @@ def cli(argv):
         if not m:
             log("Сборка не найдена:", argv[1]); return 1
         if game_running():
-            log("Игра запущена. Закройте Minecraft."); return 2
+            log("Игра запущена. Закрой Minecraft."); return 2
         switch(m[0], packs, log=log)
         log("Готово:", m[0]["name"])
     elif cmd == "--play" and len(argv) > 1:
@@ -2509,7 +3206,7 @@ def cli(argv):
         elif "--nomods" not in argv and m.get("recommended"):
             pack = next((p for p in packs if p["name"] == m["recommended"]), None)
         if game_running():
-            log("Игра запущена. Закройте Minecraft."); return 2
+            log("Игра запущена. Закрой Minecraft."); return 2
         ids = missing_items(m, pack, packs)
         if ids:
             remote = fetch_remote_manifest()
@@ -2546,18 +3243,18 @@ FONT = "Segoe UI"
 
 
 ART = os.path.join(ROOT, "Оформление")
-TAB_ORDER = ["maps", "packs", "servers", "friend", "launchers"]
+TAB_ORDER = ["maps", "packs", "builder", "skins", "servers", "friend", "launchers"]
 
 
 def gui():
     import tkinter as tk
-    from tkinter import messagebox, simpledialog, filedialog
+    from tkinter import messagebox, simpledialog, filedialog, colorchooser
 
     cleanup_after_update()
     tidy_old_name()
     win = tk.Tk()
     win.withdraw()
-    win.title(APP_NAME + " - карты, сборки и серверы Minecraft")
+    win.title(APP_NAME + " — карты, сборки и серверы Minecraft")
     win.geometry("1080x760")
     win.minsize(1000, 660)
     win.configure(bg=BG)
@@ -2748,7 +3445,7 @@ def gui():
 
     def tab_button(key, text, icon):
         b = tk.Label(tabs, text=" " + text, image=art(icon, 24, 24), compound="left", font=(FONT, 11, "bold"),
-                     bg=BG, fg=MUTED, padx=14, pady=9, cursor="hand2")
+                     bg=BG, fg=MUTED, padx=9, pady=9, cursor="hand2")
         b.pack(side="left", padx=(0, 4), pady=(0, 3))
         b.bind("<Button-1>", lambda e: show(key))
         b.bind("<Enter>", lambda e: key != state["tab"] and fade_color(b, "fg", TEXT, 120))
@@ -2757,6 +3454,8 @@ def gui():
 
     tab_button("maps", "Карты", "tab_maps.png")
     tab_button("packs", "Сборки", "tab_packs.png")
+    tab_button("builder", "Конструктор", "tab_builder.png")
+    tab_button("skins", "Скины", "tab_skins.png")
     tab_button("servers", "Серверы", "tab_servers.png")
     tab_button("friend", "С другом", "tab_friend.png")
     tab_button("launchers", "Лаунчеры", "tab_launchers.png")
@@ -3201,7 +3900,7 @@ def gui():
                 more.configure(text="Скрыть подробности")
             else:
                 details.pack_forget()
-                more.configure(text="Подробнее, что сделано")
+                more.configure(text="Подробнее о том, что сделано")
         row = tk.Frame(fr, bg=BG)
         row.pack(fill="x", pady=(18, 0))
 
@@ -3224,7 +3923,7 @@ def gui():
         if mrpack:
             small_button(row, "Папка с пакетом", lambda: subprocess.Popen(["explorer.exe", "/select,", mrpack]),
                          bg=BG, icon="ic_folder.png").pack(side="right")
-        more = small_button(row, "Подробнее, что сделано", toggle, bg=BG)
+        more = small_button(row, "Подробнее о том, что сделано", toggle, bg=BG)
         more.pack(side="left")
         t.update_idletasks()
         w, h = max(W, t.winfo_reqwidth()), t.winfo_reqheight()
@@ -3244,7 +3943,7 @@ def gui():
 
     def check_game():
         if game_running():
-            messagebox.showwarning("Игра запущена", "Сначала закройте Minecraft, потом выбирайте карту или сборку.")
+            messagebox.showwarning("Игра запущена", "Сначала закрой Minecraft, потом выбирай карту или сборку.")
             return False
         mode = launcher_mode()
         busy = (mode == "tl" and tlauncher_running()) or (mode == "legacy" and process_running("LL.exe")) or \
@@ -3480,7 +4179,7 @@ def gui():
         t, body = detail_window(p["name"].rsplit(" (", 1)[0])
         img = detail_image(t, os.path.join(p["path"], "cover_big.png"), os.path.join(p["path"], "cover.png"))
         active = cur.get("name") == p["name"] and cur.get("version_dir") == p["version_dir"]
-        badges = [(p["version_dir"], BLUE, "white"), ("%d модов" % p["count"] if p["count"] else "без модов", LINE, TEXT)]
+        badges = [(p["version_dir"], BLUE, "white"), (n_mods(p["count"]) if p["count"] else "без модов", LINE, TEXT)]
         if active:
             badges.append(("включена", "#2f6b34", "white"))
         miss = not_downloaded(pack_item_id(p))
@@ -3586,7 +4285,7 @@ def gui():
                 t.after(200, poll); return
             if "info" in box:
                 i = box["info"]
-                live.configure(text="● Онлайн: %s игроков из %s   ·   пинг %d мс   ·   %s" % (
+                live.configure(text="● Онлайн: %s из %s   ·   пинг %d мс   ·   %s" % (
                     i["online"], i["max"], i["ms"], i["version"]), fg=ACCENT_HI)
                 if i.get("motd"):
                     motd.configure(text="Сообщение сервера: " + i["motd"])
@@ -3753,10 +4452,12 @@ def gui():
             bl = tk.Frame(info, bg=CARD)
             bl.pack(fill="x", pady=(4, 6))
             badge(bl, p["version_dir"], BLUE, "white").pack(side="left", padx=(0, 6))
-            badge(bl, "%d модов" % p["count"] if p["count"] else "без модов").pack(side="left", padx=(0, 6))
+            badge(bl, n_mods(p["count"]) if p["count"] else "без модов").pack(side="left", padx=(0, 6))
             active = cur.get("name") == p["name"] and cur.get("version_dir") == p["version_dir"]
             if active:
-                badge(bl, "включена", "#2f6b34", "white").pack(side="left")
+                badge(bl, "включена", "#2f6b34", "white").pack(side="left", padx=(0, 6))
+            if p.get("user"):
+                badge(bl, "своя", "#3b2f6b", "white").pack(side="left")
             miss = not_downloaded(pack_item_id(p))
             dl_badge(bl, miss)
             tk.Label(c, text=p.get("description", ""), font=(FONT, 10), fg="#c3c7d1", bg=CARD,
@@ -3772,6 +4473,13 @@ def gui():
                    icon=None if active else ("ic_download.png" if miss else "ic_check.png"),
                        color=CARD_HI if active else ACCENT, hover=LINE if active else ACCENT_HI).pack(side="right")
             small_button(row, "Подробнее: моды", lambda p=p: open_pack(p), bg=CARD).pack(side="right", padx=8)
+            if p.get("user"):
+                def drop(p=p):
+                    if messagebox.askyesno("Удалить сборку", "Убрать свою сборку «%s» в Корзину?" % p["name"]):
+                        run_task("Убираю «%s»" % p["name"], lambda log: delete_user_pack(p, log),
+                                 lambda ok, logs: toast("Сборка убрана в Корзину.", "ok"))
+                small_button(row, "Изменить", lambda p=p: edit_user_pack(p), bg=CARD, icon="ic_settings.png").pack(side="left")
+                small_button(row, "Удалить", drop, bg=CARD, icon="ic_delete.png").pack(side="left", padx=4)
             clickable(c, lambda p=p: open_pack(p))
 
     # --- вкладка «Серверы» ---
@@ -3892,6 +4600,7 @@ def gui():
         hero.grid(row=1, column=0, columnspan=2, sticky="we", padx=(0, 14), pady=(0, 14))
         hero_img = art("friends_wide.png", 1, 1)
         hid = hero.create_image(0, -20, image=hero_img, anchor="ne")
+        hero.create_image(0, 0, image=art("shade_left.png", 1, 1), anchor="nw")
         hero.create_text(22, 52, text="Играйте вместе", font=(FONT, 20, "bold"), fill="white", anchor="w")
         hero.create_text(22, 88, text="Hamachi, Radmin VPN, ZeroTier или одна Wi-Fi сеть: выбери ниже и следуй шагам",
                          font=(FONT, 10), fill="#d7deea", anchor="w")
@@ -4060,8 +4769,8 @@ def gui():
                      justify="left", anchor="w").pack(fill="x", pady=(4, 0))
 
         tk.Label(inner, text="Важно: ники в TLauncher у вас должны быть разными, иначе второй не зайдёт. "
-                             "Сеть выбирайте одну и ту же. Если друг не подключается, у хоста первым делом "
-                             "нажмите «Проверить настройки».",
+                             "Сеть выбирайте одну и ту же. Если друг не подключается, пусть тот, кто создал игру, первым делом "
+                             "нажмёт «Проверить настройки».",
                  font=(FONT, 10), fg=MUTED, bg=BG, wraplength=900, justify="left", anchor="w"
                  ).grid(row=5, column=0, columnspan=2, sticky="we", pady=(4, 0))
 
@@ -4230,6 +4939,858 @@ def gui():
                 small_button(row, "Сделать моим", make_mine, bg=CARD, icon="ic_check.png").pack(side="left")
             small_button(row, "Указать путь...", set_path, bg=CARD, icon="ic_settings.png").pack(side="left", padx=4)
 
+    # --- картинки из сети и превью скинов: грузятся в фоне, окно не ждёт ---
+    pic_cache = {}       # ключ -> PIL-картинка (None - не удалось)
+    pic_wait = {}        # ключ -> [виджеты, ждущие картинку]
+    pic_busy = set()
+    pic_pool = concurrent.futures.ThreadPoolExecutor(6)
+
+    def blank(w, h):
+        """Пустая картинка: пока настоящая грузится, место под неё уже занято (размер в пикселях)."""
+        im = tk.PhotoImage(width=w, height=h)
+        images.append(im)
+        return im
+
+    def pil_photo(im):
+        ph = ImageTk.PhotoImage(im)
+        images.append(ph)
+        return ph
+
+    def want_pic(key, producer, widget):
+        """producer() -> PIL-картинка; вызывается в фоне, результат кэшируется по key."""
+        if key in pic_cache:
+            if pic_cache[key] is not None:
+                widget.configure(image=pil_photo(pic_cache[key]))
+            return
+        pic_wait.setdefault(key, []).append(widget)
+        if key in pic_busy:
+            return
+        pic_busy.add(key)
+
+        def job():
+            try:
+                pic_cache[key] = producer()
+            except Exception:
+                pic_cache[key] = None
+        pic_pool.submit(job)
+        if not state.get("pic_poll"):
+            state["pic_poll"] = True
+            win.after(150, pic_poll)
+
+    def pic_poll():
+        for key in [k for k in pic_wait if k in pic_cache]:
+            for w in pic_wait.pop(key):
+                try:
+                    if w.winfo_exists() and pic_cache[key] is not None:
+                        w.configure(image=pil_photo(pic_cache[key]))
+                except tk.TclError:
+                    pass
+        if pic_wait:
+            win.after(150, pic_poll)
+        else:
+            state["pic_poll"] = False
+
+    def web_icon(url, size, key):
+        """Значок проекта Modrinth (webp/png) -> PIL size x size, с кэшем на диске."""
+        d = os.path.join(ROOT, "_update", "icons")
+        p = os.path.join(d, "%s_%d.png" % (re.sub(r"\W", "_", key)[:60], size))
+        if os.path.isfile(p):
+            return PILImage.open(p).convert("RGBA")
+        im = PILImage.open(io.BytesIO(_get(url, 20, 2, MR_UA))).convert("RGBA")
+        im.thumbnail((size, size), PILImage.NEAREST if im.width <= size else PILImage.LANCZOS)
+        out = PILImage.new("RGBA", (size, size), (0, 0, 0, 0))
+        out.alpha_composite(im, ((size - im.width) // 2, (size - im.height) // 2))
+        os.makedirs(d, exist_ok=True)
+        out.save(p)
+        return out
+
+    def hero(row, img, title, sub):
+        hc = tk.Canvas(inner, height=140, bg=BG, highlightthickness=0, bd=0)
+        hc.grid(row=row, column=0, columnspan=2, sticky="we", padx=(0, 14), pady=(0, 14))
+        hid = hc.create_image(0, -24, image=art(img, 1, 1), anchor="ne")
+        hc.create_image(0, 0, image=art("shade_left.png", 1, 1), anchor="nw")
+        for dx, dy, color in ((2, 2, "#000000"), (0, 0, "white")):
+            hc.create_text(22 + dx, 48 + dy, text=title, font=(FONT, 19, "bold"), fill=color, anchor="w")
+        hc.create_text(23, 84, text=sub, font=(FONT, 10), fill="#000000", anchor="w", width=520)
+        hc.create_text(22, 83, text=sub, font=(FONT, 10), fill="#d7deea", anchor="w", width=520)
+        hc.bind("<Configure>", lambda e: hc.coords(hid, e.width, -24))
+        return hc
+
+    def chip_row(parent, items, current, on_pick, bg=BG):
+        for value, text in items:
+            on = current == value
+            b = tk.Label(parent, text=text, font=(FONT, 9, "bold"), bg=ACCENT if on else CARD_HI,
+                         fg="white" if on else TEXT, padx=10, pady=5, cursor="hand2")
+            b.pack(side="left", padx=(0, 5))
+            b.bind("<Button-1>", lambda e, v=value: on_pick(v))
+            if not on:
+                b.bind("<Enter>", lambda e, b=b: fade_color(b, "bg", LINE, 120))
+                b.bind("<Leave>", lambda e, b=b: fade_color(b, "bg", CARD_HI, 160))
+
+    def fmt_count(n):
+        n = int(n or 0)
+        if n >= 1000000:
+            return "%.1f млн" % (n / 1e6)
+        if n >= 1000:
+            return "%d тыс." % (n // 1000)
+        return str(n)
+
+    def plural(n, one, few, many):
+        n = abs(int(n))
+        if n % 10 == 1 and n % 100 != 11:
+            return one
+        if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+            return few
+        return many
+
+    # --- вкладка «Конструктор» ---
+    def builder_state():
+        cb = state.get("cb")
+        if cb is None:
+            cur = current() or {}
+            gv = cur.get("version_dir", "Fabric 26.1.2").partition(" ")[2] or "26.1.2"
+            cb = state["cb"] = {"gv": gv, "loader": "fabric", "ptype": "mod", "q": "", "cat": None, "index": "downloads",
+                                "results": [], "total": 0, "sel": {}, "name": "Моя сборка", "qid": 0,
+                                "versions": ["26.2", "26.1.2", "1.21.8", "1.21.1", "1.20.1", "1.19.2", "1.18.2", "1.16.5",
+                                             "1.12.2"]}
+            def load_versions():
+                vs = mr_game_versions()
+                if vs:
+                    cb["versions"] = vs[:40]
+            threading.Thread(target=load_versions, daemon=True).start()
+            builder_query()
+        return cb
+
+    def builder_query(more=False):
+        cb = state["cb"]
+        cb["qid"] += 1
+        qid = cb["qid"]
+        cb["loading"] = True
+        cb["error"] = None
+        offset = len(cb["results"]) if more else 0
+        if not more:
+            cb["results"] = []
+
+        def work():
+            try:
+                hits, total = mr_search(cb["q"], cb["gv"], cb["loader"], cb["ptype"], cb["cat"], cb["index"], offset, 20)
+                if qid == cb["qid"]:
+                    cb["results"] = (cb["results"] if more else []) + hits
+                    cb["total"] = total
+            except Exception as e:
+                cb["error"] = str(e)[:120]
+            cb["loading"] = False
+
+            def redraw():
+                if qid == cb["qid"] and state["tab"] == "builder":
+                    state["keep_scroll"] = more
+                    show("builder", animated=False)
+            win.after(0, redraw)
+        threading.Thread(target=work, daemon=True).start()
+
+    def builder_set(**kw):
+        cb = state["cb"]
+        cb.update(kw)
+        builder_query()
+        show("builder", animated=False)
+
+    def build_builder():
+        cb = builder_state()
+        section("Конструктор сборок", 0, "любые моды с Modrinth: нужные библиотеки Portalis добавит сам")
+        n_sel = len(cb["sel"])
+        hero(1, "builder_wide.png", "Собери свою сборку",
+             "Найди моды, шейдеры и текстуры. Portalis проверит, что они подходят к версии игры, "
+             "и сам добавит всё, без чего они не запустятся.")
+        opt = tk.Frame(inner, bg=PANEL, padx=14, pady=10)
+        opt.grid(row=2, column=0, columnspan=2, sticky="we", padx=(0, 14), pady=(0, 10))
+        r1 = tk.Frame(opt, bg=PANEL)
+        r1.pack(fill="x")
+        tk.Label(r1, text="Версия игры:", font=(FONT, 10, "bold"), fg=TEXT, bg=PANEL).pack(side="left", padx=(0, 8))
+        gvar = tk.StringVar(value=cb["gv"])
+        gb = tk.Label(r1, text=cb["gv"] + "   ▾", font=(FONT, 10, "bold"), bg=CARD_HI, fg=TEXT, padx=12, pady=5,
+                      cursor="hand2")
+        gb.pack(side="left", padx=(0, 18))
+        menu = tk.Menu(win, tearoff=0, bg=CARD_HI, fg=TEXT, activebackground=ACCENT, activeforeground="white",
+                       font=(FONT, 10), bd=0)
+        for v in cb["versions"]:
+            menu.add_command(label="  " + v + "  ", command=lambda v=v: builder_set(gv=v))
+        gb.bind("<Button-1>", lambda e: menu.tk_popup(gb.winfo_rootx(), gb.winfo_rooty() + gb.winfo_height()))
+        tk.Label(r1, text="Загрузчик:", font=(FONT, 10, "bold"), fg=TEXT, bg=PANEL).pack(side="left", padx=(0, 8))
+        chip_row(r1, [(k, v) for k, v in LOADER_TITLES.items()], cb["loader"], lambda v: builder_set(loader=v), PANEL)
+        tk.Label(r1, text="   Что ищем:", font=(FONT, 10, "bold"), fg=TEXT, bg=PANEL).pack(side="left", padx=(0, 8))
+        chip_row(r1, MR_TYPES, cb["ptype"], lambda v: builder_set(ptype=v, cat=None), PANEL)
+        _ = gvar
+        r2 = tk.Frame(opt, bg=PANEL)
+        r2.pack(fill="x", pady=(10, 0))
+        sbox = tk.Frame(r2, bg=CARD_HI, padx=8, pady=2)
+        sbox.pack(side="left")
+        tk.Label(sbox, image=art("ic_search.png", 1, 1), bg=CARD_HI).pack(side="left")
+        e = tk.Entry(sbox, font=(FONT, 10), bg=CARD_HI, fg=TEXT, insertbackground=TEXT, relief="flat", width=34,
+                     highlightthickness=0, bd=0)
+        e.pack(side="left", padx=(6, 0), ipady=4)
+        e.insert(0, cb["q"])
+        state["search_entry"] = e
+
+        def typed(ev=None):
+            v = e.get().strip()
+            if v == cb["q"]:
+                return
+            cb["q"] = v
+            if state.get("_bq"):
+                win.after_cancel(state["_bq"])
+            state["_bq"] = win.after(450, lambda: (state.update(focus_builder=True), builder_query()))
+        e.bind("<KeyRelease>", typed)
+        e.bind("<Return>", lambda ev: builder_query())
+        e.bind("<Escape>", lambda ev: (e.delete(0, "end"), typed()))
+        if state.pop("focus_builder", None):
+            e.focus_set()
+            e.icursor("end")
+        tk.Label(r2, text="   Сначала:", font=(FONT, 10, "bold"), fg=TEXT, bg=PANEL).pack(side="left", padx=(0, 8))
+        chip_row(r2, [("downloads", "Популярные"), ("relevance", "Подходящие"), ("updated", "Свежие"),
+                      ("newest", "Новые")], cb["index"], lambda v: builder_set(index=v), PANEL)
+        if cb["ptype"] == "mod":
+            r3 = tk.Frame(opt, bg=PANEL)
+            r3.pack(fill="x", pady=(10, 0))
+            r4 = tk.Frame(opt, bg=PANEL)
+            r4.pack(fill="x", pady=(5, 0))
+            half = (len(MR_CATEGORIES) + 1) // 2
+            chip_row(r3, [(None, "Все")] + MR_CATEGORIES[:half - 1], cb["cat"], lambda v: builder_set(cat=v), PANEL)
+            chip_row(r4, MR_CATEGORIES[half - 1:], cb["cat"], lambda v: builder_set(cat=v), PANEL)
+        # «Моя сборка»
+        sel = tk.Frame(inner, bg=CARD, padx=14, pady=12, highlightthickness=1, highlightbackground=ACCENT if n_sel else CARD)
+        sel.grid(row=3, column=0, columnspan=2, sticky="we", padx=(0, 14), pady=(0, 14))
+        top = tk.Frame(sel, bg=CARD)
+        top.pack(fill="x")
+        tk.Label(top, image=art("tab_builder.png", 1, 1), bg=CARD).pack(side="left")
+        tk.Label(top, text="  Моя сборка:", font=(FONT, 12, "bold"), fg=TEXT, bg=CARD).pack(side="left")
+        ne = tk.Entry(top, font=(FONT, 11), bg=CARD_HI, fg=TEXT, insertbackground=TEXT, relief="flat", width=24,
+                      highlightthickness=1, highlightbackground=LINE, highlightcolor=ACCENT)
+        ne.insert(0, cb["name"])
+        ne.pack(side="left", padx=(8, 10), ipady=3)
+        ne.bind("<KeyRelease>", lambda ev: cb.update(name=ne.get()))
+        tk.Label(top, text="%s %s · %s %d %s" % (LOADER_TITLES[cb["loader"]], cb["gv"], "выбрано" if n_sel != 1 else "выбран",
+                                               n_sel, plural(n_sel, "проект", "проекта", "проектов")),
+                 font=(FONT, 10), fg=MUTED, bg=CARD).pack(side="left")
+        if n_sel:
+            big_button(top, "Собрать сборку", lambda: builder_build(), icon="ic_add.png").pack(side="right")
+            small_button(top, "Очистить", lambda: (cb["sel"].clear(), show("builder", animated=False)), bg=CARD,
+                         icon="ic_delete.png").pack(side="right", padx=6)
+            chips = tk.Frame(sel, bg=CARD)
+            chips.pack(fill="x", pady=(10, 0))
+            line = tk.Frame(chips, bg=CARD)
+            line.pack(fill="x")
+            width = 0
+            for pid, p in list(cb["sel"].items()):
+                t = "%s  ✕" % p["title"]
+                w = 22 + len(t) * 7
+                if width + w > 900:
+                    line = tk.Frame(chips, bg=CARD)
+                    line.pack(fill="x", pady=(5, 0))
+                    width = 0
+                width += w
+                b = tk.Label(line, text=t, font=(FONT, 9, "bold"), bg=CARD_HI, fg=TEXT, padx=9, pady=4, cursor="hand2")
+                b.pack(side="left", padx=(0, 5))
+                b.bind("<Button-1>", lambda ev, pid=pid: (cb["sel"].pop(pid, None), show("builder", animated=False)))
+                b.bind("<Enter>", lambda ev, b=b: fade_color(b, "bg", "#5a2b2b", 120))
+                b.bind("<Leave>", lambda ev, b=b: fade_color(b, "bg", CARD_HI, 160))
+        else:
+            tk.Label(sel, text="Нажимай «Добавить» у модов ниже. Потом «Собрать сборку»: Portalis подберёт версии, "
+                               "добавит обязательные библиотеки и сохранит сборку — её можно будет включить, как любую другую.",
+                     font=(FONT, 10), fg=MUTED, bg=CARD, anchor="w", justify="left", wraplength=900).pack(fill="x", pady=(8, 0))
+        # результаты
+        if cb.get("error"):
+            empty_note(4, "Modrinth не ответил: %s. Проверь интернет и нажми F5." % cb["error"])
+            return
+        if cb.get("loading") and not cb["results"]:
+            note = tk.Label(inner, text="Ищу на Modrinth...", font=(FONT, 12, "bold"), fg=GOLD, bg=BG, anchor="w")
+            note.grid(row=4, column=0, columnspan=2, sticky="we", pady=10)
+            return
+        if not cb["results"]:
+            empty_note(4, "Ничего не нашлось для %s %s. Попробуй другое слово, категорию «Все» или другую версию игры."
+                       % (LOADER_TITLES[cb["loader"]], cb["gv"]))
+            return
+        tk.Label(inner, text="Найдено: %s" % fmt_count(cb["total"]), font=(FONT, 9), fg=MUTED, bg=BG, anchor="w").grid(
+            row=4, column=0, columnspan=2, sticky="we", pady=(0, 6))
+        cats = dict(MR_CATEGORIES)
+        for i, h in enumerate(cb["results"]):
+            c = card(inner, i % 2, 5 + i // 2)
+            top = tk.Frame(c, bg=CARD)
+            top.pack(fill="x")
+            ic = tk.Label(top, bg=CARD, width=48, height=48, image=art("ic_add_48.png", 1, 1))
+            ic.pack(side="left", anchor="n")
+            if h.get("icon_url"):
+                want_pic("mr:" + h["project_id"], lambda u=h["icon_url"], k=h["project_id"]: web_icon(u, 48, k), ic)
+            info = tk.Frame(top, bg=CARD, padx=12)
+            info.pack(side="left", fill="both", expand=True)
+            tk.Label(info, text=h["title"], font=(FONT, 13, "bold"), fg=TEXT, bg=CARD, anchor="w", justify="left",
+                     wraplength=300).pack(fill="x")
+            tk.Label(info, text="%s  ·  ↓ %s" % (h.get("author", ""), fmt_count(h.get("downloads"))), font=(FONT, 9),
+                     fg=MUTED, bg=CARD, anchor="w").pack(fill="x")
+            bl = tk.Frame(info, bg=CARD)
+            bl.pack(fill="x", pady=(4, 0))
+            for cat in [x for x in h.get("display_categories") or h.get("categories", []) if x in cats][:3]:
+                badge(bl, cats[cat]).pack(side="left", padx=(0, 5))
+            tk.Label(c, text=h.get("description", ""), font=(FONT, 9), fg="#c3c7d1", bg=CARD, anchor="w", justify="left",
+                     wraplength=400).pack(fill="x", pady=(8, 8))
+            row = tk.Frame(c, bg=CARD)
+            row.pack(fill="x", side="bottom")
+            inn = h["project_id"] in cb["sel"]
+
+            def toggle(h=h):
+                if h["project_id"] in cb["sel"]:
+                    cb["sel"].pop(h["project_id"])
+                else:
+                    cb["sel"][h["project_id"]] = {"project_id": h["project_id"], "title": h["title"],
+                                                  "type": cb["ptype"], "icon": h.get("icon_url")}
+                show("builder", animated=False)
+            if inn:
+                big_button(row, "В сборке  ✓", toggle, color=CARD_HI, hover="#5a2b2b").pack(side="right")
+            else:
+                big_button(row, "Добавить", toggle, icon="ic_add.png").pack(side="right")
+            small_button(row, "Страница", lambda h=h: webbrowser.open("https://modrinth.com/%s/%s" % (
+                h.get("project_type", "mod"), h.get("slug") or h["project_id"])), bg=CARD, icon="ic_globe.png").pack(
+                side="right", padx=6)
+        last = 5 + (len(cb["results"]) + 1) // 2
+        if len(cb["results"]) < cb["total"]:
+            mb = tk.Frame(inner, bg=BG)
+            mb.grid(row=last, column=0, columnspan=2, pady=(0, 14))
+            if cb.get("loading"):
+                tk.Label(mb, text="Загружаю ещё...", font=(FONT, 10, "bold"), fg=GOLD, bg=BG).pack()
+            else:
+                big_button(mb, "Показать ещё", lambda: builder_query(more=True), color=CARD_HI, hover=LINE).pack()
+
+    def builder_build():
+        cb = state["cb"]
+        name = (cb.get("name") or "").strip() or "Моя сборка"
+        selection = list(cb["sel"].values())
+        if not selection:
+            return
+        t = tk.Toplevel(win)
+        t.title("Сборка «%s»" % name)
+        t.configure(bg=BG)
+        t.transient(win)
+        W, H = 700, 640
+        t.geometry("%dx%d+%d+%d" % (W, H, win.winfo_rootx() + (win.winfo_width() - W) // 2, win.winfo_rooty() + 40))
+        fr = tk.Frame(t, bg=BG, padx=24, pady=20)
+        fr.pack(fill="both", expand=True)
+        hd = tk.Frame(fr, bg=BG)
+        hd.pack(fill="x")
+        tk.Label(hd, image=art("tab_builder_48.png", 1, 1), bg=BG).pack(side="left")
+        tk.Label(hd, text="  «%s»  ·  %s %s" % (name, LOADER_TITLES[cb["loader"]], cb["gv"]), font=(FONT, 16, "bold"),
+                 fg=TEXT, bg=BG).pack(side="left")
+        msg = tk.Label(fr, text="Подбираю версии и зависимости...", font=(FONT, 10, "bold"), fg=GOLD, bg=BG, anchor="w",
+                       justify="left", wraplength=W - 60)
+        msg.pack(fill="x", pady=(12, 6))
+        bar = tk.Canvas(fr, height=10, bg=LINE, highlightthickness=0, bd=0)
+        bar.pack(fill="x")
+        fill = bar.create_rectangle(0, 0, 0, 10, fill=ACCENT, width=0)
+        lst = tk.Text(fr, bg=PANEL, fg="#c3c7d1", font=(FONT, 10), relief="flat", wrap="word", height=18,
+                      highlightthickness=0, padx=12, pady=10)
+        lst.pack(fill="both", expand=True, pady=(12, 0))
+        for tag, col in (("h", TEXT), ("dep", "#9fd3a5"), ("bad", "#e0a45a"), ("muted", MUTED)):
+            lst.tag_configure(tag, foreground=col)
+        lst.tag_configure("h", font=(FONT, 11, "bold"))
+        row = tk.Frame(fr, bg=BG)
+        row.pack(fill="x", pady=(12, 0))
+        box = {"cancel": threading.Event(), "step": "", "done": 0, "total": 1}
+
+        def buttons(*bs):
+            for w in row.winfo_children():
+                w.destroy()
+            for kind, text, cmd in bs:
+                (big_button(row, text, cmd) if kind == "big" else small_button(row, text, cmd, bg=BG)).pack(
+                    side="right", padx=(8, 0))
+        buttons(("small", "Отмена", lambda: (box["cancel"].set(), t.destroy())))
+
+        def resolve():
+            try:
+                box["files"], box["problems"] = resolve_build(selection, cb["gv"], cb["loader"],
+                                                              log=lambda m: box.__setitem__("step", m))
+            except Exception as e:
+                box["err"] = str(e)
+        th = threading.Thread(target=resolve, daemon=True)
+        th.start()
+
+        def poll():
+            if not t.winfo_exists():
+                return
+            if th.is_alive():
+                msg.configure(text="Подбираю версии и зависимости...  " + box.get("step", ""))
+                t.after(200, poll)
+                return
+            if "err" in box:
+                msg.configure(text="Не получилось: " + box["err"], fg="#e05a5a")
+                return
+            files, problems = box["files"], box["problems"]
+            lst.delete("1.0", "end")
+            picked = [f for f in files if f.get("picked")]
+            deps = [f for f in files if not f.get("picked")]
+            size = sum(f["size"] for f in files)
+            lst.insert("end", "Выбрано (%d)\n" % len(picked), "h")
+            for f in picked:
+                lst.insert("end", "  •  %s  " % f["title"])
+                lst.insert("end", "%s\n" % f["version"], "muted")
+            if deps:
+                lst.insert("end", "\nДобавлено само, без них не запустится (%d)\n" % len(deps), "h")
+                for f in deps:
+                    lst.insert("end", "  +  %s  " % f["title"], "dep")
+                    lst.insert("end", "нужен для «%s»\n" % f.get("reason"), "muted")
+            if problems:
+                lst.insert("end", "\nВнимание\n", "h")
+                for p in problems:
+                    lst.insert("end", "  !  %s\n" % p, "bad")
+            lst.configure(state="disabled")
+            if not files:
+                msg.configure(text="Ни один мод не подходит к %s %s." % (LOADER_TITLES[cb["loader"]], cb["gv"]), fg="#e05a5a")
+                return
+            msg.configure(text="Готово к сборке: %d %s, %s. Скачаю с Modrinth и сохраню в «Сборки»." % (
+                len(files), plural(len(files), "файл", "файла", "файлов"), fmt_mb(size)), fg=TEXT)
+            buttons(("big", "Скачать и сохранить  (%s)" % fmt_mb(size), lambda: save(files)),
+                    ("small", "Назад к поиску", t.destroy))
+
+        def save(files, replace=False):
+            vdir = "%s %s" % (LOADER_TITLES[cb["loader"]], cb["gv"])
+            exists = [p for p in find_packs() if p.get("name", "").rsplit(" (", 1)[0] == _safe_name(name)
+                      and p["version_dir"] == vdir]
+            if exists and not replace:
+                if not exists[0].get("user"):
+                    messagebox.showwarning("Название занято", "Так называется сборка из каталога. Придумай другое название.",
+                                           parent=t)
+                    return
+                if not messagebox.askyesno("Заменить?", "Сборка «%s» для %s уже есть. Заменить её новой?\n"
+                                                        "Старая уйдёт в Корзину." % (name, vdir), parent=t):
+                    return
+                replace = True
+            state["busy"] = True
+            busy_anim(True)
+            buttons(("small", "Отмена", lambda: box["cancel"].set()))
+
+            def work():
+                try:
+                    box["folder"] = save_build(name, cb["gv"], cb["loader"], files, selection, replace=replace,
+                                               log=lambda m: box.__setitem__("step", m),
+                                               progress=lambda d, tot: box.update(done=d, total=tot), cancel=box["cancel"])
+                except Exception as e:
+                    box["err2"] = str(e)
+            th2 = threading.Thread(target=work, daemon=True)
+            th2.start()
+
+            def poll2():
+                if th2.is_alive():
+                    if t.winfo_exists():
+                        frac = min(1.0, box["done"] / float(max(1, box["total"])))
+                        bar.coords(fill, 0, 0, bar.winfo_width() * frac, 10)
+                        msg.configure(text="%s   %d%%" % (box.get("step", ""), frac * 100), fg=GOLD)
+                    win.after(150, poll2)
+                    return
+                state["busy"] = False
+                if not t.winfo_exists():
+                    return
+                if "err2" in box:
+                    msg.configure(text=("Отменено." if "отменено" in box["err2"] else "Не получилось: " + box["err2"]),
+                                  fg="#e05a5a")
+                    buttons(("small", "Закрыть", t.destroy))
+                    return
+                bar.coords(fill, 0, 0, bar.winfo_width(), 10)
+                folder = box["folder"]
+                msg.configure(text="Готово! Сборка «%s» сохранена: %s." % (name, os.path.relpath(folder, ROOT)),
+                              fg=ACCENT_HI)
+                cb["sel"].clear()
+                newp = next((p for p in find_packs() if os.path.abspath(p["path"]) == os.path.abspath(folder)), None)
+
+                def enable_now():
+                    t.destroy()
+                    if newp:
+                        enable_pack(newp)
+                buttons(("big", "Включить сборку", enable_now), ("small", "К сборкам", lambda: (t.destroy(), show("packs"))))
+                toast("Сборка «%s» готова." % name, "ok")
+            poll2()
+        poll()
+        fade_in_window(t)
+
+    def edit_user_pack(p):
+        c = p.get("constructor") or {}
+        cb = builder_state()
+        cb.update(gv=c.get("gv", p.get("minecraft")), loader=c.get("loader", p.get("loader", "fabric").lower()),
+                  ptype="mod", name=p["name"].rsplit(" (", 1)[0])
+        cb["sel"] = {x["project_id"]: dict(x) for x in c.get("projects", [])}
+        builder_query()
+        show("builder")
+        toast("Сборка «%s» открыта в конструкторе: добавь или убери моды и нажми «Собрать сборку»." % cb["name"], "info",
+              ms=7000)
+
+    # --- вкладка «Скины» ---
+    def skin_photo_producer(png, slim=None, scale=5):
+        return lambda: render_skin(png, slim, scale)
+
+    def skins_state():
+        sk = state.get("sk")
+        if sk is None:
+            sk = state["sk"] = {"nick": load_settings().get("skin_nick", ""), "found": None, "searching": False,
+                                "gallery": [], "after": None, "gal_loading": False, "defaults": None}
+        return sk
+
+    def skins_lookup(nick):
+        sk = skins_state()
+        nick = nick.strip()
+        if not re.match(r"^[A-Za-z0-9_]{2,16}$", nick):
+            toast("Ник в Minecraft — от 2 до 16 латинских букв, цифр или «_».", "warn")
+            return
+        sk.update(nick=nick, searching=True, found=None)
+        s = load_settings(); s["skin_nick"] = nick; save_settings(s)
+
+        def work():
+            try:
+                sk["found"] = skin_lookup(nick)
+            except Exception:
+                sk["found"] = []
+            sk["searching"] = False
+            win.after(0, lambda: state["tab"] == "skins" and show("skins", animated=False))
+        threading.Thread(target=work, daemon=True).start()
+        show("skins", animated=False)
+
+    def gallery_more():
+        sk = skins_state()
+        if sk["gal_loading"]:
+            return
+        sk["gal_loading"] = True
+
+        def work():
+            try:
+                items, nxt = mineskin_popular(sk["after"], 24)
+                sk["gallery"] += items
+                sk["after"] = nxt
+            except Exception as e:
+                sk["gal_err"] = str(e)[:80]
+            sk["gal_loading"] = False
+            win.after(0, lambda: state["tab"] == "skins" and (state.update(keep_scroll=True), show("skins", animated=False)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def wear_dialog(skin_path, cape_path=None, title=""):
+        """Как надеть скин: без интернета у себя в игре или для всех - через сайт своего аккаунта."""
+        t = tk.Toplevel(win)
+        t.title("Надеть скин")
+        t.configure(bg=BG)
+        t.transient(win)
+        W = 640
+        fr = tk.Frame(t, bg=BG, padx=24, pady=20)
+        fr.pack(fill="both", expand=True)
+        top = tk.Frame(fr, bg=BG)
+        top.pack(fill="x")
+        prev = tk.Label(top, bg=BG)
+        prev.pack(side="left", anchor="n")
+        try:
+            prev.configure(image=pil_photo(render_skin(open(skin_path, "rb").read(), None, 4)))
+        except Exception:
+            pass
+        info = tk.Frame(top, bg=BG, padx=16)
+        info.pack(side="left", fill="both", expand=True)
+        tk.Label(info, text=title or "Надеть скин", font=(FONT, 17, "bold"), fg=TEXT, bg=BG, anchor="w").pack(fill="x")
+        tk.Label(info, text="Без интернета скин увидишь ты (и друзья по сети с тем же модом). Чтобы скин видели все "
+                            "на серверах, его загружают на сайт твоего аккаунта.", font=(FONT, 10), fg=MUTED, bg=BG,
+                 anchor="w", justify="left", wraplength=400).pack(fill="x", pady=(6, 0))
+        tk.Frame(fr, height=1, bg=LINE).pack(fill="x", pady=(16, 10))
+        tk.Label(fr, text="1. Без интернета, в одиночной игре и по сети с другом", font=(FONT, 12, "bold"), fg=TEXT,
+                 bg=BG, anchor="w").pack(fill="x")
+        nr = tk.Frame(fr, bg=BG)
+        nr.pack(fill="x", pady=(6, 0))
+        tk.Label(nr, text="Твой ник в игре:", font=(FONT, 10), fg=TEXT, bg=BG).pack(side="left")
+        ne = tk.Entry(nr, font=(FONT, 11), bg=CARD_HI, fg=TEXT, insertbackground=TEXT, relief="flat", width=18)
+        ne.insert(0, load_settings().get("skin_nick", ""))
+        ne.pack(side="left", padx=8, ipady=3)
+        capes = [None] + sorted(f for f in _listdir(os.path.join(SKINS_DIR, "Плащи")) if f.lower().endswith(".png"))
+        cvar = tk.StringVar(value=os.path.basename(cape_path) if cape_path else "без плаща")
+        if cape_path and os.path.basename(cape_path) not in capes:
+            capes.insert(1, os.path.basename(cape_path))
+        om = option_menu(nr, cvar, ["без плаща"] + [c for c in capes if c])
+        om.configure(width=18)
+        om.pack(side="left", padx=(8, 0))
+
+        def offline():
+            nick = ne.get().strip()
+            if not re.match(r"^[A-Za-z0-9_]{2,16}$", nick):
+                messagebox.showwarning("Ник", "Ник — от 2 до 16 латинских букв, цифр или «_».", parent=t)
+                return
+            cp = None
+            if cvar.get() != "без плаща":
+                cp = cape_path if cape_path and os.path.basename(cape_path) == cvar.get() else \
+                    os.path.join(SKINS_DIR, "Плащи", cvar.get())
+            t.destroy()
+            run_task("Надеваю скин", lambda log: install_offline_skin(nick, skin_path, cp, log),
+                     lambda ok, logs: messagebox.showinfo("Скин", "\n".join(logs) + "\n\nВ игре скин появится после запуска "
+                                                          "сборки с модами (Fabric или Forge). Мод CustomSkinLoader "
+                                                          "Portalis добавляет в неё сам."))
+        big_button(nr, "Надеть", offline, icon="ic_check.png").pack(side="right")
+        tk.Label(fr, text="Работает со сборками на Fabric и Forge (мод CustomSkinLoader). В TLauncher при входе на "
+                          "сервер может показываться скин из его аккаунта.", font=(FONT, 9), fg=MUTED, bg=BG, anchor="w",
+                 justify="left", wraplength=W - 60).pack(fill="x", pady=(6, 0))
+        tk.Frame(fr, height=1, bg=LINE).pack(fill="x", pady=(14, 10))
+        tk.Label(fr, text="2. Для всех игроков: загрузить на сайт аккаунта", font=(FONT, 12, "bold"), fg=TEXT, bg=BG,
+                 anchor="w").pack(fill="x")
+        rr = tk.Frame(fr, bg=BG)
+        rr.pack(fill="x", pady=(8, 0))
+
+        def site(url, what):
+            webbrowser.open(url)
+            subprocess.Popen(["explorer.exe", "/select,", skin_path])
+            toast("Открыл %s и папку со скином: войди в аккаунт и загрузи этот файл." % what, "info", ms=9000)
+        small_button(rr, "TLauncher", lambda: site("https://tlauncher.org/ru/profile/", "сайт TLauncher"), bg=BG,
+                     icon="ic_globe.png").pack(side="left")
+        small_button(rr, "Ely.by (Legacy Launcher)", lambda: site("https://ely.by/skins/add", "Ely.by"), bg=BG,
+                     icon="ic_globe.png").pack(side="left", padx=6)
+        small_button(rr, "Лицензия (minecraft.net)", lambda: site("https://www.minecraft.net/msaprofile/mygames/editskin",
+                                                                 "minecraft.net"), bg=BG, icon="ic_globe.png").pack(side="left")
+        small_button(fr, "Закрыть", t.destroy, bg=BG).pack(anchor="e", pady=(16, 0))
+        t.update_idletasks()
+        t.geometry("%dx%d+%d+%d" % (W, t.winfo_reqheight(), win.winfo_rootx() + (win.winfo_width() - W) // 2,
+                                    win.winfo_rooty() + 60))
+        fade_in_window(t)
+
+    def cape_maker():
+        t = tk.Toplevel(win)
+        t.title("Мастер плащей")
+        t.configure(bg=BG)
+        t.transient(win)
+        fr = tk.Frame(t, bg=BG, padx=24, pady=20)
+        fr.pack(fill="both", expand=True)
+        st = {"c1": "#b03a2e", "c2": "#f4d03f", "pattern": "полосы"}
+        tk.Label(fr, text="Мастер плащей", font=(FONT, 17, "bold"), fg=TEXT, bg=BG, anchor="w").pack(fill="x")
+        body_ = tk.Frame(fr, bg=BG)
+        body_.pack(fill="x", pady=(10, 0))
+        prev = tk.Label(body_, bg=PANEL, padx=20, pady=14)
+        prev.pack(side="left", anchor="n")
+        ctl = tk.Frame(body_, bg=BG, padx=18)
+        ctl.pack(side="left", fill="both", expand=True)
+
+        def redraw():
+            prev.configure(image=pil_photo(render_cape(make_cape(st["c1"], st["c2"], st["pattern"]), 12)))
+            for k, b in sw.items():
+                b.configure(bg=st[k])
+            for w in pr.winfo_children():
+                w.destroy()
+            chip_row(pr, [(p, p.capitalize()) for p in ("полосы", "шахматка", "градиент", "кайма", "звёзды", "однотонный")],
+                     st["pattern"], lambda v: (st.update(pattern=v), redraw()))
+
+        def pick(k):
+            c = colorchooser.askcolor(st[k], parent=t, title="Цвет плаща")
+            if c and c[1]:
+                st[k] = c[1]
+                redraw()
+        sw = {}
+        for k, text in (("c1", "Основной цвет"), ("c2", "Второй цвет")):
+            r = tk.Frame(ctl, bg=BG)
+            r.pack(fill="x", pady=(0, 8))
+            tk.Label(r, text=text, font=(FONT, 10), fg=TEXT, bg=BG, width=14, anchor="w").pack(side="left")
+            sw[k] = tk.Label(r, text="      ", bg=st[k], cursor="hand2", relief="flat", padx=14, pady=6)
+            sw[k].pack(side="left")
+            sw[k].bind("<Button-1>", lambda e, k=k: pick(k))
+        tk.Label(ctl, text="Узор", font=(FONT, 10), fg=TEXT, bg=BG, anchor="w").pack(fill="x", pady=(6, 4))
+        pr = tk.Frame(ctl, bg=BG)
+        pr.pack(fill="x")
+        nr = tk.Frame(ctl, bg=BG)
+        nr.pack(fill="x", pady=(14, 0))
+        tk.Label(nr, text="Название", font=(FONT, 10), fg=TEXT, bg=BG, width=14, anchor="w").pack(side="left")
+        ne = tk.Entry(nr, font=(FONT, 11), bg=CARD_HI, fg=TEXT, insertbackground=TEXT, relief="flat", width=20)
+        ne.insert(0, "Мой плащ")
+        ne.pack(side="left", ipady=3)
+
+        def save():
+            d = os.path.join(SKINS_DIR, "Плащи")
+            os.makedirs(d, exist_ok=True)
+            base = _safe_name(ne.get()) or "Плащ"
+            fn, i = base + ".png", 2
+            while os.path.exists(os.path.join(d, fn)):
+                fn, i = "%s (%d).png" % (base, i), i + 1
+            with open(os.path.join(d, fn), "wb") as fh:
+                fh.write(make_cape(st["c1"], st["c2"], st["pattern"]))
+            t.destroy()
+            toast("Плащ «%s» сохранён. Выбери его, когда надеваешь скин." % fn[:-4], "ok")
+            show("skins", animated=False)
+        big_button(fr, "Сохранить плащ", save, icon="ic_cape.png").pack(anchor="e", pady=(16, 0))
+        redraw()
+        fade_in_window(t)
+
+    def skin_card(parent, col, row, title, sub, png, slim, buttons_):
+        c = card(parent, col, row)
+        top = tk.Frame(c, bg=CARD)
+        top.pack(fill="x")
+        pv = tk.Label(top, bg=CARD, image=blank(180, 160))
+        pv.pack(side="left")
+        want_pic("skin:%s:%s" % (hashlib.sha1(png).hexdigest()[:16], slim), skin_photo_producer(png, slim, 5), pv)
+        info = tk.Frame(top, bg=CARD, padx=12)
+        info.pack(side="left", fill="both", expand=True)
+        tk.Label(info, text=title, font=(FONT, 13, "bold"), fg=TEXT, bg=CARD, anchor="w", justify="left",
+                 wraplength=220).pack(fill="x")
+        tk.Label(info, text=sub, font=(FONT, 9), fg=MUTED, bg=CARD, anchor="w", justify="left", wraplength=220).pack(
+            fill="x", pady=(2, 8))
+        for kind, text, cmd, icon in buttons_:
+            (big_button(info, text, cmd, icon=icon) if kind == "big" else small_button(info, text, cmd, bg=CARD, icon=icon)
+             ).pack(anchor="w", pady=(0, 5))
+        return c
+
+    def build_skins():
+        sk = skins_state()
+        head_f = section("Скины и плащи", 0, "найди скин по нику, выбери из галереи или сделай свой плащ")
+        small_button(head_f, "Папка скинов", lambda: (os.makedirs(SKINS_DIR, exist_ok=True), os.startfile(SKINS_DIR)),
+                     icon="ic_folder.png").pack(side="right")
+        hero(1, "skins_wide.png", "Твой персонаж",
+             "Посмотри, какой скин у ника в TLauncher, Ely.by и Mojang, сохрани понравившиеся и надень — "
+             "даже без интернета.")
+        row = 2
+        lk = tk.Frame(inner, bg=PANEL, padx=14, pady=12)
+        lk.grid(row=row, column=0, columnspan=2, sticky="we", padx=(0, 14), pady=(0, 12))
+        tk.Label(lk, text="Скин по нику:", font=(FONT, 11, "bold"), fg=TEXT, bg=PANEL).pack(side="left")
+        ne = tk.Entry(lk, font=(FONT, 11), bg=CARD_HI, fg=TEXT, insertbackground=TEXT, relief="flat", width=22)
+        ne.insert(0, sk["nick"])
+        ne.pack(side="left", padx=10, ipady=4)
+        ne.bind("<Return>", lambda e: skins_lookup(ne.get()))
+        big_button(lk, "Найти", lambda: skins_lookup(ne.get()), icon="ic_search.png").pack(side="left")
+        small_button(lk, "Добавить из файла", lambda: import_skin(), bg=PANEL, icon="ic_add.png").pack(side="right")
+        small_button(lk, "Сделать плащ", cape_maker, bg=PANEL, icon="ic_cape.png").pack(side="right", padx=6)
+        row += 1
+        if sk["searching"]:
+            tk.Label(inner, text="Ищу скин «%s» в TLauncher, Ely.by и Mojang..." % sk["nick"], font=(FONT, 11, "bold"),
+                     fg=GOLD, bg=BG, anchor="w").grid(row=row, column=0, columnspan=2, sticky="we", pady=(0, 10))
+            row += 1
+        elif sk["found"] is not None:
+            if not sk["found"]:
+                empty_note(row, "У ника «%s» нет своего скина ни в TLauncher, ни на Ely.by, ни в Mojang." % sk["nick"])
+                row += 1
+            for i, r in enumerate(sk["found"]):
+                def save_it(r=r):
+                    fn = save_my_skin("%s (%s)" % (sk["nick"], r["source"].split(" ")[0]), r["skin"], r["slim"],
+                                      r.get("cape"), r["source"])
+                    toast("Сохранено в «Мои скины»: %s" % fn[:-4], "ok")
+                    show("skins", animated=False)
+                sub = "%s · %s%s" % (r["source"], "тонкие руки" if r["slim"] else "обычные руки",
+                                     " · есть плащ" if r.get("cape") else "")
+                skin_card(inner, i % 2, row + i // 2, sk["nick"], sub, r["skin"], r["slim"],
+                          [("big", "Сохранить себе", save_it, "ic_backup.png")])
+            row += (len(sk["found"]) + 1) // 2
+        # Мои скины
+        mine = my_skins()
+        hf = section("Мои скины  (%d)" % len(mine), row)
+        row += 1
+        if not mine:
+            tk.Label(inner, text="Пока пусто. Найди скин по нику, выбери стандартный или из галереи ниже — "
+                                 "или добавь свой PNG кнопкой «Добавить из файла».", font=(FONT, 10), fg=MUTED, bg=BG,
+                     anchor="w", justify="left", wraplength=900).grid(row=row, column=0, columnspan=2, sticky="we",
+                                                                      pady=(0, 12))
+            row += 1
+        for i, m in enumerate(mine):
+            path = os.path.join(SKINS_DIR, m["file"])
+            try:
+                png = open(path, "rb").read()
+            except OSError:
+                continue
+            cape = os.path.join(SKINS_DIR, m["cape"]) if m.get("cape") else None
+
+            def rm(m=m):
+                if messagebox.askyesno("Удалить", "Убрать скин «%s» в Корзину?" % m["name"]):
+                    delete_my_skin(m["file"])
+                    show("skins", animated=False)
+            skin_card(inner, i % 2, row + i // 2, m["name"],
+                      ("тонкие руки" if m.get("slim") else "обычные руки") + (" · с плащом" if cape else "")
+                      + (" · " + m["source"] if m.get("source") else ""), png, m.get("slim"),
+                      [("big", "Надеть", lambda p=path, c=cape, n=m["name"]: wear_dialog(p, c, n), "ic_check.png"),
+                       ("small", "Удалить", rm, "ic_delete.png")])
+        row += (len(mine) + 1) // 2
+        capes = sorted(f for f in _listdir(os.path.join(SKINS_DIR, "Плащи")) if f.lower().endswith(".png"))
+        if capes:
+            cf = section("Мои плащи  (%d)" % len(capes), row)
+            row += 1
+            line = tk.Frame(inner, bg=BG)
+            line.grid(row=row, column=0, columnspan=2, sticky="we", pady=(0, 12))
+            for f in capes:
+                cell = tk.Frame(line, bg=CARD, padx=10, pady=8)
+                cell.pack(side="left", padx=(0, 10))
+                lb = tk.Label(cell, bg=CARD)
+                lb.pack()
+                want_pic("cape:" + f + str(os.path.getmtime(os.path.join(SKINS_DIR, "Плащи", f))),
+                         lambda f=f: render_cape(open(os.path.join(SKINS_DIR, "Плащи", f), "rb").read(), 5), lb)
+                tk.Label(cell, text=f[:-4][:16], font=(FONT, 9), fg=TEXT, bg=CARD).pack()
+            row += 1
+            _ = cf
+        _ = hf
+        # Стандартные скины
+        if sk["defaults"] is None:
+            sk["defaults"] = default_skins()
+        if sk["defaults"]:
+            section("Стандартные скины Minecraft", row, "из файлов игры")
+            row += 1
+            grid = tk.Frame(inner, bg=BG)
+            grid.grid(row=row, column=0, columnspan=2, sticky="we", pady=(0, 12))
+            for i, d in enumerate(sk["defaults"]):
+                cell = tk.Frame(grid, bg=CARD, padx=6, pady=6, cursor="hand2")
+                cell.grid(row=i // 7, column=i % 7, padx=(0, 8), pady=(0, 8))
+                lb = tk.Label(cell, bg=CARD, image=blank(104, 96))
+                lb.pack()
+                want_pic("def:%s:%s" % (d["name"], d["slim"]), skin_photo_producer(d["skin"], d["slim"], 3), lb)
+                tk.Label(cell, text="%s%s" % (d["name"], " ·т" if d["slim"] else ""), font=(FONT, 8), fg=TEXT, bg=CARD).pack()
+
+                def take(d=d):
+                    fn = save_my_skin(d["name"] + (" (тонкие)" if d["slim"] else ""), d["skin"], d["slim"], None, "стандартный")
+                    toast("Сохранено в «Мои скины»: %s" % fn[:-4], "ok")
+                    show("skins", animated=False)
+                for w in (cell, lb) + tuple(cell.winfo_children()):
+                    w.bind("<Button-1>", lambda e, take=take: take())
+            row += 1
+            tk.Label(inner, text="Нажми на скин, чтобы добавить его в «Мои скины».", font=(FONT, 9), fg=MUTED, bg=BG,
+                     anchor="w").grid(row=row, column=0, columnspan=2, sticky="we", pady=(0, 12))
+            row += 1
+        # Галерея MineSkin
+        section("Галерея скинов", row, "MineSkin: скины, которые загрузили игроки")
+        row += 1
+        if not sk["gallery"] and not sk["gal_loading"] and not sk.get("gal_err"):
+            gallery_more()
+        if sk.get("gal_err") and not sk["gallery"]:
+            empty_note(row, "Галерея не загрузилась (%s). Проверь интернет и нажми F5." % sk["gal_err"])
+            row += 1
+        grid = tk.Frame(inner, bg=BG)
+        grid.grid(row=row, column=0, columnspan=2, sticky="we", pady=(0, 10))
+        for i, g in enumerate(sk["gallery"]):
+            cell = tk.Frame(grid, bg=CARD, padx=6, pady=6, cursor="hand2")
+            cell.grid(row=i // 7, column=i % 7, padx=(0, 8), pady=(0, 8))
+            lb = tk.Label(cell, bg=CARD, image=blank(104, 96))
+            lb.pack()
+            want_pic("gal:" + g["texture"], lambda g=g: render_skin(texture_png(g["texture"]), None, 3), lb)
+            nm = g["name"] if g["name"] != "без названия" else "скин"
+            tk.Label(cell, text=nm[:13], font=(FONT, 8), fg=TEXT, bg=CARD).pack()
+
+            def take_g(g=g, nm=nm):
+                def work(log):
+                    png = texture_png(g["texture"])
+                    return save_my_skin(nm, png, None, None, "MineSkin")
+                run_task("Сохраняю скин", work, lambda fn, logs: (toast("Сохранено в «Мои скины»: %s" % fn[:-4], "ok"),
+                                                                  show("skins", animated=False)))
+            for w in (cell, lb) + tuple(cell.winfo_children()):
+                w.bind("<Button-1>", lambda e, f=take_g: f())
+        row += 1
+        mb = tk.Frame(inner, bg=BG)
+        mb.grid(row=row, column=0, columnspan=2, pady=(0, 14))
+        if sk["gal_loading"]:
+            tk.Label(mb, text="Загружаю галерею...", font=(FONT, 10, "bold"), fg=GOLD, bg=BG).pack()
+        elif sk.get("after"):
+            big_button(mb, "Показать ещё", gallery_more, color=CARD_HI, hover=LINE).pack()
+
+    def import_skin():
+        f = filedialog.askopenfilename(parent=win, title="Скин Minecraft (PNG 64x64 или 64x32)",
+                                       filetypes=[("Картинка PNG", "*.png")])
+        if not f:
+            return
+        try:
+            png = open(f, "rb").read()
+            im = PILImage.open(io.BytesIO(png))
+            if im.width % 64 or im.height not in (im.width, im.width // 2):
+                raise ValueError("размер %dx%d, а нужен 64x64 или 64x32" % im.size)
+        except Exception as e:
+            messagebox.showwarning("Не скин", "Это не скин Minecraft: %s" % e)
+            return
+        fn = save_my_skin(os.path.splitext(os.path.basename(f))[0], png, None, None, "из файла")
+        toast("Скин добавлен: %s" % fn[:-4], "ok")
+        show("skins", animated=False)
+
+
     def show(key, animated=True):
         prev = state.get("tab")
         state["tab"] = key
@@ -4240,9 +5801,15 @@ def gui():
                 b.configure(fg=MUTED)
         if win.winfo_viewable():
             move_tab_line(key)
+        keep = state.pop("keep_scroll", False) and prev == key
+        y = canvas.yview()[0] if keep else 0
         clear()
         {"maps": build_maps, "packs": build_packs, "servers": build_servers, "friend": build_friend,
-         "launchers": build_launchers}[key]()
+         "launchers": build_launchers, "builder": build_builder, "skins": build_skins}[key]()
+        if keep:
+            canvas.update_idletasks()
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.yview_moveto(y)
         auto_wrap(inner)
         refresh_head()
         refresh_foot()
@@ -4370,7 +5937,7 @@ def gui():
             line = "У тебя: %s   →   новая: %s" % (local.get("version", "?"), remote.get("version"))
         tk.Label(info, text=line, font=(FONT, 11), fg=ACCENT_HI, bg=BG, anchor="w", justify="left",
                  wraplength=400).pack(fill="x", pady=(6, 0))
-        tk.Label(info, text=("Файлы берутся с сайтов авторов: карты - оттуда, где их выложили, моды - с Modrinth "
+        tk.Label(info, text=("Файлы берутся с сайтов авторов: карты — оттуда, где их выложили, моды — с Modrinth "
                              "и CurseForge. Если что-то уже есть в «Загрузках», программа возьмёт оттуда." if items else
                              "Программа скачает только то, что изменилось. Твои миры и настройки игры не трогаются."),
                  font=(FONT, 10), fg=MUTED, bg=BG, anchor="w", justify="left", wraplength=400).pack(fill="x", pady=(8, 0))
@@ -4602,6 +6169,7 @@ def gui():
             win.geometry(g)
 
     def on_close():
+        pic_pool.shutdown(wait=False, cancel_futures=True)
         s = load_settings()
         if win.state() == "normal":
             s["geometry"] = win.geometry()
@@ -4673,6 +6241,15 @@ if __name__ == "__main__":
         sys.exit(0)
     set_game_dir()
     if len(sys.argv) > 1:
-        cleanup_after_update()
-        sys.exit(cli(sys.argv[1:]))
+        try:
+            cleanup_after_update()
+            code = cli(sys.argv[1:])
+        except Exception as e:
+            try:
+                with open(os.path.join(ROOT, "switcher_cli.log"), "a", encoding="utf-8") as fh:
+                    fh.write("Ошибка: %s\n%s\n" % (e, traceback.format_exc()))
+            except OSError:
+                pass
+            code = 1
+        sys.exit(code)
     gui()

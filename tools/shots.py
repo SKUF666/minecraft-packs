@@ -4,7 +4,7 @@ from PIL import ImageGrab
 sys.stdout.reconfigure(encoding='utf-8')
 OUT = os.path.join(os.environ.get('TEMP', '.'), 'minecraft-packs-shots')
 os.makedirs(OUT, exist_ok=True)
-LIB = os.environ.get('LIB') or os.path.join(os.environ['LOCALAPPDATA'], 'Portalis')
+LIB = os.environ.get('LIB') or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'library')
 W, H = (int(sys.argv[1]), int(sys.argv[2])) if len(sys.argv) > 2 else (1080, 760)
 TAG = sys.argv[3] if len(sys.argv) > 3 else ''
 ONLY = os.environ.get('ONLY', '')
@@ -29,7 +29,7 @@ def patched(self, *a):
     seq = []
     if not ONLY:
         seq += [('splash', 450)]
-    seq += [('maps', 2300), ('packs', 900), ('servers', 900), ('friend', 900), ('launchers', 3500),
+    seq += [('maps', 2300), ('packs', 900), ('builder', 5000), ('skins', 6000), ('servers', 900), ('friend', 900), ('launchers', 3500),
             ('done', 900), ('toast', 900), ('update', 4000)]
     if ONLY:
         seq = [s for s in seq if s[0] in ONLY.split(',')]

@@ -1,6 +1,6 @@
 import os, sys, json, glob
 sys.stdout.reconfigure(encoding='utf-8')
-LIB = os.path.join(os.environ['LOCALAPPDATA'], 'Portalis')
+LIB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'library')
 lines = []
 total = 0
 for pj in sorted(glob.glob(os.path.join(LIB, '*', '*', 'pack.json'))):

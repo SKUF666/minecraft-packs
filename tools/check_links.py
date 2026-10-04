@@ -43,7 +43,7 @@ def probe(ps, url, referer='', size=None):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--lib', default=os.path.join(os.environ['LOCALAPPDATA'], 'Portalis'))
+    ap.add_argument('--lib', default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'library'))
     a = ap.parse_args()
     ps = load_ps(a.lib)
     bad = 0
