@@ -33,6 +33,7 @@ import ctypes.wintypes
 import webbrowser
 import concurrent.futures
 import traceback
+import calendar
 from PIL import Image as PILImage, ImageTk, ImageDraw  # значки Modrinth (webp) и превью скинов
 try:
     import winreg
@@ -626,6 +627,292 @@ def install_map(m, pack=None, fresh=False, packs=None, log=print):
     if hint:
         log("Подсказка: " + hint)
     return ok
+
+
+# ---------- аккаунты, друзья, пати и чат (Supabase) ----------
+# Адрес проекта и публичный ключ лежат в social.json рядом с каталогом (приходит с обновлением).
+# Вход по логину: Supabase хочет почту, поэтому почта собирается из логина (письма не отправляются).
+# Что кому видно, решают правила RLS в базе (supabase/portalis.sql), а не программа.
+
+SOCIAL_MAIL = "players.portalis.app"
+ONLINE_SECONDS = 100
+
+
+class SocialError(RuntimeError):
+    def __init__(self, code, msg):
+        RuntimeError.__init__(self, social_message(msg))
+        self.code = code
+
+
+def social_message(msg):
+    m = str(msg or "")
+    low = m.lower()
+    for key, ru in (("already registered", "Такой логин уже занят"), ("already exists", "Такой логин уже занят"),
+                    ("invalid login credentials", "Неверный логин или пароль"),
+                    ("password should be at least", "Пароль - минимум 6 символов"),
+                    ("weak password", "Пароль слишком простой: добавь цифры и буквы"),
+                    ("rate limit", "Слишком много попыток, подожди минуту"),
+                    ("email not confirmed", "Аккаунт ещё не подтверждён на сервере (выключи «Confirm email» в Supabase)"),
+                    ("duplicate key", "Это уже сделано"), ("jwt expired", "Сессия истекла, войди заново"),
+                    ("row-level security", "Сервер не разрешил это действие"), ("violates check constraint", "Неподходящее значение")):
+        if key in low:
+            return ru
+    return m
+
+
+def social_cfg():
+    try:
+        with open(os.path.join(ROOT, "social.json"), encoding="utf-8") as fh:
+            c = json.load(fh)
+        return c if c.get("url") and c.get("key") else None
+    except Exception:
+        return None
+
+
+def _http_json(method, url, headers=None, body=None, timeout=20):
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    last = None
+    for attempt in range(3):
+        if attempt and method != "GET" and not isinstance(last, urllib.error.URLError):
+            break  # запрос мог уйти на сервер: повтор задвоил бы сообщение; не соединились - повторяем
+        req = urllib.request.Request(url, data=data, method=method,
+                                     headers=dict({"Content-Type": "application/json"}, **(headers or {})))
+        try:
+            with urlopen(req, timeout, attempt) as r:
+                raw = r.read()
+                return json.loads(raw.decode("utf-8")) if raw.strip() else None
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode("utf-8", "ignore")
+            try:
+                j = json.loads(raw)
+            except ValueError:
+                j = {}
+            raise SocialError(e.code, j.get("msg") or j.get("message") or j.get("error_description")
+                              or j.get("error") or raw[:200] or "HTTP %d" % e.code)
+        except Exception as e:
+            last = e
+    raise SocialError(0, "нет связи с сервером аккаунтов (%s)" % last)
+
+
+class Social:
+    """Клиент Supabase для аккаунтов. Сессия (токены) хранится в _settings.json."""
+
+    def __init__(self):
+        self.cfg = social_cfg()
+        self.session = (load_settings().get("social") or {}) if self.cfg else {}
+        self.lock = threading.Lock()
+
+    # --- вход ---
+    def ready(self):
+        return bool(self.cfg)
+
+    def logged_in(self):
+        return bool(self.session.get("refresh_token"))
+
+    @property
+    def uid(self):
+        return (self.session.get("user") or {}).get("id")
+
+    def _save(self, sess):
+        self.session = sess or {}
+        st = load_settings()
+        if sess:
+            st["social"] = {k: sess.get(k) for k in ("access_token", "refresh_token", "expires_at", "user")}
+            st["social"]["user"] = {"id": (sess.get("user") or {}).get("id")}
+        else:
+            st.pop("social", None)
+        save_settings(st)
+
+    def _auth(self, path, body):
+        j = _http_json("POST", self.cfg["url"] + "/auth/v1/" + path, {"apikey": self.cfg["key"]}, body)
+        if j and j.get("access_token"):
+            j["expires_at"] = j.get("expires_at") or int(time.time()) + int(j.get("expires_in") or 3600)
+            self._save(j)
+        return j
+
+    @staticmethod
+    def check_login(login):
+        login = (login or "").strip().lower()
+        if not re.match(r"^[a-z0-9_]{3,20}$", login):
+            raise SocialError(0, "Логин: 3-20 латинских букв, цифр или «_»")
+        return login
+
+    def sign_up(self, login, password, nick):
+        login = self.check_login(login)
+        nick = (nick or login).strip()[:24] or login
+        if len(nick) < 2:
+            raise SocialError(0, "Ник - минимум 2 символа")
+        j = self._auth("signup", {"email": "%s@%s" % (login, SOCIAL_MAIL), "password": password,
+                                  "data": {"login": login, "nick": nick}})
+        if not (j and j.get("access_token")):
+            raise SocialError(0, "email not confirmed")
+        return j
+
+    def sign_in(self, login, password):
+        login = self.check_login(login)
+        return self._auth("token?grant_type=password", {"email": "%s@%s" % (login, SOCIAL_MAIL), "password": password})
+
+    def sign_out(self):
+        try:
+            if self.session.get("access_token"):
+                _http_json("POST", self.cfg["url"] + "/auth/v1/logout",
+                           {"apikey": self.cfg["key"], "Authorization": "Bearer " + self.session["access_token"]})
+        except Exception:
+            pass
+        self._save(None)
+
+    def _token(self):
+        with self.lock:
+            if not self.logged_in():
+                raise SocialError(401, "Сначала войди в аккаунт")
+            if time.time() > (self.session.get("expires_at") or 0) - 60:
+                try:
+                    self._auth("token?grant_type=refresh_token", {"refresh_token": self.session["refresh_token"]})
+                except SocialError as e:
+                    if e.code in (400, 401, 403):
+                        self._save(None)
+                        raise SocialError(401, "Сессия истекла, войди заново")
+                    raise
+            return self.session["access_token"]
+
+    # --- данные ---
+    def rest(self, method, table, params=None, body=None, prefer=None):
+        h = {"apikey": self.cfg["key"], "Authorization": "Bearer " + self._token()}
+        if prefer:
+            h["Prefer"] = prefer
+        url = self.cfg["url"] + "/rest/v1/" + table + ("?" + urllib.parse.urlencode(params, safe="(),.*:") if params else "")
+        return _http_json(method, url, h, body)
+
+    def me(self):
+        r = self.rest("GET", "profiles", {"id": "eq." + self.uid, "select": "*"})
+        return r[0] if r else None
+
+    def set_status(self, status, detail=None):
+        return self.rest("PATCH", "profiles", {"id": "eq." + self.uid},
+                         {"status": status, "status_detail": detail, "last_seen": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+
+    def set_nick(self, nick):
+        return self.rest("PATCH", "profiles", {"id": "eq." + self.uid}, {"nick": nick.strip()[:24]})
+
+    def find(self, login):
+        r = self.rest("GET", "profiles", {"login": "eq." + self.check_login(login), "select": "id,login,nick,status,last_seen"})
+        return r[0] if r else None
+
+    def profiles(self, ids):
+        if not ids:
+            return {}
+        r = self.rest("GET", "profiles", {"id": "in.(%s)" % ",".join(ids), "select": "id,login,nick,avatar,status,status_detail,last_seen"})
+        return {x["id"]: x for x in r or []}
+
+    def friends(self):
+        """[{profile, state: friend/incoming/outgoing}] - друзья, входящие и исходящие заявки."""
+        rows = self.rest("GET", "friendships", {"select": "requester,addressee,status"}) or []
+        other = {}
+        for r in rows:
+            mine = r["requester"] == self.uid
+            o = r["addressee"] if mine else r["requester"]
+            other[o] = "friend" if r["status"] == "accepted" else ("outgoing" if mine else "incoming")
+        profs = self.profiles(list(other))
+        out = [{"profile": profs.get(o, {"id": o, "login": "?", "nick": "?"}), "state": st} for o, st in other.items()]
+        out.sort(key=lambda x: ({"incoming": 0, "friend": 1, "outgoing": 2}[x["state"]], not is_online(x["profile"]),
+                                x["profile"].get("nick", "").lower()))
+        return out
+
+    def add_friend(self, login):
+        p = self.find(login)
+        if not p:
+            raise SocialError(404, "Игрока с логином «%s» нет" % login)
+        if p["id"] == self.uid:
+            raise SocialError(0, "Это ты сам :)")
+        back = self.rest("GET", "friendships", {"requester": "eq." + p["id"], "addressee": "eq." + self.uid, "select": "status"})
+        if back:
+            self.accept(p["id"])
+            return p, "accepted"
+        self.rest("POST", "friendships", body={"requester": self.uid, "addressee": p["id"]})
+        return p, "sent"
+
+    def accept(self, uid):
+        self.rest("PATCH", "friendships", {"requester": "eq." + uid, "addressee": "eq." + self.uid}, {"status": "accepted"})
+
+    def remove_friend(self, uid):
+        self.rest("DELETE", "friendships", {"or": "(and(requester.eq.%s,addressee.eq.%s),and(requester.eq.%s,addressee.eq.%s))"
+                                                  % (self.uid, uid, uid, self.uid)})
+
+    # --- пати ---
+    def parties(self):
+        """(мои пати, приглашения в чужие)."""
+        mem = self.rest("GET", "party_members", {"user_id": "eq." + self.uid, "select": "party_id,parties(*)"}) or []
+        inv = self.rest("GET", "party_invites", {"user_id": "eq." + self.uid,
+                                                 "select": "party_id,invited_by,parties(id,name,owner)"}) or []
+        mine = [m["parties"] for m in mem if m.get("parties")]
+        mine.sort(key=lambda x: x.get("created_at", ""))
+        return mine, [dict(i["parties"], invited_by=i["invited_by"]) for i in inv if i.get("parties")]
+
+    def create_party(self, name):
+        name = (name or "").strip()[:40] or "Моя пати"
+        r = self.rest("POST", "parties", body={"owner": self.uid, "name": name}, prefer="return=representation")
+        pid = r[0]["id"]
+        self.rest("POST", "party_members", body={"party_id": pid, "user_id": self.uid})
+        return r[0]
+
+    def invite(self, pid, uid):
+        self.rest("POST", "party_invites", body={"party_id": pid, "user_id": uid, "invited_by": self.uid})
+
+    def join(self, pid):
+        self.rest("POST", "party_members", body={"party_id": pid, "user_id": self.uid})
+        self.rest("DELETE", "party_invites", {"party_id": "eq." + pid, "user_id": "eq." + self.uid})
+
+    def decline(self, pid):
+        self.rest("DELETE", "party_invites", {"party_id": "eq." + pid, "user_id": "eq." + self.uid})
+
+    def leave(self, party):
+        if party.get("owner") == self.uid:
+            self.rest("DELETE", "parties", {"id": "eq." + party["id"]})  # хозяин распускает пати
+        else:
+            self.rest("DELETE", "party_members", {"party_id": "eq." + party["id"], "user_id": "eq." + self.uid})
+
+    def members(self, pid):
+        r = self.rest("GET", "party_members", {"party_id": "eq." + pid, "select": "user_id"}) or []
+        profs = self.profiles([x["user_id"] for x in r])
+        return [profs[x["user_id"]] for x in r if x["user_id"] in profs]
+
+    def party(self, pid):
+        r = self.rest("GET", "parties", {"id": "eq." + pid, "select": "*"})
+        return r[0] if r else None
+
+    def share_game(self, pid, code, info):
+        self.rest("PATCH", "parties", {"id": "eq." + pid},
+                  {"game_code": code, "game_info": info, "game_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+
+    # --- сообщения ---
+    def messages(self, pid=None, to=None, after=0, limit=100):
+        q = {"select": "id,from_user,to_user,body,created_at", "order": "id.desc", "limit": str(limit)}
+        if after:
+            q["id"] = "gt.%d" % after
+        if pid:
+            q["party_id"] = "eq." + pid
+        else:
+            q["or"] = "(and(from_user.eq.%s,to_user.eq.%s),and(from_user.eq.%s,to_user.eq.%s))" % (self.uid, to, to, self.uid)
+        return list(reversed(self.rest("GET", "messages", q) or []))
+
+    def send(self, body, pid=None, to=None):
+        body = (body or "").strip()[:500]
+        if not body:
+            return
+        row = {"body": body, "from_user": self.uid}
+        row["party_id" if pid else "to_user"] = pid or to
+        self.rest("POST", "messages", body=row)
+
+
+def is_online(p):
+    """Игрок в сети: программа отмечается раз в минуту, 100 секунд без отметки - вышел."""
+    if not p or p.get("status") == "offline" or not p.get("last_seen"):
+        return False
+    try:
+        t = calendar.timegm(time.strptime(p["last_seen"][:19], "%Y-%m-%dT%H:%M:%S"))
+    except (ValueError, OverflowError):
+        return False
+    return time.time() - t < ONLINE_SECONDS
 
 
 # ---------- карты из интернета (каталог minecraft-inside.ru) ----------
@@ -5939,6 +6226,7 @@ def gui():
         hero.create_text(22, 88, text="Hamachi, Radmin VPN, ZeroTier или одна Wi-Fi сеть: выбери ниже и следуй шагам",
                          font=(FONT, 10), fill="#d7deea", anchor="w")
         hero.bind("<Configure>", lambda e: hero.coords(hid, e.width, -20))
+        social_panel(2)
         nc = net_info()
         vpn = nc["vpn"]
         if state.get("net") not in NET_KINDS:
@@ -5981,7 +6269,7 @@ def gui():
 
         # выбор сети
         sel = tk.Frame(inner, bg=BG)
-        sel.grid(row=2, column=0, columnspan=2, sticky="we", pady=(0, 12))
+        sel.grid(row=12, column=0, columnspan=2, sticky="we", pady=(0, 12))
         tk.Label(sel, text="Через что играете:", font=(FONT, 11, "bold"), fg=TEXT, bg=BG).pack(side="left", padx=(0, 10))
         for k in NET_KINDS:
             on = k == kind
@@ -5994,7 +6282,7 @@ def gui():
 
         # настройка
         setup = tk.Frame(inner, bg=CARD, padx=16, pady=14)
-        setup.grid(row=3, column=0, columnspan=2, sticky="we", padx=(0, 14), pady=(0, 14))
+        setup.grid(row=13, column=0, columnspan=2, sticky="we", padx=(0, 14), pady=(0, 14))
         tk.Label(setup, text="Настройка перед первой игрой: делают оба", font=(FONT, 14, "bold"),
                  fg=TEXT, bg=CARD, anchor="w").pack(fill="x", pady=(0, 6))
         for i, line in enumerate(info["setup"], 1):
@@ -6020,7 +6308,7 @@ def gui():
                          fg=color, bg=PANEL, justify="left", anchor="w", wraplength=900).pack(fill="x", pady=1)
 
         # хост
-        host = card(inner, 0, 4)
+        host = card(inner, 0, 14)
         tk.Label(host, text="Я создаю игру", font=(FONT, 15, "bold"), fg=TEXT, bg=CARD, anchor="w").pack(fill="x")
         net_line(host)
         for i, line in enumerate([info["host"],
@@ -6055,7 +6343,7 @@ def gui():
                 font=(FONT, 9), fg=MUTED, bg=PANEL, wraplength=400, justify="left").pack(anchor="w", pady=(8, 0))
 
         # гость
-        guest = card(inner, 1, 4)
+        guest = card(inner, 1, 14)
         tk.Label(guest, text="Я подключаюсь", font=(FONT, 15, "bold"), fg=TEXT, bg=CARD, anchor="w").pack(fill="x")
         net_line(guest)
         for i, line in enumerate([info["guest"],
@@ -6106,7 +6394,7 @@ def gui():
                              "Сеть выбирайте одну и ту же. Если друг не подключается, пусть тот, кто создал игру, первым делом "
                              "нажмёт «Проверить настройки».",
                  font=(FONT, 10), fg=MUTED, bg=BG, wraplength=900, justify="left", anchor="w"
-                 ).grid(row=5, column=0, columnspan=2, sticky="we", pady=(4, 0))
+                 ).grid(row=15, column=0, columnspan=2, sticky="we", pady=(4, 0))
 
     def auto_wrap(root):
         """Перенос текста по фактической ширине: растянутые по ширине подписи не обрезаются в узком окне."""
@@ -7109,6 +7397,474 @@ def gui():
         poll()
         fade_in_window(t)
 
+    # --- аккаунт: друзья, пати и чат ---
+    def soc():
+        c = state.get("soc_client")
+        if c is None:
+            c = state["soc_client"] = Social()
+        return c
+
+    def soc_data():
+        return state.setdefault("soc", {"loaded": False, "loading": False, "me": None, "friends": [], "parties": [],
+                                        "invites": [], "party": None, "members": [], "msgs": [], "last": 0,
+                                        "err": None, "mode": "in", "sel": None})
+
+    def soc_bg(fn, done=None, err_toast=True):
+        """Запрос к серверу в фоне, результат - в окно."""
+        box = {}
+
+        def work():
+            try:
+                box["r"] = fn()
+            except Exception as e:
+                box["e"] = e
+
+        def poll():
+            if th.is_alive():
+                win.after(120, poll)
+                return
+            if "e" in box:
+                if err_toast:
+                    toast(str(box["e"]), "warn", ms=6000)
+                if isinstance(box["e"], SocialError) and box["e"].code == 401 and not soc().logged_in():
+                    soc_data().update(loaded=False, me=None)
+                    soc_render()
+                return
+            if done:
+                done(box.get("r"))
+        th = threading.Thread(target=work, daemon=True)
+        th.start()
+        poll()
+
+    def soc_refresh(full=True):
+        d = soc_data()
+        c = soc()
+        if not c.logged_in() or d["loading"]:
+            return
+        d["loading"] = True
+
+        def fetch():
+            r = {"me": c.me(), "friends": c.friends()}
+            r["parties"], r["invites"] = c.parties()
+            sel = d.get("sel")
+            if r["parties"] and sel not in [x["id"] for x in r["parties"]]:
+                sel = r["parties"][0]["id"]
+            r["sel"] = sel if r["parties"] else None
+            if r["sel"]:
+                r["party"] = next(x for x in r["parties"] if x["id"] == r["sel"])
+                r["members"] = c.members(r["sel"])
+            else:
+                r["party"], r["members"] = None, []
+            return r
+
+        def done(r):
+            d["loading"] = False
+            changed = any(json.dumps(d.get(k), sort_keys=True, default=str) != json.dumps(r[k], sort_keys=True, default=str)
+                          for k in r)
+            if r["sel"] != d.get("sel"):
+                d.update(msgs=[], last=0)
+            d.update(r, loaded=True, err=None)
+            if changed or full:
+                soc_render()
+            soc_poll_chat()
+
+        def fail(fn):
+            try:
+                return fn()
+            finally:
+                d["loading"] = False
+        soc_bg(lambda: fail(fetch), done, err_toast=full)
+
+    def soc_poll_chat():
+        d = soc_data()
+        c = soc()
+        if not d.get("sel") or not c.logged_in() or d.get("polling"):
+            return
+        pid, after = d["sel"], d["last"]
+        d["polling"] = True
+
+        def fetch():
+            try:
+                return c.messages(pid=pid, after=after)
+            finally:
+                d["polling"] = False
+
+        def done(rows):
+            rows = [m for m in rows or [] if m["id"] > d["last"]]  # уже показанные не повторяем
+            if d.get("sel") != pid or not rows:
+                return
+            d["msgs"] = (d["msgs"] + rows)[-200:]
+            d["last"] = rows[-1]["id"]
+            soc_chat_append(rows)
+        soc_bg(fetch, done, err_toast=False)
+
+    def soc_name(uid):
+        d = soc_data()
+        for p in [d.get("me") or {}] + d.get("members", []) + [f["profile"] for f in d.get("friends", [])]:
+            if p.get("id") == uid:
+                return p.get("nick") or p.get("login")
+        return "игрок"
+
+    def soc_chat_append(rows):
+        t = state.get("soc_chat")
+        if not t or not t.winfo_exists() or not rows:
+            return
+        t.configure(state="normal")
+        if getattr(t, "_empty", False):  # убрать «Сообщений пока нет»
+            t.delete("1.0", "end")
+            t._empty = False
+        for m in rows:
+            mine = m["from_user"] == soc().uid
+            tm = m["created_at"][11:16]
+            t.insert("end", "%s  " % tm, "time")
+            t.insert("end", "%s: " % soc_name(m["from_user"]), "me" if mine else "who")
+            body = m["body"]
+            if body.startswith("MC1-"):
+                t.insert("end", "код приглашения в игру (кнопка «Присоединиться» выше)\n", "sys")
+            else:
+                t.insert("end", body + "\n")
+        t.configure(state="disabled")
+        t.see("end")
+
+    def social_panel(row):
+        """Сверху вкладки «С другом»: вход или аккаунт с друзьями, пати и чатом."""
+        if not soc().ready():
+            return
+        fr = tk.Frame(inner, bg=BG)
+        fr.grid(row=row, column=0, columnspan=2, sticky="we", padx=(0, 14), pady=(0, 14))
+        state["soc_frame"] = fr
+        soc_render()
+        d = soc_data()
+        if soc().logged_in() and not d["loaded"]:
+            soc_refresh()
+
+    def soc_render():
+        fr = state.get("soc_frame")
+        if fr is None or not fr.winfo_exists():
+            return
+        for w in fr.winfo_children():
+            w.destroy()
+        c, d = soc(), soc_data()
+        if not c.logged_in():
+            return soc_login_form(fr)
+        if not d["loaded"]:
+            tk.Label(fr, text="Загружаю аккаунт...", font=(FONT, 11, "bold"), fg=GOLD, bg=BG, anchor="w").pack(fill="x")
+            return
+        me = d.get("me") or {}
+        head = tk.Frame(fr, bg=PANEL, padx=14, pady=10)
+        head.pack(fill="x")
+        tk.Label(head, text="●", font=(FONT, 12), fg=ACCENT_HI, bg=PANEL).pack(side="left")
+        tk.Label(head, text=" %s" % me.get("nick", "?"), font=(FONT, 13, "bold"), fg=TEXT, bg=PANEL).pack(side="left")
+        tk.Label(head, text="   логин: %s  ·  друзья найдут тебя по логину" % me.get("login", "?"), font=(FONT, 9),
+                 fg=MUTED, bg=PANEL).pack(side="left")
+
+        def logout():
+            if messagebox.askyesno("Выйти", "Выйти из аккаунта на этом компьютере?"):
+                soc_bg(lambda: c.sign_out(), lambda r: (soc_data().update(loaded=False, me=None, sel=None), soc_render()))
+
+        def rename():
+            n = simpledialog.askstring("Ник", "Как тебя показывать друзьям (2-24 символа):", initialvalue=me.get("nick", ""),
+                                       parent=win)
+            if n and len(n.strip()) >= 2:
+                soc_bg(lambda: c.set_nick(n), lambda r: soc_refresh())
+        small_button(head, "Выйти", logout, bg=PANEL).pack(side="right")
+        small_button(head, "Сменить ник", rename, bg=PANEL).pack(side="right", padx=6)
+        small_button(head, "Обновить", lambda: soc_refresh(), bg=PANEL).pack(side="right")
+        cols = tk.Frame(fr, bg=BG)
+        cols.pack(fill="x", pady=(10, 0))
+        cols.grid_columnconfigure(0, weight=1, uniform="s")
+        cols.grid_columnconfigure(1, weight=1, uniform="s")
+        left = tk.Frame(cols, bg=CARD, padx=14, pady=12)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
+        right = tk.Frame(cols, bg=CARD, padx=14, pady=12)
+        right.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
+        soc_friends(left)
+        soc_party(right)
+        auto_wrap(fr)
+
+    def soc_login_form(fr):
+        d = soc_data()
+        box = tk.Frame(fr, bg=PANEL, padx=18, pady=14)
+        box.pack(fill="x")
+        top = tk.Frame(box, bg=PANEL)
+        top.pack(fill="x")
+        tk.Label(top, text="Аккаунт Portalis", font=(FONT, 14, "bold"), fg=TEXT, bg=PANEL).pack(side="left")
+        tk.Label(top, text="   друзья, пати, чат и приглашения в игру одной кнопкой", font=(FONT, 10), fg=MUTED,
+                 bg=PANEL).pack(side="left")
+        chip_row(top, [("in", "Вход"), ("up", "Регистрация")], d["mode"],
+                 lambda v: (d.update(mode=v), soc_render()), PANEL)
+        form = tk.Frame(box, bg=PANEL)
+        form.pack(fill="x", pady=(12, 0))
+        ents = {}
+        fields = [("login", "Логин", False)] + ([("nick", "Ник (как видят друзья)", False)] if d["mode"] == "up" else []) + \
+                 [("password", "Пароль", True)]
+        for k, label, secret in fields:
+            col = tk.Frame(form, bg=PANEL)
+            col.pack(side="left", padx=(0, 12))
+            tk.Label(col, text=label, font=(FONT, 9), fg=MUTED, bg=PANEL, anchor="w").pack(fill="x")
+            e = tk.Entry(col, font=(FONT, 11), bg=CARD_HI, fg=TEXT, insertbackground=TEXT, relief="flat", width=18,
+                         highlightthickness=1, highlightbackground=LINE, highlightcolor=ACCENT, show="•" if secret else "")
+            e.pack(ipady=4)
+            ents[k] = e
+
+        def go(ev=None):
+            login, pw = ents["login"].get(), ents["password"].get()
+            nick = ents["nick"].get() if "nick" in ents else ""
+            if len(pw) < 6:
+                toast("Пароль - минимум 6 символов", "warn")
+                return
+            act = (lambda: soc().sign_up(login, pw, nick or login)) if d["mode"] == "up" else \
+                (lambda: soc().sign_in(login, pw))
+            btn.configure(text="Подожди...")
+            soc_bg(act, lambda r: (toast("Готово! Ты в аккаунте.", "ok"), soc_data().update(loaded=False), soc_refresh(),
+                                   soc_render()))
+        for e in ents.values():
+            e.bind("<Return>", go)
+        btn = big_button(form, "Создать аккаунт" if d["mode"] == "up" else "Войти", go, icon="ic_check.png")
+        btn.pack(side="left", pady=(14, 0))
+        tk.Label(box, text="Логин - латиница, цифры и «_» (3-20). Почта не нужна. Пароль хранится на сервере только "
+                           "в виде хэша; восстановить его нельзя, так что запомни.",
+                 font=(FONT, 9), fg=MUTED, bg=PANEL, anchor="w", justify="left", wraplength=900).pack(fill="x", pady=(10, 0))
+
+    def soc_friends(box):
+        c, d = soc(), soc_data()
+        tk.Label(box, text="Друзья", font=(FONT, 13, "bold"), fg=TEXT, bg=CARD, anchor="w").pack(fill="x")
+        add = tk.Frame(box, bg=CARD)
+        add.pack(fill="x", pady=(8, 8))
+        e = tk.Entry(add, font=(FONT, 10), bg=CARD_HI, fg=TEXT, insertbackground=TEXT, relief="flat", width=20,
+                     highlightthickness=1, highlightbackground=LINE, highlightcolor=ACCENT)
+        e.pack(side="left", ipady=4)
+
+        def add_friend(ev=None):
+            login = e.get().strip()
+            if not login:
+                return
+            soc_bg(lambda: c.add_friend(login),
+                   lambda r: (toast(("Теперь вы друзья с %s" if r[1] == "accepted" else "Заявка отправлена: %s")
+                                    % r[0]["nick"], "ok"), soc_refresh()))
+        e.bind("<Return>", add_friend)
+        small_button(add, "Добавить по логину", add_friend, bg=CARD, icon="ic_add.png").pack(side="left", padx=6)
+        if not d["friends"]:
+            tk.Label(box, text="Пока никого. Спроси у друга его логин в Portalis и добавь.", font=(FONT, 10), fg=MUTED,
+                     bg=CARD, anchor="w").pack(fill="x")
+        for f in d["friends"][:30]:
+            p, st = f["profile"], f["state"]
+            row = tk.Frame(box, bg=CARD)
+            row.pack(fill="x", pady=2)
+            on = is_online(p)
+            tk.Label(row, text="●", font=(FONT, 11), fg=(ACCENT_HI if on else "#5c6170") if st == "friend" else GOLD,
+                     bg=CARD).pack(side="left")
+            sub = ("играет: " + p["status_detail"]) if on and p.get("status") == "playing" and p.get("status_detail") else \
+                ("в сети" if on else "не в сети") if st == "friend" else ("хочет дружить" if st == "incoming" else "ждёт ответа")
+            tk.Label(row, text=" %s" % p.get("nick", "?"), font=(FONT, 10, "bold"), fg=TEXT, bg=CARD).pack(side="left")
+            tk.Label(row, text="  %s" % sub, font=(FONT, 9), fg=MUTED, bg=CARD).pack(side="left")
+            if st == "incoming":
+                small_button(row, "Отклонить", lambda u=p["id"]: soc_bg(lambda: c.remove_friend(u), lambda r: soc_refresh()),
+                             bg=CARD).pack(side="right")
+                small_button(row, "Принять", lambda u=p["id"]: soc_bg(lambda: c.accept(u), lambda r: soc_refresh()),
+                             bg=CARD, icon="ic_check.png").pack(side="right")
+            elif st == "outgoing":
+                small_button(row, "Отменить", lambda u=p["id"]: soc_bg(lambda: c.remove_friend(u), lambda r: soc_refresh()),
+                             bg=CARD).pack(side="right")
+            else:
+                def drop(p=p):
+                    if messagebox.askyesno("Друзья", "Убрать %s из друзей?" % p.get("nick")):
+                        soc_bg(lambda: c.remove_friend(p["id"]), lambda r: soc_refresh())
+                small_button(row, "✕", drop, bg=CARD).pack(side="right")
+                if d.get("sel"):
+                    small_button(row, "В пати", lambda u=p["id"]: soc_bg(
+                        lambda: c.invite(d["sel"], u), lambda r: toast("Приглашение в пати отправлено.", "ok")),
+                        bg=CARD).pack(side="right")
+                small_button(row, "Написать", lambda p=p: soc_dm(p), bg=CARD).pack(side="right")
+
+    def soc_party(box):
+        c, d = soc(), soc_data()
+        top = tk.Frame(box, bg=CARD)
+        top.pack(fill="x")
+        tk.Label(top, text="Пати", font=(FONT, 13, "bold"), fg=TEXT, bg=CARD).pack(side="left")
+
+        def new_party():
+            n = simpledialog.askstring("Новая пати", "Название пати:", initialvalue="Играем вместе", parent=win)
+            if n:
+                soc_bg(lambda: c.create_party(n), lambda r: (d.update(sel=r["id"]), soc_refresh()))
+        small_button(top, "Новая пати", new_party, bg=CARD, icon="ic_add.png").pack(side="right")
+        for inv in d["invites"]:
+            row = tk.Frame(box, bg=PANEL, padx=8, pady=6)
+            row.pack(fill="x", pady=(8, 0))
+            tk.Label(row, text="Зовут в пати «%s»" % inv["name"], font=(FONT, 10, "bold"), fg=GOLD, bg=PANEL).pack(side="left")
+            small_button(row, "Отклонить", lambda i=inv: soc_bg(lambda: c.decline(i["id"]), lambda r: soc_refresh()),
+                         bg=PANEL).pack(side="right")
+            small_button(row, "Вступить", lambda i=inv: soc_bg(lambda: c.join(i["id"]),
+                                                               lambda r: (d.update(sel=i["id"]), soc_refresh())),
+                         bg=PANEL, icon="ic_check.png").pack(side="right")
+        if not d["parties"]:
+            tk.Label(box, text="Создай пати и позови друзей: в ней общий чат, а хозяин игры одной кнопкой "
+                               "присылает всем приглашение в свой мир.", font=(FONT, 10), fg=MUTED, bg=CARD,
+                     anchor="w", justify="left", wraplength=420).pack(fill="x", pady=(8, 0))
+            state["soc_chat"] = None
+            return
+        if len(d["parties"]) > 1:
+            pr = tk.Frame(box, bg=CARD)
+            pr.pack(fill="x", pady=(8, 0))
+            chip_row(pr, [(x["id"], x["name"][:16]) for x in d["parties"]], d["sel"],
+                     lambda v: (d.update(sel=v, msgs=[], last=0), soc_refresh()), CARD)
+        party = d.get("party") or {}
+        tk.Label(box, text="«%s»  ·  %s" % (party.get("name", ""), ", ".join(
+            ("● " if is_online(m) else "○ ") + m.get("nick", "?") for m in d["members"])), font=(FONT, 9), fg=MUTED,
+            bg=CARD, anchor="w", justify="left", wraplength=420).pack(fill="x", pady=(6, 4))
+        # приглашение в игру от хозяина
+        if party.get("game_code") and party.get("game_at"):
+            try:
+                age = time.time() - calendar.timegm(time.strptime(party["game_at"][:19], "%Y-%m-%dT%H:%M:%S"))
+            except ValueError:
+                age = 1e9
+            info = party.get("game_info") or {}
+            if age < 6 * 3600 and info.get("host") != c.uid:
+                g = tk.Frame(box, bg="#1d3524", padx=10, pady=8, highlightthickness=1, highlightbackground="#2f6b34")
+                g.pack(fill="x", pady=(4, 6))
+                tk.Label(g, text="%s зовёт в игру%s" % (soc_name(info.get("host")), (": " + info["pack"]) if info.get("pack") else ""),
+                         font=(FONT, 10, "bold"), fg=TEXT, bg="#1d3524", anchor="w", wraplength=260,
+                         justify="left").pack(side="left")
+
+                def join_game(code=party["game_code"]):
+                    if not check_game():
+                        return
+                    run_task("Подключаюсь к игре друга", lambda log: join_friend(code, None, log), finish)
+                big_button(g, "Присоединиться", join_game, icon="ic_play.png").pack(side="right")
+
+        def share():
+            kind = state.get("net") if state.get("net") in NET_KINDS else None
+
+            def work(log):
+                h = host_setup(kind)
+                c.share_game(d["sel"], h["code"], {"host": c.uid, "pack": h.get("pack"), "version": h.get("tl"),
+                                                     "address": h["address"]})
+                c.send(h["code"], pid=d["sel"])
+                log("Приглашение отправлено в пати: адрес %s, версия %s%s" % (
+                    h["address"], h.get("tl") or "?", (", сборка " + h["pack"]) if h.get("pack") else ""))
+                return True
+            run_task("Зову пати в мою игру", work, lambda ok, logs: (toast(logs[-1] if logs else "Готово", "ok", ms=7000),
+                                                                      soc_refresh()))
+        acts = tk.Frame(box, bg=CARD)
+        acts.pack(fill="x", pady=(2, 6))
+        big_button(acts, "Позвать пати в мою игру", share, icon="ic_invite.png").pack(side="left")
+
+        def leave():
+            own = party.get("owner") == c.uid
+            if messagebox.askyesno("Пати", "Распустить пати «%s»?" % party.get("name") if own else
+                                   "Выйти из пати «%s»?" % party.get("name")):
+                soc_bg(lambda: c.leave(party), lambda r: (d.update(sel=None, msgs=[], last=0), soc_refresh()))
+        small_button(acts, "Распустить" if party.get("owner") == c.uid else "Выйти", leave, bg=CARD).pack(side="right")
+        tk.Label(box, text="Мир сначала открой для сети (Esc → «Открыть для сети»), сеть - Hamachi или Radmin, как ниже.",
+                 font=(FONT, 8), fg=MUTED, bg=CARD, anchor="w", justify="left", wraplength=420).pack(fill="x")
+        # чат
+        t = tk.Text(box, bg=PANEL, fg="#c3c7d1", font=(FONT, 10), relief="flat", wrap="word", height=9,
+                    highlightthickness=0, padx=10, pady=8)
+        t.pack(fill="x", pady=(8, 6))
+        t.tag_configure("time", foreground="#6b7080", font=(FONT, 8))
+        t.tag_configure("me", foreground=ACCENT_HI, font=(FONT, 10, "bold"))
+        t.tag_configure("who", foreground="#7fb2ff", font=(FONT, 10, "bold"))
+        t.tag_configure("sys", foreground=GOLD)
+        t.configure(state="disabled")
+        state["soc_chat"] = t
+        soc_chat_append(d["msgs"])
+        if not d["msgs"]:
+            t.configure(state="normal")
+            t.insert("end", "Сообщений пока нет. Напиши первым!\n", "time")
+            t.configure(state="disabled")
+            t._empty = True
+        send_row = tk.Frame(box, bg=CARD)
+        send_row.pack(fill="x")
+        e = tk.Entry(send_row, font=(FONT, 10), bg=CARD_HI, fg=TEXT, insertbackground=TEXT, relief="flat",
+                     highlightthickness=1, highlightbackground=LINE, highlightcolor=ACCENT)
+        e.pack(side="left", fill="x", expand=True, ipady=4)
+        e.insert(0, state.pop("soc_draft", ""))
+        state["soc_entry"] = e
+
+        def send(ev=None):
+            text = e.get().strip()
+            if not text:
+                return
+            e.delete(0, "end")
+            soc_bg(lambda: c.send(text, pid=d["sel"]), lambda r: soc_poll_chat())
+        e.bind("<Return>", send)
+        small_button(send_row, "Отправить", send, bg=CARD).pack(side="right", padx=(6, 0))
+
+    def soc_dm(p):
+        """Личная переписка с другом в отдельном окне."""
+        c = soc()
+        t = tk.Toplevel(win)
+        t.title("Чат: %s" % p.get("nick"))
+        t.configure(bg=BG)
+        t.transient(win)
+        t.geometry("460x520+%d+%d" % (win.winfo_rootx() + 300, win.winfo_rooty() + 80))
+        tk.Label(t, text="  %s  (%s)" % (p.get("nick"), p.get("login")), font=(FONT, 13, "bold"), fg=TEXT, bg=BG,
+                 anchor="w").pack(fill="x", pady=(12, 6))
+        tx = tk.Text(t, bg=PANEL, fg="#c3c7d1", font=(FONT, 10), relief="flat", wrap="word", highlightthickness=0,
+                     padx=10, pady=8)
+        tx.pack(fill="both", expand=True, padx=12)
+        tx.tag_configure("time", foreground="#6b7080", font=(FONT, 8))
+        tx.tag_configure("me", foreground=ACCENT_HI, font=(FONT, 10, "bold"))
+        tx.tag_configure("who", foreground="#7fb2ff", font=(FONT, 10, "bold"))
+        tx.configure(state="disabled")
+        row = tk.Frame(t, bg=BG)
+        row.pack(fill="x", padx=12, pady=10)
+        e = tk.Entry(row, font=(FONT, 10), bg=CARD_HI, fg=TEXT, insertbackground=TEXT, relief="flat",
+                     highlightthickness=1, highlightbackground=LINE, highlightcolor=ACCENT)
+        e.pack(side="left", fill="x", expand=True, ipady=4)
+        st = {"last": 0}
+
+        def add(rows):
+            if not tx.winfo_exists() or not rows:
+                return
+            tx.configure(state="normal")
+            for m in rows:
+                mine = m["from_user"] == c.uid
+                tx.insert("end", m["created_at"][11:16] + "  ", "time")
+                tx.insert("end", ("Ты" if mine else p.get("nick", "друг")) + ": ", "me" if mine else "who")
+                tx.insert("end", m["body"] + "\n")
+            tx.configure(state="disabled")
+            tx.see("end")
+            st["last"] = rows[-1]["id"]
+
+        def poll():
+            if not t.winfo_exists():
+                return
+            soc_bg(lambda: c.messages(to=p["id"], after=st["last"]), add, err_toast=False)
+            t.after(3000, poll)
+
+        def send(ev=None):
+            text = e.get().strip()
+            if text:
+                e.delete(0, "end")
+                soc_bg(lambda: c.send(text, to=p["id"]), lambda r: soc_bg(lambda: c.messages(to=p["id"], after=st["last"]), add))
+        e.bind("<Return>", send)
+        small_button(row, "Отправить", send, bg=BG).pack(side="right", padx=(6, 0))
+        e.focus_set()
+        poll()
+        fade_in_window(t)
+
+    def soc_tick():
+        """Раз в минуту - «я в сети» (или «играет»), раз в 4 секунды - новые сообщения на вкладке «С другом»."""
+        c = soc()
+        if c.ready() and c.logged_in():
+            now = time.time()
+            if now - state.get("soc_beat", 0) > 55:
+                state["soc_beat"] = now
+                playing = game_running()
+                cur = current() or {}
+                detail = (cur.get("name") or "Minecraft").rsplit(" (", 1)[0] if playing else None
+                soc_bg(lambda: c.set_status("playing" if playing else "online", detail), err_toast=False)
+            if state.get("tab") == "friend":
+                e = state.get("soc_entry")
+                if e is not None and e.winfo_exists():
+                    state["soc_draft"] = e.get()
+                soc_poll_chat()
+                if now - state.get("soc_full", 0) > 15:
+                    state["soc_full"] = now
+                    soc_refresh(full=False)
+        win.after(4000, soc_tick)
+
     # --- вкладка «Скины» ---
     def skin_photo_producer(png, slim=None, scale=5):
         return lambda: render_skin(png, slim, scale)
@@ -7899,6 +8655,11 @@ def gui():
         s["zoomed"] = win.state() == "zoomed"
         s["tab"] = state["tab"]
         save_settings(s)
+        c = state.get("soc_client")
+        if c is not None and c.ready() and c.logged_in():  # друзья сразу видят «не в сети»
+            th = threading.Thread(target=lambda: c.set_status("offline"), daemon=True)
+            th.start()
+            th.join(2.5)
         win.destroy()
     win.protocol("WM_DELETE_WINDOW", on_close)
 
@@ -7960,6 +8721,7 @@ def gui():
         animate("win_in", 260, step, done=lambda: (splash.destroy(), win.after(250, after_start)))
 
     def after_start():
+        win.after(1500, soc_tick)
         if not library_found() or not load_local_manifest().get("items"):
             # Первый запуск (программа - один файл): каталог с GitHub, без лишних вопросов.
             with_remote(lambda r: open_update(r, None, lambda: show(state["tab"], animated=False),
