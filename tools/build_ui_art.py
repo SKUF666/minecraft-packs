@@ -154,3 +154,20 @@ im = im.resize((1400, int(im.height * 1400 / im.width)), Image.LANCZOS)
 im.crop((0, 250, 1400, 450)).save(os.path.join(OUT, 'versions_wide.png'))
 darken_left('versions_wide.png')
 print('вкладка «Версии»: картинки готовы')
+
+
+# --- профиль (2026-10-04): 12 аватаров из листа 4x3 и фон шапки профиля ---
+av = Image.open(os.path.join(RAW, '36_avatars.png')).convert('RGB')
+cw, ch = av.width // 4, av.height // 3
+os.makedirs(os.path.join(OUT, 'avatars'), exist_ok=True)
+for i in range(12):
+    cell = av.crop(((i % 4) * cw, (i // 4) * ch, (i % 4 + 1) * cw, (i // 4 + 1) * ch))
+    side = int(min(cell.size) * 0.86)  # квадрат по центру, без белых промежутков и скруглённых углов
+    l, t = (cell.width - side) // 2, (cell.height - side) // 2
+    cell.crop((l, t, l + side, t + side)).resize((128, 128), Image.LANCZOS).save(
+        os.path.join(OUT, 'avatars', 'av_%02d.png' % (i + 1)))
+hb = Image.open(os.path.join(RAW, '34_versions_hero.png')).convert('RGB')
+hb = hb.resize((900, int(hb.height * 900 / hb.width)), Image.LANCZOS).crop((120, 150, 900, 330))
+hb.save(os.path.join(OUT, 'profile_banner.png'))
+darken_left('profile_banner.png', upto=0.7, strength=0.6)
+print('профиль: аватары и шапка готовы')

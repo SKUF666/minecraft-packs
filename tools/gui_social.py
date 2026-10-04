@@ -51,9 +51,10 @@ def patched(self, *a):
     def entries():
         return [e for e in walk(self) if isinstance(e, tk.Entry) and e.winfo_ismapped()]
 
-    def click(text):
+    def click(text, exact=False):
         for x in walk(self):
-            if isinstance(x, tk.Label) and str(x.cget('text')).strip().startswith(text):
+            t_ = str(x.cget('text')).strip() if isinstance(x, tk.Label) else None
+            if t_ is not None and (t_ == text if exact else t_.startswith(text)):
                 x.event_generate('<Button-1>'); return True
         return False
     at(1500, lambda: hk['show']('friend'))
@@ -84,6 +85,25 @@ def patched(self, *a):
     at(18000, lambda: grab(self, 'soc_main'))
     at(300, lambda: hk['body'].yview_moveto(0.22))
     at(800, lambda: (grab(self, 'soc_chat'), print('чат:', [t.get('1.0', 'end').strip() for t in walk(self) if isinstance(t, tk.Text)])))
+
+    def profiles():
+        g = ps.Social()
+        g.update_profile(avatar='preset:1', mood='Ищу команду на вечер', about='Играю в OneBlock и RPG Pack.',
+                         favorites=['OneBlock', 'RPG Pack', 'Business Battle'])
+        as_other(lambda: (h.update_profile(avatar='preset:11', presence='dnd', mood='Строю замок',
+                                            favorites=['SkyBlock']), h.post_wall(h.uid, 'Мой замок почти готов!')))
+        as_other(lambda: h.post_wall(g.uid, 'Привет! Сыграем сегодня?'))
+        print('обновить2:', click('Обновить'))
+    at(500, profiles)
+    at(5000, lambda: (grab(self, 'prof_head'), print('профиль:', click(self_name()))))
+    at(4000, lambda: grab([w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1], 'prof_mine'))
+    at(300, lambda: [w.destroy() for w in self.winfo_children() if isinstance(w, tk.Toplevel)])
+    at(500, lambda: print('друг:', click('Друг Б', True)))
+    at(4000, lambda: grab([w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1], 'prof_friend'))
+    at(300, lambda: [w.destroy() for w in self.winfo_children() if isinstance(w, tk.Toplevel)])
+
+    def self_name():
+        return 'Тестер Г'
 
     def cleanup():
         g = ps.Social()

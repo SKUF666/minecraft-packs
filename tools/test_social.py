@@ -104,6 +104,43 @@ try:
     check(use(a).me()['nick'] == 'Тестер А', 'чужой профиль не меняется')
 except ps.SocialError:
     check(True, 'чужой профиль не меняется')
+# профиль: аватар, статус, настроение, любимые игры, о себе
+use(a).update_profile(avatar='preset:3', presence='dnd', mood='Строю базу', about='Люблю скайблок',
+                      favorites=['OneBlock', 'SkyBlock'])
+pa = use(b).profile(a.uid)
+check(pa['avatar'] == 'preset:3' and pa['mood'] == 'Строю базу' and pa['favorites'] == ['OneBlock', 'SkyBlock']
+      and pa['about'] == 'Люблю скайблок', 'Б видит профиль А: аватар, настроение, любимые игры, о себе')
+use(a).set_status('online')
+check(ps.status_text(use(b).profile(a.uid)) == 'не беспокоить', 'статус «не беспокоить» виден другу')
+use(a).update_profile(presence='invisible')
+use(a).set_status('playing', 'RPG Pack')
+pa = use(b).profile(a.uid)
+check(pa['status'] == 'offline' and pa['last_seen'] is None and pa['status_detail'] is None and not ps.is_online(pa),
+      'невидимку друг видит «не в сети», без подробностей')
+check(use(a).me()['presence'] == 'invisible', 'сам себя невидимка видит невидимкой')
+try:
+    use(b).rest('GET', 'profiles', {'id': 'eq.' + a.uid, 'select': 'status,last_seen'})
+    check(False, 'статус в обход представления не должен читаться')
+except ps.SocialError:
+    check(True, 'настоящий статус невидимки в обход не прочитать')
+use(a).update_profile(presence='auto')
+av = ps.avatar_from_file(os.path.join(LIB, 'Оформление', 'avatars', 'av_05.png'))
+use(a).update_profile(avatar=av)
+check(use(b).profile(a.uid)['avatar'] == av and len(av) < 40000, 'своя картинка аватара сохраняется (%d символов)' % len(av))
+# стена
+use(a).post_wall(a.uid, 'Моя первая запись')
+use(b).post_wall(a.uid, 'Привет со стены!')
+wl = use(b).wall(a.uid)
+check([w['body'] for w in wl] == ['Привет со стены!', 'Моя первая запись'] and wl[0]['author_profile']['nick'] == 'Тестер Б',
+      'стена: записи хозяина и друга, новые сверху, с автором')
+check(use(x).wall(a.uid) == [], 'посторонний не видит стену')
+try:
+    use(x).post_wall(a.uid, 'спам')
+    check(False, 'посторонний не должен писать на стену')
+except ps.SocialError:
+    check(True, 'посторонний не может писать на стену')
+use(a).delete_post(wl[0]['id'])
+check([w['body'] for w in use(a).wall(a.uid)] == ['Моя первая запись'], 'хозяин удалил чужую запись со своей стены')
 use(b).leave(party)
 check(not use(b).parties()[0], 'Б вышел из пати')
 use(a).leave(party)
