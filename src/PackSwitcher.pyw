@@ -752,6 +752,21 @@ class Social:
         login = self.check_login(login)
         return self._auth("token?grant_type=password", {"email": "%s@%s" % (login, SOCIAL_MAIL), "password": password})
 
+    def change_password(self, new):
+        if len(new or "") < 6:
+            raise SocialError(0, "Пароль - минимум 6 символов")
+        _http_json("PUT", self.cfg["url"] + "/auth/v1/user",
+                   {"apikey": self.cfg["key"], "Authorization": "Bearer " + self._token()}, {"password": new})
+
+    def inbox(self, after=None):
+        """Личные сообщения мне новее after (для уведомлений); after=None - только самое последнее (отметка)."""
+        q = {"to_user": "eq." + self.uid, "select": "id,from_user,body,created_at", "order": "id.asc", "limit": "50"}
+        if after is None:
+            q.update(order="id.desc", limit="1")
+        else:
+            q["id"] = "gt.%d" % after
+        return self.rest("GET", "messages", q) or []
+
     def sign_out(self):
         try:
             if self.session.get("access_token"):
@@ -1766,45 +1781,99 @@ def add_server_entry(name, ip):
 
 
 def host_setup(kind=None):
-    """Собирает то, что нужно другу: адрес в выбранной сети, порт, версию и сборку."""
+    """Собирает то, что нужно другу: адреса во всех сетях этого компьютера (Hamachi, Radmin VPN, ZeroTier,
+    домашняя сеть), порт открытого мира, версию и сборку. Первой идёт выбранная сеть."""
+    vpn = vpn_addresses()
     if kind is None:
-        vpn = vpn_addresses()
         kind = "Hamachi" if "Hamachi" in vpn else (next(iter(vpn)) if vpn else LAN_KIND)
-    ip = net_address(kind)
-    if not ip:
-        if kind == LAN_KIND:
-            raise RuntimeError("Не нашёл подключение к роутеру. Проверь Wi-Fi или кабель.")
-        raise RuntimeError("%s не включён. Открой его, нажми кнопку включения и зайди в сеть." % kind)
     port = lan_port()
     if not port:
         raise RuntimeError("Мир ещё не открыт для сети. В игре: Esc -> «Открыть для сети» -> «Начать».")
     try:
-        info = ping_server(ip, port)
+        info = ping_server("127.0.0.1", port, 5)  # мир отвечает на самом компьютере
     except Exception as e:
-        raise RuntimeError("Нашёл порт %d, но игра на нём не отвечает (%s). Мир точно открыт для сети? "
-                           "Проверь брандмауэр кнопкой «Проверить настройки»." % (port, e))
-    tl = get_tlauncher_version()
+        raise RuntimeError("Нашёл порт %d, но мир на нём не отвечает (%s). Мир точно открыт для сети?" % (port, e))
+    lan = lan_ip()
+    cands = []
+    for k in [kind] + [x for x in NET_KINDS if x != kind]:
+        ip = lan if k == LAN_KIND else vpn.get(k)
+        if ip:
+            cands.append([k, "%s:%d" % (ip, port)])
+    if not cands:
+        raise RuntimeError("Нет ни одной сети для игры с другом: включи Hamachi, Radmin VPN или ZeroTier "
+                           "(или подключись к Wi-Fi, если друг в той же сети).")
     cur = current() or {}
+    tl = (get_tlauncher_version() if chosen_launcher() == "tlauncher" else None) or cur.get("tl_version")
     pack = cur.get("name") if cur.get("tl_version") == tl else None
     code = "MC1-" + base64.urlsafe_b64encode(json.dumps(
-        {"a": "%s:%d" % (ip, port), "t": tl, "p": pack}, ensure_ascii=False).encode()).decode().rstrip("=")
-    return {"vpn": kind, "address": "%s:%d" % (ip, port), "code": code, "tl": tl, "pack": pack, "info": info}
+        {"a": cands[0][1], "aa": cands, "t": tl, "p": pack}, ensure_ascii=False).encode()).decode().rstrip("=")
+    return {"vpn": cands[0][0], "address": cands[0][1], "addresses": cands, "code": code, "tl": tl, "pack": pack,
+            "info": info}
 
 
-def parse_invite(text):
+def parse_invite_full(text):
+    """Код приглашения -> ([[сеть, адрес], ...], версия, сборка). Понимает и старые коды с одним адресом."""
     text = text.strip()
     if text.startswith("MC1-"):
         raw = text[4:]
         raw += "=" * (-len(raw) % 4)
         try:
             j = json.loads(base64.urlsafe_b64decode(raw).decode())
-            return j["a"], j.get("t"), j.get("p")
+            cands = [list(x) for x in j.get("aa") or [] if isinstance(x, (list, tuple)) and len(x) == 2]
+            return cands or [["?", j["a"]]], j.get("t"), j.get("p")
         except Exception:
             raise ValueError("Код приглашения повреждён. Попроси друга скопировать его ещё раз целиком.")
     m = re.match(r"^\s*([0-9.]+|[\w.-]+):(\d{2,5})\s*$", text)
     if m:
-        return "%s:%s" % (m.group(1), m.group(2)), None, None
+        return [["?", "%s:%s" % (m.group(1), m.group(2))]], None, None
     raise ValueError("Не понял код. Вставь код приглашения от друга (начинается с MC1-) или адрес вида 25.1.2.3:51234.")
+
+
+def parse_invite(text):
+    cands, tl, pack = parse_invite_full(text)
+    return cands[0][1], tl, pack
+
+
+def pick_address(cands, log=print, timeout=4):
+    """Проверяет все адреса друга сразу и выбирает тот, что отвечает. Если не отвечает ни один - объясняет почему.
+    Возвращает (адрес, отвечает ли)."""
+    mine = vpn_addresses()
+    lan = lan_ip()
+
+    def probe(c):
+        host, _, port = c[1].rpartition(":")
+        t0 = time.time()
+        try:
+            info = ping_server(host, int(port), timeout)
+            return c, info, int((time.time() - t0) * 1000)
+        except Exception as e:
+            return c, e, None
+    with concurrent.futures.ThreadPoolExecutor(max(1, len(cands))) as ex:
+        res = list(ex.map(probe, cands))
+    for c, info, ms in res:
+        label = c[0] if c[0] != "?" else "адрес"
+        log("%s %s: %s" % (label, c[1], ("отвечает, %d мс" % ms) if ms is not None else "не отвечает"))
+    ok = [r for r in res if r[2] is not None]
+    if ok:
+        best = min(ok, key=lambda r: r[2])
+        info = best[1]
+        log("Подключаю через %s: версия %s, игроков %s из %s" % (best[0][0], info["version"], info["online"], info["max"]))
+        return best[0][1], True
+    # никто не ответил: подсказки по сетям
+    have = set(mine) | ({LAN_KIND} if lan else set())
+    host_nets = [c[0] for c in cands if c[0] != "?"]
+    common = [c for c in cands if c[0] in have]
+    for k in host_nets:
+        if k == LAN_KIND:
+            ip = next(c[1] for c in cands if c[0] == k).split(":")[0]
+            if lan and ip.rsplit(".", 1)[0] != lan.rsplit(".", 1)[0]:
+                log("Подсказка: друг в другой Wi-Fi сети (%s), а ты в %s - через Wi-Fi не выйдет." % (ip, lan))
+        elif k not in mine:
+            log("Подсказка: друг играет через %s, а у тебя %s не включён. Включи его и зайди в ту же сеть." % (k, k))
+    if common:
+        log("Подсказка: вы оба в сети %s, но игра не отвечает: мир у друга открыт для сети? Брандмауэр не "
+            "блокирует Java? (кнопка «Проверить настройки»)" % common[0][0])
+    return (common[0] if common else cands[0])[1], False
 
 
 def _read_servers_dat():
@@ -1843,7 +1912,7 @@ def set_friend_server(address, name=FRIEND_SERVER):
 
 
 def join_friend(text, packs=None, log=print):
-    address, tl, pack_name = parse_invite(text)
+    cands, tl, pack_name = parse_invite_full(text)
     packs = packs if packs is not None else find_packs()
     ok = True
     if pack_name:
@@ -1861,17 +1930,11 @@ def join_friend(text, packs=None, log=print):
         ok, hint = select_version(tl, "игра друга", log)
         if hint:
             log("Подсказка: " + hint)
+    address, alive = pick_address(cands, log)
     set_friend_server(address)
-    log("В «Сетевой игре» первой строкой добавлено: %s" % FRIEND_SERVER)
-    host, _, port = address.rpartition(":")
-    vpn = vpn_addresses()
-    if not vpn:
-        log("Внимание: не нашёл подключённую VPN-сеть (Hamachi, Radmin VPN или ZeroTier). Включи её и войди в сеть друга.")
-    try:
-        info = ping_server(host, int(port))
-        log("Игра друга отвечает: версия %s, игроков %s из %s" % (info["version"], info["online"], info["max"]))
-    except Exception as e:
-        log("Игра друга пока не отвечает (%s). Проверь, что вы в одной сети и мир открыт для сети." % e)
+    log("В «Сетевой игре» первой строкой добавлено: %s (%s)" % (FRIEND_SERVER, address))
+    if not alive:
+        log("Подсказка: игра друга пока не отвечает. Как только всё будет готово, она появится в «Сетевой игре» сама.")
     return ok
 
 
@@ -4776,7 +4839,7 @@ def gui():
     tab_button("skins", "Скины", "tab_skins.png")
     tab_button("versions", "Версии", "tab_versions.png")
     tab_button("servers", "Серверы", "tab_servers.png")
-    tab_button("friend", "С другом", "tab_friend.png")
+    tab_button("friend", "Друзья", "tab_friend.png")
     tab_button("launchers", "Лаунчеры", "tab_launchers.png")
     tk.Frame(win, height=1, bg=LINE).pack(fill="x", padx=24)
 
@@ -5916,6 +5979,22 @@ def gui():
         start = len(wm["items"])
 
         def work():
+            if wm.get("mine"):  # скачанные: из своего списка, описание и обложка - со страниц (кэш)
+                reg = sorted(web_maps_installed().items(), key=lambda kv: -kv[1].get("time", 0))
+                items = []
+                for url, rec in reg:
+                    try:
+                        inf = mi_page(url)
+                    except Exception:
+                        inf = {"title": rec["title"], "versions": [rec.get("version")] if rec.get("version") else [],
+                               "main": None, "sections": {}}
+                    items.append({"url": url, "title": inf["title"] or rec["title"], "versions": inf.get("versions") or [],
+                                  "cover": inf.get("main"), "desc": (inf.get("sections") or {}).get("Описание", "")[:300],
+                                  "author": "", "views": 0, "date": "", "ru": False})
+                if qid == wm["qid"]:
+                    wm.update(items=items, page=1, next=False, loading=False)
+                win.after(0, lambda: qid == wm["qid"] and state["tab"] == "maps" and show("maps", animated=False))
+                return
             try:
                 items, nxt = mi_list(page, wm["cat"], None if wm["cat"] else wm["ver"], wm["sort"], wm["q"] or None)
                 if wm["ver"] and (wm["cat"] or wm["q"]):  # раздел и версию сайт вместе не фильтрует
@@ -5987,7 +6066,12 @@ def gui():
         r = tk.Frame(fl, bg=BG)
         r.pack(fill="x", pady=(8, 0))
         tk.Label(r, text="Сначала:", font=(FONT, 10, "bold"), fg=TEXT, bg=BG).pack(side="left", padx=(0, 8))
-        chip_row(r, MI_SORTS, wm["sort"], lambda v: wm_set(sort=v), BG)
+        chip_row(r, MI_SORTS, None if wm.get("mine") else wm["sort"], lambda v: wm_set(sort=v, mine=False), BG)
+        n_mine = len(web_maps_installed())
+        if n_mine:
+            tk.Label(r, text="  ", bg=BG).pack(side="left")
+            chip_row(r, [(True, "Скачанные (%d)" % n_mine)], bool(wm.get("mine")),
+                     lambda v: wm_set(mine=not wm.get("mine")), BG)
         if wm["q"]:
             tk.Label(r, text="   поиск: «%s»" % wm["q"], font=(FONT, 9), fg=MUTED, bg=BG).pack(side="left")
         state["wm_more"] = None
@@ -6360,7 +6444,7 @@ def gui():
                  font=(FONT, 10), fg=MUTED, bg=BG, wraplength=900, justify="left", anchor="w"
                  ).grid(row=2, column=0, columnspan=2, sticky="we", pady=(12, 0))
 
-    # --- вкладка «С другом» ---
+    # --- вкладка «Друзья» ---
     def net_info():
         """Адреса Hamachi/Radmin и роутера. PowerShell отвечает до 20 с, поэтому в фоне и с кэшем на минуту."""
         c = state.get("net_cache")
@@ -6500,6 +6584,11 @@ def gui():
             ar.pack(fill="x")
             tk.Label(ar, text=h["address"], font=("Consolas", 15, "bold"), fg=ACCENT_HI, bg=PANEL).pack(side="left")
             small_button(ar, "Копировать", lambda: copy(h["address"], "Адрес"), bg=PANEL, icon="ic_copy.png").pack(side="right")
+            others = [a for a in h.get("addresses", [])[1:]]
+            if others:
+                tk.Label(box, text="В коде есть и запасные адреса: " + ", ".join("%s %s" % (k, a) for k, a in others)
+                         + ". У друга Portalis сам выберет тот, что отвечает.", font=(FONT, 9), fg=MUTED, bg=PANEL,
+                         wraplength=400, justify="left").pack(anchor="w", pady=(4, 0))
             tk.Label(box, text="Код приглашения: друг вставит его, и программа сама всё настроит",
                      font=(FONT, 9), fg=MUTED, bg=PANEL).pack(anchor="w", pady=(8, 2))
             cr = tk.Frame(box, bg=PANEL)
@@ -6533,15 +6622,8 @@ def gui():
                 _addr, _tl, pack_name = parse_invite(text)
             except Exception as e:
                 messagebox.showwarning("Код", str(e)); return
-            if not check_game():
-                return
-            state["join_text"] = text
-            pk = next((p for p in find_packs() if p["name"] == pack_name), None) if pack_name else None
-            ids = missing_items(pack=pk) if pk else []
-            if ids:  # у друга сборка, которую ещё не скачивали: сначала скачать
-                ensure_items(ids, lambda: do_join(text), "Скачать «%s»" % pack_name.rsplit(" (", 1)[0])
-                return
-            do_join(text)
+            _ = pack_name
+            start_join(text, lambda ok, logs: show("friend", animated=False))
 
         def do_join(text):
             def after(ok, logs):
@@ -6554,7 +6636,8 @@ def gui():
             run_task("Подключаюсь к другу", lambda log: join_friend(text, None, log), after)
         big_button(row2, "Подключиться", join, icon="ic_invite.png").pack(side="left")
         for line in state.get("join_logs", []):
-            color = ACCENT_HI if "отвечает:" in line else ("#e0a45a" if "не отвечает" in line or "Внимание" in line else "#c3c7d1")
+            color = ("#e0a45a" if "не отвечает" in line or "Подсказка" in line or "Внимание" in line else
+                     ACCENT_HI if "отвечает" in line or line.startswith("Подключаю") else "#c3c7d1")
             tk.Label(guest, text=line, font=(FONT, 9), fg=color, bg=CARD, wraplength=410,
                      justify="left", anchor="w").pack(fill="x", pady=(4, 0))
 
@@ -7586,6 +7669,9 @@ def gui():
                 soc_refresh(full=False)
             return
         acct_name.configure(text=me.get("nick", "?"))
+        if state.get("soc_offline"):
+            acct_status.configure(text="● нет связи с сервером", fg="#e05a5a")
+            return
         pres = me.get("presence") or "auto"
         acct_status.configure(text="● " + {"dnd": "не беспокоить", "invisible": "невидимка"}.get(pres, "в сети")
                               + ("  ·  " + me["mood"][:22] if me.get("mood") else ""),
@@ -7669,12 +7755,13 @@ def gui():
                 dpara(body, p["about"])
             if p.get("favorites"):
                 dsection(body, "Любимые игры")
+                body.winfo_children()[-1].configure(image=art("ic_heart.png", 18, 18), compound="left", text=" Любимые игры")
                 fav = tk.Frame(body, bg=BG)
                 fav.pack(fill="x")
                 for g in p["favorites"][:12]:
                     badge(fav, g, CARD_HI).pack(side="left", padx=(0, 6), pady=2)
             row = dbuttons(body)
-            small_button(row, "Написать", lambda: soc_dm(p), bg=BG).pack(side="left")
+            small_button(row, "Написать", lambda: soc_dm(p), bg=BG, icon="ic_mail.png").pack(side="left")
         wall_view(t, body, p)
         auto_wrap(body)
 
@@ -7800,6 +7887,17 @@ def gui():
                                                         refresh_account(), soc_render()))
         small_button(row, "Выйти из аккаунта", logout, bg=BG).pack(side="left")
 
+        def change_pw():
+            a = simpledialog.askstring("Новый пароль", "Новый пароль (минимум 6 символов):", show="•", parent=t)
+            if not a:
+                return
+            b = simpledialog.askstring("Новый пароль", "Повтори новый пароль:", show="•", parent=t)
+            if a != b:
+                messagebox.showwarning("Пароль", "Пароли не совпали.", parent=t)
+                return
+            soc_bg(lambda: c.change_password(a), lambda r: toast("Пароль изменён.", "ok"))
+        small_button(row, "Сменить пароль", change_pw, bg=BG, icon="ic_lock.png").pack(side="left", padx=6)
+
     def wall_view(t, body, p):
         """Стена: записи хозяина и друзей, новые сверху."""
         c = soc()
@@ -7881,6 +7979,10 @@ def gui():
             if th.is_alive():
                 win.after(120, poll)
                 return
+            offline = isinstance(box.get("e"), SocialError) and box["e"].code == 0
+            if offline != bool(state.get("soc_offline")):
+                state["soc_offline"] = offline
+                refresh_account()
             if "e" in box:
                 if err_toast:
                     toast(str(box["e"]), "warn", ms=6000)
@@ -7921,7 +8023,12 @@ def gui():
                           for k in r)
             if r["sel"] != d.get("sel"):
                 d.update(msgs=[], last=0)
+            old = {k: d.get(k) for k in ("loaded", "friends", "invites", "parties")}
             d.update(r, loaded=True, err=None)
+            try:
+                soc_notify(old, r)
+            except Exception:
+                pass
             refresh_account()
             if changed or full:
                 soc_render()
@@ -7952,9 +8059,16 @@ def gui():
             rows = [m for m in rows or [] if m["id"] > d["last"]]  # уже показанные не повторяем
             if d.get("sel") != pid or not rows:
                 return
+            first = not d["last"]
             d["msgs"] = (d["msgs"] + rows)[-200:]
             d["last"] = rows[-1]["id"]
             soc_chat_append(rows)
+            theirs = [m for m in rows if m["from_user"] != c.uid and not m["body"].startswith("MC1-")]
+            if theirs and not first and state.get("tab") != "friend":
+                m = theirs[-1]
+                toast("%s в пати: %s" % (soc_name(m["from_user"]), m["body"][:60]), "info",
+                      ("Открыть", lambda: show("friend")), 8000)
+                set_friend_badge(state.get("badge", 0) + len(theirs))
         soc_bg(fetch, done, err_toast=False)
 
     def soc_name(uid):
@@ -7986,7 +8100,7 @@ def gui():
         t.see("end")
 
     def social_panel(row):
-        """Сверху вкладки «С другом»: вход или аккаунт с друзьями, пати и чатом."""
+        """Сверху вкладки «Друзья»: вход или аккаунт с друзьями, пати и чатом."""
         if not soc().ready():
             return
         fr = tk.Frame(inner, bg=BG)
@@ -8140,7 +8254,7 @@ def gui():
                     small_button(row, "В пати", lambda u=p["id"]: soc_bg(
                         lambda: c.invite(d["sel"], u), lambda r: toast("Приглашение в пати отправлено.", "ok")),
                         bg=CARD).pack(side="right")
-                small_button(row, "Написать", lambda p=p: soc_dm(p), bg=CARD).pack(side="right")
+                small_button(row, "Написать", lambda p=p: soc_dm(p), bg=CARD, icon="ic_mail.png").pack(side="right")
 
     def soc_party(box):
         c, d = soc(), soc_data()
@@ -8174,9 +8288,24 @@ def gui():
             chip_row(pr, [(x["id"], x["name"][:16]) for x in d["parties"]], d["sel"],
                      lambda v: (d.update(sel=v, msgs=[], last=0), soc_refresh()), CARD)
         party = d.get("party") or {}
-        tk.Label(box, text="«%s»  ·  %s" % (party.get("name", ""), ", ".join(
-            ("● " if is_online(m) else "○ ") + m.get("nick", "?") for m in d["members"])), font=(FONT, 9), fg=MUTED,
-            bg=CARD, anchor="w", justify="left", wraplength=420).pack(fill="x", pady=(6, 4))
+        tk.Label(box, text="«%s»" % party.get("name", ""), font=(FONT, 10, "bold"), fg=TEXT, bg=CARD,
+                 anchor="w").pack(fill="x", pady=(6, 2))
+        mem = tk.Frame(box, bg=CARD)
+        mem.pack(fill="x", pady=(0, 4))
+        for m in d["members"][:8]:
+            one = tk.Frame(mem, bg=CARD, cursor="hand2")
+            one.pack(side="left", padx=(0, 10))
+            av = tk.Label(one, bg=CARD, cursor="hand2")
+            av.pack(side="left")
+            want_pic("pm:%s:%s:%d" % (m.get("avatar"), status_color(m), len(m.get("avatar") or "")),
+                     lambda m=m: avatar_pil(m.get("avatar"), 22, m.get("login", ""), status_color(m)), av)
+            if m.get("id") == party.get("owner"):
+                tk.Label(one, image=art("ic_crown.png", 18, 18), bg=CARD).pack(side="left", padx=(3, 0))
+            nm = tk.Label(one, text=m.get("nick", "?"), font=(FONT, 9), fg=TEXT if is_online(m) else MUTED, bg=CARD,
+                          cursor="hand2")
+            nm.pack(side="left", padx=(3, 0))
+            for w_ in (one, av, nm):
+                w_.bind("<Button-1>", lambda e, m=m: open_profile(m))
         # приглашение в игру от хозяина
         if party.get("game_code") and party.get("game_at"):
             try:
@@ -8192,10 +8321,19 @@ def gui():
                          justify="left").pack(side="left")
 
                 def join_game(code=party["game_code"]):
-                    if not check_game():
-                        return
-                    run_task("Подключаюсь к игре друга", lambda log: join_friend(code, None, log), finish)
+                    start_join(code)
+
+                def probe(code=party["game_code"]):
+                    def work(log):
+                        cands, _t, _p = parse_invite_full(code)
+                        return pick_address(cands, log)[1]
+
+                    def after(alive, logs):
+                        messagebox.showinfo("Связь с игрой друга", "\n".join(logs) + (
+                            "\n\nВсё в порядке - жми «Присоединиться»." if alive else ""))
+                    run_task("Проверяю связь с игрой друга", work, after)
                 big_button(g, "Присоединиться", join_game, icon="ic_play.png").pack(side="right")
+                small_button(g, "Проверить связь", probe, bg="#1d3524", icon="ic_signal.png").pack(side="right", padx=6)
 
         def share():
             kind = state.get("net") if state.get("net") in NET_KINDS else None
@@ -8259,6 +8397,8 @@ def gui():
         """Личная переписка с другом в отдельном окне."""
         c = soc()
         t = tk.Toplevel(win)
+        state.setdefault("dm_open", set()).add(p["id"])
+        t.bind("<Destroy>", lambda e: e.widget is t and state.get("dm_open", set()).discard(p["id"]))
         t.title("Чат: %s" % p.get("nick"))
         t.configure(bg=BG)
         t.transient(win)
@@ -8309,8 +8449,102 @@ def gui():
         poll()
         fade_in_window(t)
 
+    def start_join(text, after_ok=None):
+        """Подключиться по коду приглашения: сборка друга скачивается сама, если её ещё нет."""
+        try:
+            _c, _tl, pack_name = parse_invite_full(text)
+        except Exception as e:
+            messagebox.showwarning("Код", str(e))
+            return
+        if not check_game():
+            return
+        state["join_text"] = text
+
+        def go():
+            def after(ok, logs):
+                state["join_logs"] = logs
+                if after_ok:
+                    after_ok(ok, logs)
+                alive = any(l.startswith("Подключаю через") for l in logs)
+                if alive and auto_var.get() and not tlauncher_running():
+                    launch_now()
+                else:
+                    toast("Игра друга добавлена в «Сетевую игру»." if alive else
+                          "Игра друга пока не отвечает - подсказки на вкладке «Друзья».", "ok" if alive else "warn",
+                          ("Запустить", launch_now), 9000)
+            run_task("Подключаюсь к игре друга", lambda log: join_friend(text, None, log), after)
+        pk = next((p for p in find_packs() if p["name"] == pack_name), None) if pack_name else None
+        ids = missing_items(pack=pk) if pk else []
+        if ids:
+            ensure_items(ids, go, "Скачать «%s»" % pack_name.rsplit(" (", 1)[0])
+        else:
+            go()
+
+    def set_friend_badge(n):
+        state["badge"] = n
+        b = tab_btns.get("friend")
+        if b is not None:
+            b.configure(text=" Друзья" + ("  ●%d" % n if n else ""))
+            if n and state.get("tab") != "friend":
+                b.configure(fg=GOLD)
+
+    def soc_notify(old, new):
+        """Что нового с прошлой проверки: заявки, приглашения в пати, приглашения в игру."""
+        if not old.get("loaded"):
+            inc = [f for f in new["friends"] if f["state"] == "incoming"]
+            if inc or new["invites"]:
+                toast("Тебя ждут: заявок в друзья - %d, приглашений в пати - %d" % (len(inc), len(new["invites"])), "info",
+                      ("Открыть", lambda: show("friend")), 8000)
+                set_friend_badge(state.get("badge", 0) + len(inc) + len(new["invites"]))
+            return
+        was = {f["profile"]["id"] for f in old.get("friends", []) if f["state"] == "incoming"}
+        for f in new["friends"]:
+            if f["state"] == "incoming" and f["profile"]["id"] not in was:
+                toast("%s хочет дружить" % f["profile"].get("nick"), "info", ("Открыть", lambda: show("friend")), 8000)
+                set_friend_badge(state.get("badge", 0) + 1)
+        was_inv = {i["id"] for i in old.get("invites", [])}
+        for i in new["invites"]:
+            if i["id"] not in was_inv:
+                toast("Тебя зовут в пати «%s»" % i["name"], "info", ("Открыть", lambda: show("friend")), 8000)
+                set_friend_badge(state.get("badge", 0) + 1)
+        op = {x["id"]: x for x in old.get("parties", [])}
+        for pt in new["parties"]:
+            info = pt.get("game_info") or {}
+            if pt.get("game_at") and pt.get("game_at") != (op.get(pt["id"]) or {}).get("game_at") and info.get("host") != soc().uid:
+                code = pt.get("game_code")
+                toast("%s зовёт в игру%s" % (soc_name(info.get("host")), (": " + info["pack"]) if info.get("pack") else ""),
+                      "ok", ("Присоединиться", lambda code=code: start_join(code)), 15000)
+
+    def soc_inbox():
+        """Личные сообщения: уведомление, если окно переписки с этим другом не открыто."""
+        c = soc()
+        st0 = load_settings()
+        inited = st0.get("soc_dm_init") == c.uid
+        last = st0.get("soc_last_dm", 0) if inited else None
+
+        def done(rows):
+            st_ = load_settings()
+            if not inited:  # первая проверка на этом компьютере: только запомнить, где остановились
+                st_["soc_dm_init"] = c.uid
+                st_["soc_last_dm"] = rows[-1]["id"] if rows else 0
+                save_settings(st_)
+                return
+            if not rows:
+                return
+            st_["soc_last_dm"] = rows[-1]["id"]
+            save_settings(st_)
+            open_dm = state.get("dm_open", set())
+            for m in rows:
+                if m["from_user"] in open_dm:
+                    continue
+                f = next((x["profile"] for x in soc_data().get("friends", []) if x["profile"]["id"] == m["from_user"]),
+                         {"id": m["from_user"], "nick": "друг", "login": ""})
+                toast("%s: %s" % (f.get("nick"), m["body"][:60]), "info", ("Ответить", lambda f=f: soc_dm(f)), 9000)
+                set_friend_badge(state.get("badge", 0) + 1)
+        soc_bg(lambda: c.inbox(last), done, err_toast=False)
+
     def soc_tick():
-        """Раз в минуту - «я в сети» (или «играет»), раз в 4 секунды - новые сообщения на вкладке «С другом»."""
+        """Раз в минуту - «я в сети» (или «играет»), раз в 4 секунды - новые сообщения и уведомления."""
         c = soc()
         if c.ready() and c.logged_in():
             now = time.time()
@@ -8324,10 +8558,13 @@ def gui():
                 e = state.get("soc_entry")
                 if e is not None and e.winfo_exists():
                     state["soc_draft"] = e.get()
-                soc_poll_chat()
-                if now - state.get("soc_full", 0) > 15:
-                    state["soc_full"] = now
-                    soc_refresh(full=False)
+                if state.get("badge"):
+                    set_friend_badge(0)
+            soc_poll_chat()
+            if now - state.get("soc_full", 0) > 15:
+                state["soc_full"] = now
+                soc_refresh(full=False)
+                soc_inbox()
         win.after(4000, soc_tick)
 
     # --- вкладка «Скины» ---

@@ -171,3 +171,19 @@ hb = hb.resize((900, int(hb.height * 900 / hb.width)), Image.LANCZOS).crop((120,
 hb.save(os.path.join(OUT, 'profile_banner.png'))
 darken_left('profile_banner.png', upto=0.7, strength=0.6)
 print('профиль: аватары и шапка готовы')
+
+
+# --- значки аккаунта (2026-10-04): колокольчик, письмо, корона, связь, замок, сердце ---
+sh = Image.open(os.path.join(RAW, '37_social_icons.png')).convert('RGBA')
+cw, ch = sh.width // 3, sh.height // 2
+for i, n in enumerate(['ic_bell', 'ic_mail', 'ic_crown', 'ic_signal', 'ic_lock', 'ic_heart']):
+    cell = sh.crop(((i % 3) * cw, (i // 3) * ch, (i % 3 + 1) * cw, (i // 3 + 1) * ch))
+    a = cell.getchannel('A').point(lambda v: 255 if v > 150 else 0)  # без размытого свечения вокруг
+    cell = cell.crop(a.getbbox())
+    cell.putalpha(Image.eval(cell.getchannel('A'), lambda v: 0 if v < 120 else min(255, v * 2)))
+    side = max(cell.size)
+    sq = Image.new('RGBA', (side, side), (0, 0, 0, 0))
+    sq.paste(cell, ((side - cell.width) // 2, (side - cell.height) // 2), cell)
+    sq.resize((18, 18), Image.LANCZOS).save(os.path.join(OUT, n + '.png'))
+    sq.resize((48, 48), Image.LANCZOS).save(os.path.join(OUT, n + '_48.png'))
+print('значки аккаунта готовы')
