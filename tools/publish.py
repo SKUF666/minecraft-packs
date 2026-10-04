@@ -1,4 +1,4 @@
-"""Выпуск новой версии библиотеки «Minecraft Packs» в релиз GitHub (тег library).
+"""Выпуск новой версии Куботеки (библиотека «Minecraft Packs» на рабочем столе) в релиз GitHub (тег library).
 
     python tools/publish.py [--dry] [--note "текст для «Что нового»"] [--lib "путь к библиотеке"]
 
@@ -33,7 +33,8 @@ TOOLS = os.path.join(REPO_DIR, 'tools')
 ARCH = os.path.join(REPO_DIR, 'archives')
 REPO = 'SKUF666/minecraft-packs'
 TAG = 'library'
-STARTER = 'Minecraft-Packs.zip'
+STARTER = 'Kuboteka.zip'
+STARTER_OLD = 'Minecraft-Packs.zip'  # старая ссылка из README и переписки, остаётся рабочей
 STORED = ('.jar', '.zip', '.png', '.jpg', '.jpeg', '.ogg', '.mp3', '.exe', '.gz', '.mca')
 
 
@@ -246,6 +247,10 @@ def main():
                     src = {'t': 'arc', 'a': hit[0], 'm': hit[1]}
         items[iid]['files'].append({'p': rel, 's': h, 'z': size, 'src': src})
         stat[src['t']] = stat.get(src['t'], 0) + size
+    exe_sha0 = cache.sha1(ps.EXE_NAME)
+    for old_name in ps.OLD_EXE_NAMES:
+        items['app']['files'].append({'p': old_name, 's': exe_sha0, 'z': os.path.getsize(os.path.join(lib, ps.EXE_NAME)),
+                                      'src': {'t': 'own'}})
     cache.save()
     print('Источники, МБ:', {k: round(v / 1048576) for k, v in stat.items()})
 
@@ -300,7 +305,8 @@ def main():
                 with zipfile.ZipFile(zp, 'w', allowZip64=True) as z:
                     for f in own:
                         comp = zipfile.ZIP_STORED if f['p'].lower().endswith(STORED) else zipfile.ZIP_DEFLATED
-                        z.write(ps.lp(os.path.join(lib, f['p'])), f['p'], compress_type=comp, compresslevel=6)
+                        srcp = ps.EXE_NAME if f['p'] in ps.OLD_EXE_NAMES else f['p']
+                        z.write(ps.lp(os.path.join(lib, srcp)), f['p'], compress_type=comp, compresslevel=6)
                 it['own_size'], it['own_sha1'] = os.path.getsize(zp), sha1_file(zp)
                 to_upload.append(zp)
         arcs = {f['src']['a'] for f in fl if f['src']['t'] in ('arc', 'arcfile')}
@@ -335,7 +341,7 @@ def main():
         changes.append('Мелкие исправления')
 
     manifest = {
-        'name': 'Minecraft Packs', 'version': version, 'format': 2, 'repo': REPO, 'tag': TAG,
+        'name': 'Куботека', 'version': version, 'format': 2, 'repo': REPO, 'tag': TAG,
         'note': 'Всё, что входит в эту версию. Остальное в папке библиотеки - остатки прошлых версий '
                 '(см. README, раздел 8 для Claude).',
         'changes': changes,
@@ -357,8 +363,9 @@ def main():
     old_blocks = {b['id']: b for b in remote.get('blocks', [])}
     blocks = []
     for bid, kind, title, extra_b in (('core', 'core', 'Файлы программы и описания', {'paths': lc_paths}),
-                                      ('app', 'app', 'Программа', {'path': ps.EXE_NAME})):
-        h = lc_hash if kind == 'core' else ps.block_hash([ps.EXE_NAME], cache)
+                                      ('app', 'app', 'Программа', {'path': ps.OLD_EXE_NAMES[0]})):
+        h = lc_hash if kind == 'core' else hashlib.sha1(
+            ('%s\t%s\n' % (ps.OLD_EXE_NAMES[0], exe_sha)).encode('utf-8')).hexdigest()
         b = dict({'id': bid, 'kind': kind, 'title': title, 'hash': h}, **extra_b)
         ob = old_blocks.get(bid)
         if ob and ob.get('hash') == h and ob.get('asset') in assets:
@@ -390,8 +397,8 @@ def main():
     with zipfile.ZipFile(starter, 'w') as z:
         for f in [x['p'] for x in core_files] + [ps.EXE_NAME]:
             comp = zipfile.ZIP_STORED if f.lower().endswith(STORED) else zipfile.ZIP_DEFLATED
-            z.write(ps.lp(os.path.join(lib, f)), 'Minecraft Packs/' + f, compress_type=comp)
-        z.write(mpath, 'Minecraft Packs/manifest.json')
+            z.write(ps.lp(os.path.join(lib, f)), 'Куботека/' + f, compress_type=comp)
+        z.write(mpath, 'Куботека/manifest.json')
     total = sum(os.path.getsize(p) for p in to_upload)
     print('Версия %s. Загрузить: %d файлов, %.1f МБ; стартовый архив %.1f МБ' % (
         version, len(to_upload), total / 1048576, os.path.getsize(starter) / 1048576))
@@ -406,21 +413,25 @@ def main():
 
     # 4. Загрузка: части, потом стартовый архив и опись. Лишнее из релиза удаляется.
     if gh('release', 'view', TAG, '--repo', REPO, check=False).returncode:
-        gh('release', 'create', TAG, '--repo', REPO, '--title', 'Minecraft Packs', '--latest',
-           '--notes', 'Скачай Minecraft-Packs.zip, распакуй и запусти «Выбор карты и сборки.exe».')
+        gh('release', 'create', TAG, '--repo', REPO, '--title', 'Куботека', '--latest',
+           '--notes', 'Скачай Kuboteka.zip, распакуй и запусти «Куботека.exe».')
     for i, p in enumerate(to_upload, 1):
         print('Загружаю %d/%d %s (%.1f МБ)' % (i, len(to_upload), os.path.basename(p), os.path.getsize(p) / 1048576),
               flush=True)
         upload(p)
     upload(starter)
+    starter_old = os.path.join(out, STARTER_OLD)
+    shutil.copy2(starter, starter_old)
+    upload(starter_old)
     upload(mpath)
-    used = {i['list'] for i in mitems} | {i['own'] for i in mitems if i['own']} | {STARTER, 'manifest.json'}         | {b['asset'] for b in blocks if b.get('asset')}
+    used = {i['list'] for i in mitems} | {i['own'] for i in mitems if i['own']} | {STARTER, STARTER_OLD, 'manifest.json'} \
+        | {b['asset'] for b in blocks if b.get('asset')}
     for name in assets:
         if name not in used:
             gh('release', 'delete-asset', TAG, name, '--repo', REPO, '--yes', check=False)
             print('Удалён из релиза:', name)
-    gh('release', 'edit', TAG, '--repo', REPO, '--title', 'Minecraft Packs %s' % version, '--latest',
-       '--notes', 'Скачай Minecraft-Packs.zip, распакуй и запусти «Выбор карты и сборки.exe». Карты и моды '
+    gh('release', 'edit', TAG, '--repo', REPO, '--title', 'Куботека %s' % version, '--latest',
+       '--notes', 'Скачай Kuboteka.zip, распакуй и запусти «Куботека.exe». Карты и моды '
                   'программа скачивает с сайтов авторов, когда их выбираешь.\n\nЧто нового:\n' +
                   '\n'.join('- ' + c for c in changes))
     shutil.copy2(mpath, os.path.join(lib, 'manifest.json'))

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""Minecraft: карты и сборки.
+"""Куботека: карты, сборки и серверы Minecraft.
 
-Окно: двойной клик по «Выбор карты и сборки.exe» (или .bat, если установлен Python).
+Окно: двойной клик по «Куботека.exe» (или .bat, если установлен Python).
 Командная строка (результат пишется в switcher_cli.log рядом с программой):
   --list                         список сборок
   --maps                         список карт
@@ -52,10 +52,19 @@ MANIFEST = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
 NO_MODS = "Без модов"
 
 
+# Вывод PowerShell по умолчанию в OEM-кодировке (cp866): кириллица в путях и названиях портилась.
+PS_UTF8 = "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+
+
 def lp(path):
-    """Путь с префиксом для длинных имён: в некоторых картах файлы лежат глубже 260 символов."""
+    """Путь с префиксом для длинных имён: в некоторых картах файлы лежат глубже 260 символов.
+    Сетевой путь \\\\server\\share превращается в \\\\?\\UNC\\server\\share."""
     p = os.path.abspath(path)
-    return p if p.startswith("\\\\?\\") else "\\\\?\\" + p
+    if p.startswith("\\\\?\\"):
+        return p
+    if p.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + p[2:]
+    return "\\\\?\\" + p
 
 
 def copy_long(src, dst):
@@ -198,9 +207,9 @@ def _java_cmdlines():
     """Командные строки всех java-процессов. Нужны, чтобы отличить игру от самого TLauncher."""
     try:
         out = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
+            ["powershell", "-NoProfile", "-Command", PS_UTF8,
              "Get-CimInstance Win32_Process -Filter \"Name like 'java%'\" | ForEach-Object { $_.CommandLine }"],
-            capture_output=True, text=True, errors="ignore", timeout=20, creationflags=0x08000000).stdout
+            capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=20, creationflags=0x08000000).stdout
         return [l for l in out.splitlines() if l.strip()]
     except Exception:
         return []
@@ -222,7 +231,7 @@ def tlauncher_running():
         if "tlauncher" in low and "--gamedir" not in low:
             return True
     try:
-        out = subprocess.run(["tasklist"], capture_output=True, text=True, errors="ignore",
+        out = subprocess.run(["tasklist"], capture_output=True, text=True, encoding="utf-8", errors="ignore",
                              creationflags=0x08000000).stdout.lower()
         return "tlauncher.exe" in out
     except Exception:
@@ -334,13 +343,20 @@ def jars(d):
     return [f for f in os.listdir(d) if f.lower().endswith(".jar")]
 
 
+def _listdir(d):
+    try:
+        return sorted(os.listdir(d))
+    except OSError:
+        return []
+
+
 def find_packs():
     packs = []
-    for vdir in sorted(os.listdir(ROOT)):
+    for vdir in _listdir(ROOT):
         vp = os.path.join(ROOT, vdir)
-        if not os.path.isdir(vp) or vdir.startswith("_") or vp == MAPS_DIR:
+        if not os.path.isdir(vp) or vdir.startswith(("_", ".")) or vp == MAPS_DIR:
             continue
-        for pdir in sorted(os.listdir(vp)):
+        for pdir in _listdir(vp):
             meta = os.path.join(vp, pdir, "pack.json")
             if not os.path.isfile(meta):
                 continue
@@ -349,6 +365,11 @@ def find_packs():
                     m = json.load(fh)
             except Exception:
                 continue
+            if not isinstance(m, dict):
+                continue
+            m.setdefault("name", pdir)
+            m.setdefault("loader", vdir.partition(" ")[0])
+            m.setdefault("minecraft", vdir.partition(" ")[2])
             m["path"] = os.path.join(vp, pdir)
             m["version_dir"] = vdir
             m["count"] = len(jars(os.path.join(vp, pdir, "mods")))
@@ -458,10 +479,11 @@ def switch(pack, packs, copy_configs=True, log=print):
     except Exception as e:
         log("Серверы не добавлены: %s" % e)
 
-    # 4. Версия в TLauncher и отметка активной сборки.
-    ok = set_tlauncher_version(pack.get("tl_version", ""))
-    note = "" if ok else " (TLauncher открыт, выберите версию в нём вручную)"
-    log("Версия в TLauncher: %s%s" % (pack.get("tl_version"), note))
+    # 4. Версия в «моём» лаунчере и отметка активной сборки.
+    ok, hint = select_version(pack.get("tl_version", ""), pack["name"].rsplit(" (", 1)[0], log)
+    if hint:
+        log("Подсказка: " + hint)
+    os.makedirs(MODS, exist_ok=True)
     with open(MARKER, "w", encoding="utf-8") as fh:
         json.dump({"name": pack["name"], "version_dir": pack["version_dir"],
                    "tl_version": pack.get("tl_version"),
@@ -481,7 +503,7 @@ def save_current_as(name, version_dir, tl_version, description=""):
     return dst
 
 
-LIBRARY_NOTE = ("Рядом с программой нет папок со сборками и картами. Похоже, она запущена прямо из архива или скопирована отдельно. Распакуй архив «Minecraft Packs» целиком и запусти «Выбор карты и сборки.exe» из распакованной папки.")
+LIBRARY_NOTE = ("Рядом с программой нет папок со сборками и картами. Похоже, она запущена прямо из архива или скопирована отдельно. Распакуй архив целиком и запусти «Куботека.exe» из распакованной папки.")
 
 
 def library_found():
@@ -495,7 +517,7 @@ def find_maps():
     maps = []
     if not os.path.isdir(MAPS_DIR):
         return maps
-    for d in sorted(os.listdir(MAPS_DIR)):
+    for d in _listdir(MAPS_DIR):
         meta = os.path.join(MAPS_DIR, d, "map.json")
         if not os.path.isfile(meta):
             continue
@@ -504,6 +526,13 @@ def find_maps():
                 m = json.load(fh)
         except Exception:
             continue
+        if not isinstance(m, dict) or not m.get("version"):
+            continue  # без версии игры карту не поставить
+        m.setdefault("id", d)
+        m.setdefault("title", d)
+        m.setdefault("save", m["title"])
+        for k, v in (("genre", "Карта"), ("players", ""), ("desc", ""), ("recommended", None)):
+            m.setdefault(k, v)
         m["path"] = os.path.join(MAPS_DIR, d)
         maps.append(m)
     def vkey(v):
@@ -532,11 +561,18 @@ def install_map(m, pack=None, fresh=False, packs=None, log=print):
     os.makedirs(SAVES, exist_ok=True)
     dst = os.path.join(SAVES, m["save"])
     if os.path.isdir(dst) and fresh:
-        backup = "%s (старое сохранение %s)" % (m["save"], time.strftime("%Y-%m-%d %H-%M"))
+        backup = "%s (старое сохранение %s)" % (m["save"], time.strftime("%Y-%m-%d %H-%M-%S"))
         os.rename(dst, os.path.join(SAVES, backup))
         log("Старое сохранение переименовано в «%s»" % backup)
     if not os.path.isdir(dst):
-        n = copy_long(os.path.join(m["path"], "world"), dst)
+        src = os.path.join(m["path"], "world")
+        if not os.path.isfile(os.path.join(src, "level.dat")):
+            raise RuntimeError("В папке карты нет мира (world\\level.dat). Скачай карту заново.")
+        tmp = os.path.join(SAVES, ".kuboteka-tmp-" + m["save"])
+        if os.path.isdir(lp(tmp)):
+            shutil.rmtree(lp(tmp), ignore_errors=True)
+        n = copy_long(src, tmp)
+        os.replace(lp(tmp), lp(dst))  # мир появляется в игре только целиком
         log("Карта «%s» установлена, файлов: %d" % (m["title"], n))
     else:
         log("Карта «%s» уже установлена, продолжаешь своё сохранение" % m["title"])
@@ -551,8 +587,9 @@ def install_map(m, pack=None, fresh=False, packs=None, log=print):
     if pack:
         return switch(pack, packs or find_packs(), True, log)
     ensure_vanilla(m["version"], log)
-    ok = set_tlauncher_version(m["version"])
-    log("Версия в TLauncher: %s%s" % (m["version"], "" if ok else " (TLauncher открыт, выберите версию в нём вручную)"))
+    ok, hint = select_version(m["version"], m["title"], log)
+    if hint:
+        log("Подсказка: " + hint)
     return ok
 
 
@@ -573,9 +610,9 @@ def vpn_addresses():
     found = {}
     try:
         out = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
+            ["powershell", "-NoProfile", "-Command", PS_UTF8,
              "Get-NetIPAddress -AddressFamily IPv4 | ForEach-Object { $_.InterfaceAlias + '|' + $_.IPAddress }"],
-            capture_output=True, text=True, errors="ignore", timeout=20, creationflags=0x08000000).stdout
+            capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=20, creationflags=0x08000000).stdout
     except Exception:
         return found
     for line in out.splitlines():
@@ -593,9 +630,9 @@ def vpn_gui(title):
     if title == "Hamachi":
         cands = []
         try:
-            out = subprocess.run(["powershell", "-NoProfile", "-Command",
+            out = subprocess.run(["powershell", "-NoProfile", "-Command", PS_UTF8,
                                   "(Get-CimInstance Win32_Service -Filter \"Name='Hamachi2Svc'\").PathName"],
-                                 capture_output=True, text=True, errors="ignore", timeout=20,
+                                 capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=20,
                                  creationflags=0x08000000).stdout.strip().strip('"')
             exe = out.split(" -")[0].strip('"')
             if exe:
@@ -749,10 +786,10 @@ def lan_ip():
     """Адрес компьютера в домашней сети (у роутера), без VPN-адаптеров."""
     try:
         out = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
+            ["powershell", "-NoProfile", "-Command", PS_UTF8,
              "Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway } | "
              "ForEach-Object { $_.InterfaceAlias + '|' + $_.IPv4Address.IPAddress }"],
-            capture_output=True, text=True, errors="ignore", timeout=25, creationflags=0x08000000).stdout
+            capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=25, creationflags=0x08000000).stdout
     except Exception:
         return None
     for line in out.splitlines():
@@ -781,7 +818,7 @@ def network_checks(kind):
         "Where-Object { $_.DisplayName -match '^(java|javaw)$|Java\\(TM\\)|OpenJDK|Minecraft' } | "
         "ForEach-Object { 'R|' + $_.Profile + '|' + $_.DisplayName }")
     try:
-        out = subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], capture_output=True, text=True,
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", PS_UTF8, ps_cmd], capture_output=True, text=True, encoding="utf-8",
                              errors="ignore", timeout=120, creationflags=0x08000000).stdout
     except Exception as e:
         res["error"] = str(e)
@@ -850,10 +887,10 @@ def _motd_text(d):
 def resolve_srv(host):
     """Адрес из DNS-записи _minecraft._tcp, если сервер сидит не на стандартном порту."""
     try:
-        out = subprocess.run(["powershell", "-NoProfile", "-Command",
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", PS_UTF8,
                               "Resolve-DnsName -Type SRV _minecraft._tcp.%s -ErrorAction Stop | "
                               "Where-Object { $_.Type -eq 'SRV' } | ForEach-Object { $_.NameTarget + '|' + $_.Port }" % host],
-                             capture_output=True, text=True, errors="ignore", timeout=20,
+                             capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=20,
                              creationflags=0x08000000).stdout.strip().splitlines()
         if out:
             t, _, p = out[0].partition("|")
@@ -978,7 +1015,7 @@ def join_friend(text, packs=None, log=print):
     if pack_name:
         pack = next((p for p in packs if p["name"] == pack_name), None)
         if not pack:
-            raise RuntimeError("У друга сборка «%s», а у тебя её нет. Обнови папку Minecraft Packs." % pack_name)
+            raise RuntimeError("У друга сборка «%s», а у тебя её нет. Обнови Куботеку: кнопка «Проверить обновления»." % pack_name)
         cur = current() or {}
         if cur.get("name") != pack_name or get_tlauncher_version() != pack.get("tl_version"):
             ok = switch(pack, packs, True, log)
@@ -987,8 +1024,9 @@ def join_friend(text, packs=None, log=print):
     elif tl:
         if not tl.lower().startswith(("fabric", "forge")):
             ensure_vanilla(tl, log)
-        ok = set_tlauncher_version(tl)
-        log("Версия в TLauncher: %s%s" % (tl, "" if ok else " (TLauncher открыт, выберите версию вручную)"))
+        ok, hint = select_version(tl, "игра друга", log)
+        if hint:
+            log("Подсказка: " + hint)
     set_friend_server(address)
     log("В «Сетевой игре» первой строкой добавлено: %s" % FRIEND_SERVER)
     host, _, port = address.rpartition(":")
@@ -1040,9 +1078,9 @@ def start_apps(refresh=False):
         return _START_APPS["list"]
     out = []
     try:
-        raw = subprocess.run(["powershell", "-NoProfile", "-Command",
+        raw = subprocess.run(["powershell", "-NoProfile", "-Command", PS_UTF8,
                               "Get-StartApps | ForEach-Object { $_.Name + '|' + $_.AppID }"],
-                             capture_output=True, text=True, errors="ignore", timeout=60,
+                             capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=60,
                              creationflags=0x08000000).stdout
         for line in raw.splitlines():
             name, _, app = line.partition("|")
@@ -1054,13 +1092,200 @@ def start_apps(refresh=False):
     return out
 
 
+LAUNCHER_PATHS = {
+    # Где лаунчеры лежат после обычной установки (%VAR% раскрываются).
+    "tlauncher": [r"%APPDATA%\.minecraft\TLauncher.exe", r"%USERPROFILE%\Desktop\TLauncher.exe"],
+    "legacy": [r"%APPDATA%\.tlauncher\legacy\Minecraft\LL.exe"],
+    "sklauncher": [r"%APPDATA%\sklauncher\SKlauncher.exe"],
+    "official": [r"%ProgramFiles(x86)%\Minecraft Launcher\MinecraftLauncher.exe",
+                 r"%ProgramFiles%\Minecraft Launcher\MinecraftLauncher.exe"],
+    "prism": [r"%LOCALAPPDATA%\Programs\PrismLauncher\prismlauncher.exe"],
+    "modrinth": [r"%LOCALAPPDATA%\Modrinth App\Modrinth App.exe", r"%LOCALAPPDATA%\Programs\Modrinth App\Modrinth App.exe"],
+}
+LEGACY_PROPS = [os.path.join(os.environ.get("APPDATA", ""), ".tlauncher", "legacy", "Minecraft", "tl.properties"),
+                os.path.join(os.environ.get("APPDATA", ""), ".tlauncher", "legacy.properties")]
+DEFAULT_MC = os.path.join(os.environ.get("APPDATA", ""), ".minecraft")
+MRPACK_HOSTS = ("cdn.modrinth.com", "github.com", "raw.githubusercontent.com", "gitlab.com")
+
+
+def launcher_info(lid=None):
+    lid = lid or chosen_launcher()
+    return next((x for x in load_launchers() if x["id"] == lid), {"id": lid, "name": lid, "mode": "tl"})
+
+
+def launcher_mode(lid=None):
+    """tl - TLauncher, legacy - Legacy Launcher, profiles - официальный и SKLauncher, mrpack - Prism и Modrinth App."""
+    return launcher_info(lid).get("mode", "tl")
+
+
+def _props_read(path):
+    out = {}
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                line = line.rstrip("\n")
+                if not line or line.startswith(("#", "!")) or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                out[k.strip()] = v.replace("\\:", ":").replace("\\=", "=").replace("\\\\", "\\").strip()
+    except OSError:
+        pass
+    return out
+
+
+def _props_set(path, key, value):
+    """Меняет один ключ в файле настроек Java (.properties), остальное не трогает. Резервная копия рядом."""
+    esc = value.replace("\\", "\\\\").replace(":", "\\:").replace("=", "\\=")
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        lines = []
+    done = False
+    for i, line in enumerate(lines):
+        if line.split("=", 1)[0].strip() == key:
+            lines[i] = "%s=%s" % (key, esc)
+            done = True
+    if not done:
+        lines.append("%s=%s" % (key, esc))
+    if os.path.isfile(path) and not os.path.exists(path + ".switcher.bak"):
+        shutil.copy2(path, path + ".switcher.bak")
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+def legacy_props():
+    return next((p for p in LEGACY_PROPS if os.path.isfile(p)), None)
+
+
+def launcher_game_dir(lid=None):
+    """Папка игры выбранного лаунчера: своя (из настроек), у Legacy Launcher - из его tl.properties."""
+    s = load_settings()
+    if s.get("game_dir"):
+        return s["game_dir"]
+    if (lid or chosen_launcher()) == "legacy":
+        p = legacy_props()
+        if p:
+            d = _props_read(p).get("minecraft.gamedir")
+            if d and os.path.isabs(d):
+                return d
+    return DEFAULT_MC
+
+
+def set_game_dir(path=None):
+    """Переключает все пути программы на папку игры path (по умолчанию - папку выбранного лаунчера)."""
+    global MC, MODS, SAVES, MARKER, SERVERS_DAT
+    MC = path or launcher_game_dir()
+    MODS = os.path.join(MC, "mods")
+    SAVES = os.path.join(MC, "saves")
+    MARKER = os.path.join(MODS, ".active_pack.json")
+    SERVERS_DAT = os.path.join(MC, "servers.dat")
+    return MC
+
+
+def process_running(*names):
+    try:
+        out = subprocess.run(["tasklist"], capture_output=True, text=True, encoding="utf-8", errors="ignore",
+                             creationflags=0x08000000).stdout.lower()
+        return any(n.lower() in out for n in names)
+    except Exception:
+        return False
+
+
+def _profiles_files():
+    return [p for p in (os.path.join(MC, "launcher_profiles.json"),
+                        os.path.join(MC, "launcher_profiles_microsoft_store.json")) if os.path.isfile(p)]
+
+
+def set_launcher_profile(version, title):
+    """Профиль «Куботека» в launcher_profiles.json (официальный лаунчер, SKLauncher): самый свежий lastUsed,
+    поэтому он первый в списке. Возвращает True, если файл профилей нашёлся."""
+    files = _profiles_files() or [os.path.join(MC, "launcher_profiles.json")]
+    now = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+    icon = "Grass"
+    try:
+        with open(os.path.join(ROOT, "Оформление", "appicon_72.png"), "rb") as fh:
+            icon = "data:image/png;base64," + base64.b64encode(fh.read()).decode()
+    except OSError:
+        pass
+    for path in files:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception:
+            data = {"profiles": {}, "settings": {}, "version": 3}
+        if os.path.isfile(path) and not os.path.exists(path + ".switcher.bak"):
+            shutil.copy2(path, path + ".switcher.bak")
+        prof = data.setdefault("profiles", {})
+        old = prof.get("kuboteka", {})
+        prof["kuboteka"] = {"name": "%s: %s" % (APP_NAME, title)[:60], "type": "custom",
+                            "created": old.get("created", now), "lastUsed": now, "icon": icon, "lastVersionId": version}
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+    return True
+
+
+def select_version(version, title="", log=print):
+    """Выбирает версию в «моём» лаунчере. Возвращает (получилось, подсказка человеку)."""
+    lid = chosen_launcher()
+    mode = launcher_mode(lid)
+    name = launcher_title(lid)
+    vdir = os.path.join(MC, "versions", version)
+    missing = not os.path.isfile(os.path.join(vdir, version + ".json"))
+    if mode == "tl":
+        ok = set_tlauncher_version(version)
+        log("Версия в TLauncher: %s%s" % (version, "" if ok else " (TLauncher открыт, выберите версию в нём вручную)"))
+        return ok, "" if ok else "TLauncher был открыт, поэтому версию «%s» выбери в нём сам." % version
+    if mode == "legacy":
+        p = legacy_props()
+        if p and not process_running("LL.exe"):
+            _props_set(p, "login.version", version)
+            log("Версия в Legacy Launcher: %s" % version)
+            return True, ""
+        log("Версия для Legacy Launcher: %s" % version)
+        return False, "В Legacy Launcher выбери версию «%s» (список внизу)." % version
+    if mode == "profiles":
+        set_launcher_profile(version, title or version)
+        log("Профиль «%s» в %s: версия %s" % (APP_NAME, name, version))
+        hint = "В %s выбери профиль «%s: %s» (он первый в списке) и нажми «Играть»." % (name, APP_NAME, title or version)
+        if missing and not re.match(r"^\d+(\.\d+)+$", version):
+            hint += (" Версии «%s» в папке игры нет: один раз поставь её через TLauncher или установщик "
+                     "Forge/Fabric, иначе лаунчер её не найдёт." % version)
+        return True, hint
+    return False, "В %s выбери версию «%s»." % (name, version)
+
+
+def launcher_exe(lid):
+    """Путь к exe лаунчера: указанный вручную, из обычного места установки или из меню «Пуск»."""
+    s = load_settings().get("launcher_paths", {})
+    if s.get(lid) and os.path.isfile(s[lid]):
+        return s[lid]
+    for p in LAUNCHER_PATHS.get(lid, []):
+        p = os.path.expandvars(p)
+        if os.path.isfile(p):
+            return p
+    if lid == "prism":
+        try:
+            k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\PrismLauncher")
+            p = os.path.join(winreg.QueryValueEx(k, "InstallDir")[0], "prismlauncher.exe")
+            if os.path.isfile(p):
+                return p
+        except Exception:
+            pass
+    return None
+
+
 def find_installed_launchers(launchers=None):
     launchers = launchers if launchers is not None else load_launchers()
     found = {}
+    for x in launchers:
+        exe = launcher_exe(x["id"])
+        if exe:
+            found[x["id"]] = exe
     apps = start_apps()
     for x in launchers:
-        if x["id"] == "tlauncher" and tlauncher_exe():
-            found["tlauncher"] = tlauncher_exe()
+        if x["id"] in found:
             continue
         for name, app in apps:
             low = name.lower()
@@ -1071,9 +1296,12 @@ def find_installed_launchers(launchers=None):
     return found
 
 
-def run_target(target):
+def run_target(target, args=()):
     if target.lower().endswith(".exe") and os.path.isfile(target):
-        os.startfile(target)
+        if args:
+            subprocess.Popen([target] + list(args), cwd=os.path.dirname(target))
+        else:
+            os.startfile(target)
     else:
         subprocess.Popen(["explorer.exe", "shell:AppsFolder\\" + target])
 
@@ -1088,13 +1316,147 @@ def launcher_title(lid):
 
 def open_launcher():
     lid = chosen_launcher()
-    if lid == "tlauncher":
+    exe = launcher_exe(lid)
+    if lid == "tlauncher" and not exe:
         return open_tlauncher()
-    target = find_installed_launchers().get(lid)
+    target = exe or find_installed_launchers().get(lid)
     if target:
         run_target(target)
         return True
     return False
+
+
+# --- пакет .mrpack для Prism Launcher и Modrinth App ---
+
+def _servers_dat_bytes():
+    lst = [("compound", [("ip", 8, s["ip"]), ("name", 8, s["name"]), ("acceptTextures", 1, 1), ("hideAddress", 1, 0)])
+           for s in load_servers()]
+    out = io.BytesIO()
+    out.write(b"\x0a\x00\x00")
+    _nbt_w(out, 10, ("compound", [("servers", 9, ("list", 10, lst))]))
+    return out.getvalue()
+
+
+def export_mrpack(m=None, pack=None, log=print):
+    """Собирает .mrpack: моды с Modrinth - ссылками, остальное (конфиги, текстуры, мир карты) - внутри пакета.
+    Prism Launcher и Modrinth App создают из него отдельный экземпляр с нужной версией и загрузчиком."""
+    if m is not None and not pack and m.get("requires_pack"):
+        pack = next((p for p in find_packs() if p["name"] == m.get("recommended")), None)
+    if missing_items(m, pack):
+        raise RuntimeError("Сначала нужно скачать карту или сборку.")
+    man = load_local_manifest()
+    urls = {}
+    for iid in ([pack_item_id(pack)] if pack else []) + ([map_item_id(m)] if m else []):
+        it = manifest_item(man, iid)
+        if not it:
+            continue
+        try:
+            for f in fetch_list(man, it)["files"]:
+                if f["src"]["t"] == "url":
+                    urls[f["p"]] = f["src"]["u"]
+        except Exception:
+            pass
+    mc_ver = pack["minecraft"] if pack else m["version"]
+    deps = {"minecraft": mc_ver}
+    if pack and pack.get("loader") in ("Fabric", "Forge") and pack.get("loader_version"):
+        deps["fabric-loader" if pack["loader"] == "Fabric" else "forge"] = pack["loader_version"]
+    parts = [x for x in ((m or {}).get("title"), pack and pack["name"].rsplit(" (", 1)[0]) if x]
+    title = " + ".join(dict.fromkeys(parts)) or mc_ver
+    name = "%s - %s" % (APP_NAME, title)
+    out_dir = os.path.join(ROOT, "_export")
+    os.makedirs(out_dir, exist_ok=True)
+    out = os.path.join(out_dir, re.sub(r'[\\/:*?"<>|]', "_", title) + ".mrpack")
+    files = []
+    n_over = 0
+    with zipfile.ZipFile(out + ".tmp", "w", zipfile.ZIP_DEFLATED, allowZip64=True) as z:
+        if pack:
+            base = os.path.relpath(pack["path"], ROOT).replace("\\", "/")
+            for rel in _walk_rel(ROOT, base):
+                sub = rel[len(base) + 1:]
+                if "/" not in sub and sub in META_NAMES or sub.startswith(("versions/", "saves/")):
+                    continue
+                full = os.path.join(ROOT, rel)
+                u = urls.get(rel)
+                if u and urllib.parse.urlparse(u).netloc in MRPACK_HOSTS:
+                    data = open(lp(full), "rb").read()
+                    files.append({"path": sub, "hashes": {"sha1": hashlib.sha1(data).hexdigest(),
+                                                          "sha512": hashlib.sha512(data).hexdigest()},
+                                  "env": {"client": "required", "server": "required"},
+                                  "downloads": [u], "fileSize": len(data)})
+                else:
+                    z.write(lp(full), "overrides/" + sub)
+                    n_over += 1
+        if m:
+            wbase = os.path.relpath(os.path.join(m["path"], "world"), ROOT).replace("\\", "/")
+            for rel in _walk_rel(ROOT, wbase):
+                if rel.endswith("/session.lock"):
+                    continue
+                z.write(lp(os.path.join(ROOT, rel)), "overrides/saves/%s/%s" % (m["save"], rel[len(wbase) + 1:]))
+                n_over += 1
+            if m.get("usercache") and os.path.isfile(os.path.join(m["path"], m["usercache"])):
+                z.write(os.path.join(m["path"], m["usercache"]), "overrides/usercache.json")
+        if load_servers():
+            z.writestr("overrides/servers.dat", _servers_dat_bytes())
+        z.writestr("modrinth.index.json", json.dumps({
+            "formatVersion": 1, "game": "minecraft", "versionId": load_local_manifest().get("version", "1"),
+            "name": name, "summary": "Собрано в %s" % APP_NAME, "files": files, "dependencies": deps},
+            ensure_ascii=False, indent=1))
+    os.replace(out + ".tmp", out)
+    log("Пакет для лаунчера собран: %s (модов по ссылкам %d, файлов внутри %d, %s)" % (
+        os.path.basename(out), len(files), n_over, fmt_mb(os.path.getsize(out))))
+    return out
+
+
+def open_mrpack(path, lid=None):
+    """Передаёт .mrpack лаунчеру: Prism - через --import, Modrinth App - путём в аргументе, иначе - как файл."""
+    lid = lid or chosen_launcher()
+    exe = launcher_exe(lid)
+    if exe and lid == "prism":
+        subprocess.Popen([exe, "--import", path], cwd=os.path.dirname(exe))
+    elif exe and lid == "modrinth":
+        subprocess.Popen([exe, path], cwd=os.path.dirname(exe))
+    else:
+        os.startfile(path)
+    return True
+
+
+# --- скачивание установщиков лаунчеров с официальных сайтов ---
+
+def launcher_installer_url(x):
+    """Прямая ссылка на установщик (только официальные адреса). None - качать в браузере с сайта."""
+    d = x.get("download") or {}
+    kind = d.get("kind")
+    if kind == "url":
+        return d["url"]
+    if kind == "github":
+        rel = json.loads(_get("https://api.github.com/repos/%s/releases/latest" % d["repo"]).decode("utf-8"))
+        for a in rel.get("assets", []):
+            if re.search(d["pattern"], a["name"]):
+                return a["browser_download_url"]
+    if kind == "modrinth":
+        upd = json.loads(_get("https://launcher-files.modrinth.com/updates.json").decode("utf-8"))
+        return upd["platforms"]["windows-x86_64"]["install_urls"][0]
+    return None
+
+
+def download_installer(x, log=print, progress=None, cancel=None):
+    url = launcher_installer_url(x)
+    if not url:
+        raise RuntimeError("установщик %s скачивается только в браузере" % x["name"])
+    name = urllib.parse.unquote(url.rsplit("/", 1)[-1].split("?")[0]) or (x["id"] + "-setup.exe")
+    if not name.lower().endswith((".exe", ".msi")):
+        name += ".exe"
+    dst = os.path.join(downloads_dir(), name)
+    log("Скачиваю %s с %s" % (name, urllib.parse.urlparse(url).netloc))
+    total = [0]
+
+    def tick(n):
+        total[0] += n
+        if progress:
+            progress(total[0])
+    _fetch_to(url, dst, tick, None, cancel, {"User-Agent": UA_BROWSER})
+    log("Скачано: %s (%s)" % (dst, fmt_mb(os.path.getsize(dst))))
+    return dst
 
 
 def merge_usercache(src):
@@ -1172,8 +1534,12 @@ def map_matches(m, players="all", version="all"):
 
 # ---------- ярлыки ----------
 
-APP_TITLE = "Minecraft - карты и сборки"
-EXE_NAME = "Выбор карты и сборки.exe"
+APP_NAME = "Куботека"
+APP_TITLE = APP_NAME
+EXE_NAME = APP_NAME + ".exe"
+# Так программа называлась до 2026.10.05: старые файлы и ярлыки переименовываются при запуске.
+OLD_EXE_NAMES = ("Выбор карты и сборки.exe",)
+OLD_APP_TITLES = ("Minecraft - карты и сборки",)
 
 
 def _shell_folder(name, default):
@@ -1202,6 +1568,58 @@ def app_target():
     return (pyw if os.path.isfile(pyw) else sys.executable), '"%s"' % os.path.abspath(__file__)
 
 
+def migrate_old_name(argv):
+    """Запущен старый «Выбор карты и сборки.exe»: копируем себя в «Куботека.exe» и перезапускаемся под новым именем."""
+    if not getattr(sys, "frozen", False) or os.path.basename(sys.executable) not in OLD_EXE_NAMES:
+        return False
+    new = os.path.join(ROOT, EXE_NAME)
+    try:
+        if not (os.path.isfile(new) and os.path.getsize(new) == os.path.getsize(sys.executable)):
+            shutil.copy2(sys.executable, new)
+        subprocess.Popen([new] + list(argv), cwd=ROOT)
+        return True
+    except Exception:
+        return False
+
+
+def tidy_old_name():
+    """Убрать старый exe и старые ярлыки (их место займут новые)."""
+    def work():
+        for _ in range(20):
+            left = 0
+            for n in OLD_EXE_NAMES:
+                p = os.path.join(ROOT, n)
+                if os.path.exists(p) and os.path.abspath(p) != os.path.abspath(sys.executable):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        left += 1
+            if not left:
+                break
+            time.sleep(1)
+    threading.Thread(target=work, daemon=True).start()
+    had = False
+    home = os.environ.get("USERPROFILE", "")
+    desk = _shell_folder("Desktop", os.path.join(home, "Desktop"))
+    start = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs")
+    for t in OLD_APP_TITLES:
+        for d in (desk, start):
+            p = os.path.join(d, t + ".lnk")
+            if os.path.isfile(p):
+                had = True
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+    if had and not shortcuts_exist():
+        def make():
+            try:
+                create_shortcuts()
+            except Exception:
+                pass
+        threading.Thread(target=make, daemon=True).start()
+
+
 def shortcuts_exist():
     return all(os.path.isfile(p) for p in shortcut_paths())
 
@@ -1217,7 +1635,7 @@ def create_shortcuts():
               "$s.Arguments='{2}';$s.WorkingDirectory='{3}';$s.IconLocation='{4},0';"
               "$s.Description='Карты, сборки и серверы Minecraft';$s.Save()").format(
             *(x.replace("'", "''") for x in (path, target, args, ROOT, icon)))
-        subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, timeout=30,
+        subprocess.run(["powershell", "-NoProfile", "-Command", PS_UTF8, ps], capture_output=True, timeout=30,
                        creationflags=0x08000000)
         if os.path.isfile(path):
             made.append(path)
@@ -1327,8 +1745,9 @@ class HashCache:
     def save(self):
         try:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            with open(self.path, "w", encoding="utf-8") as fh:
+            with open(self.path + ".tmp", "w", encoding="utf-8") as fh:
                 json.dump(self.data, fh)
+            os.replace(self.path + ".tmp", self.path)
         except Exception:
             pass
 
@@ -1432,18 +1851,27 @@ def fetch_list(man, item, root=ROOT):
     if item.get("list_sha1") and hashlib.sha1(data).hexdigest() != item["list_sha1"]:
         raise RuntimeError("список файлов «%s» скачался с ошибкой" % item["title"])
     lst = json.loads(data.decode("utf-8"))
-    with open(p, "wb") as fh:
+    with open(p + ".tmp", "wb") as fh:
         fh.write(data)
+    os.replace(p + ".tmp", p)
     return lst
+
+
+PLAN_LOCK = threading.RLock()
 
 
 def plan_items(man, items, root=ROOT, log=print):
     """Какие файлы скачать и какие лишние убрать, чтобы части items совпали с описью man."""
+    with PLAN_LOCK:
+        return _plan_items(man, items, root, log)
+
+
+def _plan_items(man, items, root, log):
     cache = HashCache(root)
     need, extra = [], []
     for it in items:
         log("Проверяю: %s" % it["title"])
-        lst = fetch_list(man, it, root)["files"]
+        lst = [f for f in fetch_list(man, it, root)["files"] if f["p"] not in OLD_EXE_NAMES]
         want = {f["p"] for f in lst}
         for f in lst:
             try:
@@ -1636,6 +2064,10 @@ def _fetch_to(url, dst, progress=None, expect_sha1=None, cancel=None, headers=No
             return
         except Exception as e:
             last = e
+            try:
+                os.remove(lp(dst) + ".part")
+            except OSError:
+                pass
             if progress and got:
                 progress(-got)
             if cancel and cancel.is_set():
@@ -1670,7 +2102,14 @@ def get_archive(man, a, root, tick, cancel, ask_browser, log):
 
 
 def recycle(path, tries=4, log=None):
-    """В Корзину. Свежие файлы бывают заняты антивирусом, поэтому несколько попыток с паузой."""
+    """В Корзину. Свежие файлы бывают заняты антивирусом, поэтому несколько попыток с паузой.
+    На флешке и сетевом диске Корзины нет (Windows удалил бы насовсем) - тогда False, и файлы остаются в «_Старое»."""
+    try:
+        drive = os.path.splitdrive(os.path.abspath(path))[0] + "\\"
+        if ctypes.windll.kernel32.GetDriveTypeW(drive) != 3:  # 3 = DRIVE_FIXED
+            return False
+    except Exception:
+        return False
     for i in range(tries):
         code = _recycle_once(path)
         if code == 0 and not os.path.exists(path):
@@ -1707,7 +2146,22 @@ def _write(path, data):
         fh.write(data)
 
 
+def _lay_out(need, root, stage, old_dir):
+    for f in need:
+        if f["p"] == EXE_NAME:
+            continue
+        dst = os.path.join(root, f["p"])
+        if os.path.exists(lp(dst)):
+            _move(dst, os.path.join(old_dir, f["p"]))
+        _move(os.path.join(stage, f["p"]), dst)
+
+
 def apply_plan(man, plan, root=ROOT, log=print, progress=None, cancel=None, ask_browser=None):
+    with PLAN_LOCK:
+        return _apply_plan(man, plan, root, log, progress, cancel, ask_browser)
+
+
+def _apply_plan(man, plan, root=ROOT, log=print, progress=None, cancel=None, ask_browser=None):
     """Скачивает нужные файлы из всех источников, проверяет sha1 и раскладывает. Старое - в Корзину.
     Возвращает {'restart': exe заменён, нужен перезапуск; 'trash': папка со старым, если Корзина не приняла}."""
     ThreadPoolExecutor = concurrent.futures.ThreadPoolExecutor
@@ -1804,8 +2258,6 @@ def apply_plan(man, plan, root=ROOT, log=print, progress=None, cancel=None, ask_
             orig = os.path.join(dl, "z_" + s["us"])
             if not (os.path.isfile(orig) and _sha1_file(orig) == s["us"]):
                 _fetch_to(s["u"], orig, tick, s["us"], cancel, {"User-Agent": UA_BROWSER})
-            else:
-                tick(s.get("uz", 0))
             out = os.path.join(stage, f["p"])
             os.makedirs(os.path.dirname(lp(out)), exist_ok=True)
             zpatch_build(orig, out, s["set"])
@@ -1821,16 +2273,15 @@ def apply_plan(man, plan, root=ROOT, log=print, progress=None, cancel=None, ask_
         shutil.rmtree(lp(stage), ignore_errors=True)
         raise
 
-    # 5. Раскладка. Программу меняем последней.
+    # 5. Раскладка. Программу меняем последней. Если что-то сорвётся, прежние версии файлов
+    # остаются в _update/old_<время>, и при следующем запуске уходят в Корзину или в «_Старое».
     restart = False
     app_files = [f for f in need if f["p"] == EXE_NAME]
-    for f in need:
-        if f["p"] == EXE_NAME:
-            continue
-        dst = os.path.join(root, f["p"])
-        if os.path.exists(lp(dst)):
-            _move(dst, os.path.join(old_dir, f["p"]))
-        _move(os.path.join(stage, f["p"]), dst)
+    try:
+        _lay_out(need, root, stage, old_dir)
+    except Exception:
+        shutil.rmtree(lp(stage), ignore_errors=True)
+        raise
     for p in plan.get("extra", []) + plan.get("remove", []):
         if os.path.exists(lp(os.path.join(root, p))):
             log("Убираю старое: %s" % p)
@@ -1897,16 +2348,28 @@ def remove_item(item, root=ROOT, log=print):
 
 
 def cleanup_after_update():
-    """Хвосты прошлого обновления: старый exe и временные файлы."""
-    try:
-        if os.path.exists(os.path.join(ROOT, EXE_NAME + ".old")):
-            os.remove(os.path.join(ROOT, EXE_NAME + ".old"))
-    except OSError:
-        pass
+    """Хвосты прошлого обновления: старый exe, временные файлы, старые версии после прерванной раскладки."""
+    for n in (EXE_NAME,) + OLD_EXE_NAMES:
+        try:
+            if os.path.exists(os.path.join(ROOT, n + ".old")):
+                os.remove(os.path.join(ROOT, n + ".old"))
+        except OSError:
+            pass
     try:
         for name in os.listdir(UPD_DIR):
+            full = os.path.join(UPD_DIR, name)
             if name.startswith("new_") or name == "new":
-                shutil.rmtree(lp(os.path.join(UPD_DIR, name)), ignore_errors=True)
+                shutil.rmtree(lp(full), ignore_errors=True)
+            elif name.startswith("old_") and os.path.isdir(full) and not recycle(full, tries=1):
+                os.replace(full, os.path.join(ROOT, "_Старое после обновления " + name[4:]))
+            elif name.startswith("dl") or name == "archives":
+                for d, _dirs, fs in os.walk(full):
+                    for f in fs:
+                        if f.endswith(".part"):
+                            try:
+                                os.remove(os.path.join(d, f))
+                            except OSError:
+                                pass
     except OSError:
         pass
 
@@ -2061,9 +2524,10 @@ def gui():
     from tkinter import messagebox, simpledialog, filedialog
 
     cleanup_after_update()
+    tidy_old_name()
     win = tk.Tk()
     win.withdraw()
-    win.title("Minecraft: карты и сборки")
+    win.title(APP_NAME + " - карты, сборки и серверы Minecraft")
     win.geometry("1080x760")
     win.minsize(1000, 660)
     win.configure(bg=BG)
@@ -2171,9 +2635,9 @@ def gui():
     scv.pack()
     scv.create_image(0, 0, image=sp_img, anchor="nw")
     for dx, dy, color in ((2, 2, "#000000"), (0, 0, "#ffffff")):
-        scv.create_text(SW // 2 + dx, SH - 92 + dy, text="MINECRAFT", font=(FONT, 30, "bold"), fill=color)
-    scv.create_text(SW // 2 + 1, SH - 56 + 1, text="карты  ·  сборки  ·  серверы", font=(FONT, 13), fill="#000000")
-    scv.create_text(SW // 2, SH - 56, text="карты  ·  сборки  ·  серверы", font=(FONT, 13), fill="#d7deea")
+        scv.create_text(SW // 2 + dx, SH - 92 + dy, text="КУБОТЕКА", font=(FONT, 30, "bold"), fill=color)
+    scv.create_text(SW // 2 + 1, SH - 56 + 1, text="карты  ·  сборки  ·  серверы Minecraft", font=(FONT, 13), fill="#000000")
+    scv.create_text(SW // 2, SH - 56, text="карты  ·  сборки  ·  серверы Minecraft", font=(FONT, 13), fill="#d7deea")
     scv.create_rectangle(SW // 2 - 120, SH - 26, SW // 2 + 120, SH - 22, fill="#2a2d35", width=0)
     sp_bar = scv.create_rectangle(SW // 2 - 120, SH - 26, SW // 2 - 120, SH - 22, fill=ACCENT_HI, width=0)
     splash.update_idletasks()
@@ -2205,9 +2669,10 @@ def gui():
         head.create_line(0, y, 4000, y, fill=px(banner, 0, y) if BW else BG)
     banner_id = head.create_image(0, 0, image=banner, anchor="ne")
     for dx, dy, color in ((2, 2, "#000000"), (0, 0, "#ffffff")):
-        head.create_text(28 + dx, 52 + dy, text="MINECRAFT", font=(FONT, 26, "bold"), fill=color, anchor="w")
-    head.create_text(31, 89, text="карты  ·  сборки  ·  серверы", font=(FONT, 12), fill="#000000", anchor="w")
-    head.create_text(30, 88, text="карты  ·  сборки  ·  серверы", font=(FONT, 12), fill="#d7deea", anchor="w")
+        head.create_text(108 + dx, 54 + dy, text="КУБОТЕКА", font=(FONT, 26, "bold"), fill=color, anchor="w")
+    head.create_text(111, 91, text="карты  ·  сборки  ·  серверы Minecraft", font=(FONT, 12), fill="#000000", anchor="w")
+    head.create_text(110, 90, text="карты  ·  сборки  ·  серверы Minecraft", font=(FONT, 12), fill="#d7deea", anchor="w")
+    head.create_image(22, HEAD_H // 2 - 4, image=art("appicon_72.png", 1, 1), anchor="w")
     rnd = random.Random(7)
     stars = []
     for _ in range(16):
@@ -2361,16 +2826,25 @@ def gui():
         except tk.TclError:
             pass
 
-    def small_button(parent, text, cmd, bg=CARD_HI, fg=TEXT):
+    def with_icon(b, icon, text):
+        """Значок слева от надписи кнопки (картинки ic_*.png из «Оформления»)."""
+        im = art(icon, 1, 1) if icon else None
+        if im is not None and im.width() > 2:
+            b.configure(image=im, compound="left", text="  " + text)
+
+    def small_button(parent, text, cmd, bg=CARD_HI, fg=TEXT, icon=None):
         b = tk.Label(parent, text=text, font=(FONT, 10), bg=bg, fg=fg, padx=12, pady=6, cursor="hand2")
+        with_icon(b, icon, text)
         b.bind("<Button-1>", lambda e: (press_flash(b, LINE), cmd()))
         b.bind("<Enter>", lambda e: fade_color(b, "bg", LINE, 120))
         b.bind("<Leave>", lambda e: fade_color(b, "bg", bg, 180))
         return b
 
-    def big_button(parent, text, cmd, color=ACCENT, hover=ACCENT_HI):
+    def big_button(parent, text, cmd, color=ACCENT, hover=ACCENT_HI, icon=None):
         b = tk.Label(parent, text=text, font=(FONT, 11, "bold"), bg=color, fg="white",
                      padx=20, pady=7, cursor="hand2")
+        if icon:
+            with_icon(b, icon, text.lstrip("▶ ").strip())
         b.bind("<Button-1>", lambda e: (press_flash(b, hover), cmd()))
         b.bind("<Enter>", lambda e: fade_color(b, "bg", hover, 120))
         b.bind("<Leave>", lambda e: fade_color(b, "bg", color, 180))
@@ -2443,15 +2917,15 @@ def gui():
     play_btn.pack()
     foot_btns = tk.Frame(foot_row, bg=PANEL)
     foot_btns.pack(side="right", padx=(0, 10))
-    small_button(foot_btns, "Папка игры", lambda: os.startfile(MC), bg=PANEL).pack(side="right", padx=4, pady=8)
+    small_button(foot_btns, "Папка игры", lambda: os.makedirs(MC, exist_ok=True) or os.startfile(MC), bg=PANEL, icon="ic_folder.png").pack(side="right", padx=4, pady=8)
     shortcut_btn = small_button(foot_btns, "", make_shortcuts, bg=PANEL)
     shortcut_btn.pack(side="right", padx=4, pady=8)
-    small_button(foot_btns, "Проверить обновления", lambda: check_updates(manual=True), bg=PANEL).pack(
+    small_button(foot_btns, "Проверить обновления", lambda: check_updates(manual=True), bg=PANEL, icon="tab_update.png").pack(
         side="right", padx=4, pady=8)
 
     def refresh_foot():
         shortcut_btn.configure(text="Ярлык создан ✓" if shortcuts_exist() else "Создать ярлык")
-        play_btn.configure(text="▶  Запустить " + launcher_title(chosen_launcher()))
+        with_icon(play_btn, "ic_play.png", ("Открыть " if launcher_mode() == "mrpack" else "Запустить ") + launcher_title(chosen_launcher()))
 
     def badge(parent, text, color=LINE, fg=TEXT):
         return tk.Label(parent, text=text, font=(FONT, 9, "bold"), bg=color, fg=fg, padx=8, pady=2)
@@ -2505,8 +2979,16 @@ def gui():
 
     def refresh_head():
         c = current()
+        lid = chosen_launcher()
+        if launcher_mode(lid) == "mrpack":
+            now_pack.configure(text="Лаунчер: %s" % launcher_title(lid))
+            now_ver.configure(text="карты и сборки уходят в него пакетами")
+            return
         now_pack.configure(text="Моды: " + (c["name"] if c else "не выбраны через программу"))
-        now_ver.configure(text="Версия в TLauncher: %s" % (get_tlauncher_version() or "?"))
+        if lid == "tlauncher":
+            now_ver.configure(text="Версия в TLauncher: %s" % (get_tlauncher_version() or "?"))
+        else:
+            now_ver.configure(text="Лаунчер: %s" % launcher_title(lid))
 
     def clear():
         for w in inner.winfo_children():
@@ -2526,9 +3008,73 @@ def gui():
         tk.Label(tx, text=text, font=(FONT, 10), fg="#c3c7d1", bg=CARD, justify="left", anchor="w",
                  wraplength=700).pack(fill="x", pady=(6, 0))
 
+    def search_box(parent, key, hint):
+        """Поле поиска: фильтрует по мере ввода, Esc очищает. Ctrl+F ставит в него курсор."""
+        box = tk.Frame(parent, bg=CARD_HI, padx=8, pady=2, highlightthickness=1, highlightbackground=CARD_HI)
+        tk.Label(box, image=art("ic_search.png", 1, 1), bg=CARD_HI).pack(side="left")
+        e = tk.Entry(box, font=(FONT, 10), bg=CARD_HI, fg=MUTED, insertbackground=TEXT, relief="flat", width=26,
+                     highlightthickness=0, bd=0)
+        e.pack(side="left", padx=(6, 0), ipady=4)
+        q = state.get(key, "")
+        e.insert(0, q or hint)
+        if q:
+            e.configure(fg=TEXT)
+
+        def value():
+            v = e.get()
+            return "" if v == hint and e.cget("fg") == MUTED else v.strip()
+
+        def focus_in(ev=None):
+            fade_color(box, "highlightbackground", ACCENT, 150)
+            if e.cget("fg") == MUTED:
+                e.delete(0, "end")
+                e.configure(fg=TEXT)
+
+        def focus_out(ev=None):
+            fade_color(box, "highlightbackground", CARD_HI, 200)
+            if not e.get().strip():
+                e.delete(0, "end")
+                e.insert(0, hint)
+                e.configure(fg=MUTED)
+
+        def changed(ev=None):
+            v = value()
+            if v == state.get(key, ""):
+                return
+            state[key] = v
+            if state.get("_sq"):
+                win.after_cancel(state["_sq"])
+            state["_sq"] = win.after(280, lambda: (state.update(focus_search=key), show(state["tab"], animated=False)))
+
+        def clear(ev=None):
+            e.delete(0, "end")
+            changed()
+        e.bind("<FocusIn>", focus_in)
+        e.bind("<FocusOut>", focus_out)
+        e.bind("<KeyRelease>", changed)
+        e.bind("<Escape>", clear)
+        state["search_entry"] = e
+        if state.pop("focus_search", None) == key:
+            e.focus_set()
+            e.icursor("end")
+        return box
+
+    def toggle_chip(parent, text, key):
+        on = bool(state.get(key))
+        b = tk.Label(parent, text=("✓  " if on else "") + text, font=(FONT, 9, "bold"), bg=ACCENT if on else CARD_HI,
+                     fg="white" if on else TEXT, padx=11, pady=5, cursor="hand2")
+        b.bind("<Button-1>", lambda e: (state.update({key: not on}), show(state["tab"], animated=False)))
+        b.bind("<Enter>", lambda e: on or fade_color(b, "bg", LINE, 120))
+        b.bind("<Leave>", lambda e: on or fade_color(b, "bg", CARD_HI, 160))
+        return b
+
+    def matches_query(q, *fields):
+        q = (q or "").lower()
+        return not q or all(w in " ".join(str(f or "") for f in fields).lower() for w in q.split())
+
     def section(text, row, sub=""):
         f = tk.Frame(inner, bg=BG)
-        f.grid(row=row, column=0, columnspan=2, sticky="we", pady=(4, 10))
+        f.grid(row=row, column=0, columnspan=2, sticky="we", padx=(0, 14), pady=(4, 10))
         tk.Label(f, text=text, font=(FONT, 14, "bold"), fg=TEXT, bg=BG).pack(side="left")
         if sub:
             tk.Label(f, text="   " + sub, font=(FONT, 10), fg=MUTED, bg=BG).pack(side="left", pady=(3, 0))
@@ -2537,6 +3083,7 @@ def gui():
     # --- фоновые задачи, чтобы окно не зависало ---
     def run_task(title, fn, after=None):
         if state["busy"]:
+            toast("Подожди: программа ещё занята предыдущим делом.", "warn")
             return
         state["busy"] = True
         status.configure(text=title + "...", fg=GOLD)
@@ -2576,15 +3123,17 @@ def gui():
         """Окно «Всё готово» с кнопкой запуска лаунчера."""
         lid = chosen_launcher()
         name = launcher_title(lid)
-        ver = next((re.match(r"Версия в TLauncher: (.+?)(?: \(|$)", l).group(1) for l in reversed(logs)
-                    if l.startswith("Версия в TLauncher:")), None)
-        hints = []
-        if lid == "tlauncher" and not ok:
-            hints.append("TLauncher был открыт, поэтому версию «%s» выбери в нём сам (список версий внизу слева)." % ver)
-        if lid != "tlauncher" and ver:
-            hints.append("В %s выбери версию «%s»." % (name, ver))
+        mrpack = ok if isinstance(ok, str) and ok.endswith(".mrpack") else None
+        ver = next((re.search(r"(?:Версия в [^:]+|версия): (\S+)", l).group(1) for l in reversed(logs)
+                    if re.search(r"(?:Версия в [^:]+|версия): (\S+)", l)), None)
+        hints = [l[len("Подсказка: "):] for l in logs if l.startswith("Подсказка: ")]
         opened = False
-        if auto_var.get() and not (lid == "tlauncher" and not ok):
+        if mrpack:
+            hints = ["Пакет «%s» передаётся в %s: подтверди установку в его окне и запусти новый экземпляр."
+                     % (os.path.basename(mrpack)[:-7], name)]
+            if auto_var.get():
+                opened = open_mrpack(mrpack, lid)
+        elif auto_var.get() and ok:
             opened = open_launcher()
 
         t = tk.Toplevel(win)
@@ -2601,8 +3150,9 @@ def gui():
         tk.Label(top, image=pic, bg=BG).pack(side="left", anchor="n")
         info = tk.Frame(top, bg=BG, padx=18)
         info.pack(side="left", fill="both", expand=True)
-        tk.Label(info, text="Всё готово!", font=(FONT, 22, "bold"), fg=TEXT, bg=BG, anchor="w").pack(fill="x")
-        what = next((l for l in logs if l.startswith(("Карта «", "Скопировано модов"))), "")
+        tk.Label(info, text="Пакет готов!" if mrpack else "Всё готово!", font=(FONT, 22, "bold"), fg=TEXT, bg=BG,
+                 anchor="w").pack(fill="x")
+        what = next((l for l in logs if l.startswith(("Карта «", "Скопировано модов", "Пакет для лаунчера"))), "")
         tk.Label(info, text=(what + "\n" if what else "") + ("Версия: %s" % ver if ver else ""), font=(FONT, 10),
                  fg=MUTED, bg=BG, anchor="w", justify="left", wraplength=300).pack(fill="x", pady=(6, 0))
         for h in hints:
@@ -2625,13 +3175,23 @@ def gui():
 
         def go():
             t.destroy()
-            launch_now()
+            if mrpack:
+                try:
+                    open_mrpack(mrpack, lid)
+                    toast("Открываю пакет в %s." % name, "ok")
+                except Exception as e:
+                    toast("Не открылся пакет: %s. Он лежит в папке _export." % e, "err", ms=8000)
+            else:
+                launch_now()
         if opened:
             tk.Label(row, text="%s открывается..." % name, font=(FONT, 11, "bold"), fg=ACCENT_HI, bg=BG).pack(side="left")
             big_button(row, "Закрыть", t.destroy, CARD_HI, LINE).pack(side="right")
         else:
-            big_button(row, "▶  Запустить %s" % name, go).pack(side="right")
+            big_button(row, ("▶  Открыть в %s" if mrpack else "▶  Запустить %s") % name, go, icon="ic_play.png").pack(side="right")
             small_button(row, "Закрыть", t.destroy, bg=BG).pack(side="right", padx=8)
+        if mrpack:
+            small_button(row, "Папка с пакетом", lambda: subprocess.Popen(["explorer.exe", "/select,", mrpack]),
+                         bg=BG, icon="ic_folder.png").pack(side="right")
         more = small_button(row, "Подробнее, что сделано", toggle, bg=BG)
         more.pack(side="left")
         t.update_idletasks()
@@ -2654,11 +3214,15 @@ def gui():
         if game_running():
             messagebox.showwarning("Игра запущена", "Сначала закройте Minecraft, потом выбирайте карту или сборку.")
             return False
-        if tlauncher_running():
+        mode = launcher_mode()
+        busy = (mode == "tl" and tlauncher_running()) or (mode == "legacy" and process_running("LL.exe")) or \
+            (mode == "profiles" and process_running("MinecraftLauncher.exe", "SKlauncher"))
+        if busy:
+            name = launcher_title(chosen_launcher())
             return messagebox.askyesno(
-                "TLauncher открыт",
-                "TLauncher сейчас открыт и при закрытии перезапишет выбор версии.\n"
-                "Лучше закрыть его и нажать ещё раз.\n\nПродолжить всё равно?")
+                "%s открыт" % name,
+                "%s сейчас открыт и при закрытии может перезаписать выбор версии.\n"
+                "Лучше закрыть его и нажать ещё раз.\n\nПродолжить всё равно?" % name)
         return True
 
     # --- вкладка «Карты» ---
@@ -2748,6 +3312,15 @@ def gui():
     def start_map(m, pick, packs):
         if not check_game():
             return
+        pack = next((p for p in packs if p["name"] == pick), None)
+        if launcher_mode() == "mrpack":
+            def go_pack():
+                ps2 = find_packs()
+                pk = next((q for q in ps2 if pack and q["path"] == pack["path"]), None)
+                run_task("Собираю пакет «%s» для %s" % (m["title"], launcher_title(chosen_launcher())),
+                         lambda log: export_mrpack(m, pk, log), finish)
+            ensure_items(missing_items(m, pack, packs), go_pack, "Скачать «%s»" % m["title"])
+            return
         fresh = False
         if map_installed(m):
             ans = messagebox.askyesnocancel(
@@ -2787,9 +3360,17 @@ def gui():
                 t.destroy()
             run_task("Убираю «%s»" % title, lambda log: remove_item(it, log=log),
                      lambda n, logs: toast("«%s» убрана, место освобождено." % title))
-        small_button(row, "Удалить скачанное", go, bg=row["bg"]).pack(side="left", padx=(8, 0))
+        small_button(row, "Удалить скачанное", go, bg=row["bg"], icon="ic_delete.png").pack(side="left", padx=(8, 0))
 
     def enable_pack(p):
+        if launcher_mode() == "mrpack":
+            def go_pack():
+                pk = next((q for q in find_packs() if q["path"] == p["path"]), p)
+                run_task("Собираю пакет «%s» для %s" % (pk["name"].rsplit(" (", 1)[0], launcher_title(chosen_launcher())),
+                         lambda log: export_mrpack(None, pk, log), finish)
+            ensure_items(missing_items(pack=p), go_pack, "Скачать «%s»" % p["name"].rsplit(" (", 1)[0])
+            return
+
         def go():
             ps2 = find_packs()
             pk = next((q for q in ps2 if q["path"] == p["path"]), p)
@@ -2845,18 +3426,20 @@ def gui():
         var = tk.StringVar(value=m.get("recommended") if m.get("recommended") in choices else choices[0])
         dropdown(row, var, choices, BG).pack(side="left")
         big_button(row, "Скачать и играть" if miss else "Играть",
-                   lambda: (t.destroy(), start_map(m, var.get(), packs))).pack(side="right")
+                   lambda: (t.destroy(), start_map(m, var.get(), packs)),
+                   icon="ic_download.png" if miss else "ic_play.png").pack(side="right")
         remove_button(row, it, m["title"], t)
         if map_installed(m):
-            small_button(row, "Папка мира", lambda: os.startfile(os.path.join(SAVES, m["save"])),
+            small_button(row, "Папка мира", lambda: os.startfile(os.path.join(SAVES, m["save"])), icon="ic_folder.png",
                          bg=BG).pack(side="right", padx=8)
 
             def do_backup():
                 def after(path, logs):
-                    if path and messagebox.askyesno("Копия готова", "\n".join(logs) + "\n\nОткрыть папку с копиями?", parent=t):
+                    if path and messagebox.askyesno("Копия готова", "\n".join(logs) + "\n\nОткрыть папку с копиями?",
+                                                    parent=t if t.winfo_exists() else win):
                         os.startfile(os.path.dirname(path))
                 run_task("Делаю копию мира «%s»" % m["title"], lambda log: backup_world(m, log), after)
-            small_button(row, "Резервная копия", do_backup, bg=BG).pack(side="right")
+            small_button(row, "Резервная копия", do_backup, bg=BG, icon="ic_backup.png").pack(side="right")
         auto_wrap(body)
 
     def open_pack(p):
@@ -2934,8 +3517,9 @@ def gui():
             enable_pack(p)
         remove_button(row, it, p["name"].rsplit(" (", 1)[0], t)
         big_button(row, "Включена" if active else ("Скачать и включить" if miss else "Включить"), enable,
+                   icon=None if active else ("ic_download.png" if miss else "ic_check.png"),
                    color=CARD_HI if active else ACCENT, hover=LINE if active else ACCENT_HI).pack(side="right")
-        small_button(row, "Папка сборки", lambda: os.startfile(p["path"]), bg=BG).pack(side="right", padx=8)
+        small_button(row, "Папка сборки", lambda: os.startfile(p["path"]), bg=BG, icon="ic_folder.png").pack(side="right", padx=8)
         auto_wrap(body)
 
     def open_server(s):
@@ -2994,8 +3578,8 @@ def gui():
             ok = add_server_entry(s["name"], s["ip"])
             messagebox.showinfo("Сервер", "Сервер добавлен в «Сетевую игру»." if ok else "Этот сервер уже есть в списке игры.",
                                 parent=t)
-        big_button(row, "Добавить в игру", add).pack(side="right")
-        small_button(row, "Копировать адрес", copy, bg=BG).pack(side="right", padx=8)
+        big_button(row, "Добавить в игру", add, icon="ic_server.png").pack(side="right")
+        small_button(row, "Копировать адрес", copy, bg=BG, icon="ic_copy.png").pack(side="right", padx=8)
         auto_wrap(body)
 
     def clickable(widget, fn):
@@ -3017,11 +3601,16 @@ def gui():
     def build_maps():
         packs = find_packs()
         maps = find_maps()
-        section("Карты", 0, "выбери карту и с какой сборкой играть, остальное программа сделает сама")
+        head_f = section("Карты", 0, "выбери карту и сборку, остальное программа сделает сама")
+        search_box(head_f, "q_maps", "Поиск карты").pack(side="right")
         if not maps:
             empty_note(2, LIBRARY_NOTE if not library_found() else "Карт пока нет. Добавь папку с картой в «Карты».")
-        flt = tk.Frame(inner, bg=BG)
-        flt.grid(row=1, column=0, columnspan=2, sticky="we", pady=(0, 12))
+        fbox = tk.Frame(inner, bg=BG)
+        fbox.grid(row=1, column=0, columnspan=2, sticky="we", pady=(0, 12))
+        flt = tk.Frame(fbox, bg=BG)
+        flt.pack(fill="x")
+        flt2 = tk.Frame(fbox, bg=BG)
+        flt2.pack(fill="x", pady=(8, 0))
 
         def chip(parent, text, key, value):
             on = state.get(key, "all") == value
@@ -3036,10 +3625,14 @@ def gui():
         for text, v in (("Все", "all"), ("26.x", "new"), ("1.21", "1.21"), ("1.20", "1.20"), ("Старые", "old")):
             chip(flt, text, "f_version", v)
         total = len(maps)
-        maps = [m for m in maps if map_matches(m, state.get("f_players", "all"), state.get("f_version", "all"))]
-        tk.Label(flt, text="   показано %d из %d" % (len(maps), total), font=(FONT, 9), fg=MUTED, bg=BG).pack(side="left")
+        maps = [m for m in maps if map_matches(m, state.get("f_players", "all"), state.get("f_version", "all"))
+                and matches_query(state.get("q_maps"), m["title"], m.get("genre"), m.get("desc"), m.get("players"),
+                                  m.get("author"), m["version"])
+                and (not state.get("f_dl_maps") or not not_downloaded(map_item_id(m)))]
+        toggle_chip(flt2, "Только скачанные", "f_dl_maps").pack(side="left")
+        tk.Label(flt2, text="   показано %d из %d" % (len(maps), total), font=(FONT, 9), fg=MUTED, bg=BG).pack(side="left")
         if total and not maps:
-            empty_note(2, "Под этот фильтр карт нет. Нажми «Все», чтобы сбросить.")
+            empty_note(2, "Под этот фильтр карт нет. Сбрось фильтры или очисти поиск (Esc).")
         for i, m in enumerate(maps):
             c = card(inner, i % 2, 2 + i // 2)
             top = tk.Frame(c, bg=CARD)
@@ -3069,7 +3662,8 @@ def gui():
             dropdown(row, var, choices).pack(side="left")
 
             big_button(row, "Скачать и играть" if miss else "Играть",
-                       lambda m=m, var=var, packs=packs: start_map(m, var.get(), packs)).pack(side="right")
+                       lambda m=m, var=var, packs=packs: start_map(m, var.get(), packs),
+                       icon="ic_download.png" if miss else "ic_play.png").pack(side="right")
             small_button(row, "Подробнее", lambda m=m: open_map(m), bg=CARD).pack(side="right", padx=8)
             clickable(c, lambda m=m: open_map(m))
 
@@ -3093,11 +3687,29 @@ def gui():
             save_current_as(n, v, tl, "Сохранено из текущей папки mods")
             show("packs")
         small_button(head_f, "Сохранить текущие моды как сборку", save_current).pack(side="right")
+        search_box(head_f, "q_packs", "Поиск сборки или мода").pack(side="right", padx=(0, 10))
+        allp = len(packs)
 
-        if not packs:
-            empty_note(1, LIBRARY_NOTE)
+        def mod_names(p):
+            try:
+                with open(os.path.join(p["path"], "mods.json"), encoding="utf-8") as fh:
+                    return " ".join(x.get("name", "") + " " + x.get("ru", "") for x in json.load(fh).get("mods", []))
+            except Exception:
+                return ""
+        packs = [p for p in packs if matches_query(state.get("q_packs"), p["name"], p.get("description"), p["version_dir"],
+                                                    mod_names(p) if state.get("q_packs") else "")
+                 and (not state.get("f_dl_packs") or not not_downloaded(pack_item_id(p)))]
+        fl = tk.Frame(inner, bg=BG)
+        fl.grid(row=1, column=0, columnspan=2, sticky="we", pady=(0, 12))
+        toggle_chip(fl, "Только скачанные", "f_dl_packs").pack(side="left")
+        tk.Label(fl, text="   показано %d из %d" % (len(packs), allp), font=(FONT, 9), fg=MUTED, bg=BG).pack(side="left")
+        if allp and not packs:
+            empty_note(2, "Под этот фильтр сборок нет. Очисти поиск (Esc) или сними «Только скачанные».")
+
+        if not allp:
+            empty_note(2, LIBRARY_NOTE)
         for i, p in enumerate(packs):
-            c = card(inner, i % 2, 1 + i // 2)
+            c = card(inner, i % 2, 3 + i // 2)
             top = tk.Frame(c, bg=CARD)
             top.pack(fill="x")
             tk.Label(top, image=image(os.path.join(p["path"], "cover.png")), bg=CARD).pack(side="left", anchor="n")
@@ -3125,6 +3737,7 @@ def gui():
                     return
                 enable_pack(p)
             big_button(row, "Включена" if active else ("Скачать и включить" if miss else "Включить"), enable,
+                   icon=None if active else ("ic_download.png" if miss else "ic_check.png"),
                        color=CARD_HI if active else ACCENT, hover=LINE if active else ACCENT_HI).pack(side="right")
             small_button(row, "Подробнее: моды", lambda p=p: open_pack(p), bg=CARD).pack(side="right", padx=8)
             clickable(c, lambda p=p: open_pack(p))
@@ -3140,12 +3753,54 @@ def gui():
             except Exception as e:
                 messagebox.showerror("Серверы", str(e)); return
             messagebox.showinfo("Серверы", "\n".join(logs) + "\n\nОни появятся в «Сетевой игре».")
-        big_button(head_f, "Добавить все в игру", add_all).pack(side="right")
+        big_button(head_f, "Добавить все в игру", add_all, icon="ic_server.png").pack(side="right")
         if not load_servers():
             empty_note(1, LIBRARY_NOTE if not library_found() else "Список серверов пуст: нет файла servers.json.")
             return
         box = tk.Frame(inner, bg=CARD, padx=6, pady=6)
         box.grid(row=1, column=0, columnspan=2, sticky="we", padx=(0, 14))
+        srv_cache = state.setdefault("srv_status", {})
+        srv_labels = {}
+
+        def srv_text(st):
+            if st is None:
+                return "проверяю..."
+            if st.get("err"):
+                return "● не отвечает"
+            return "● %s онлайн · %d мс" % (st["online"], st["ms"])
+
+        def srv_color(st):
+            return MUTED if st is None else ("#e05a5a" if st.get("err") else ACCENT_HI)
+
+        if time.time() - state.get("srv_t", 0) > 120:
+            state["srv_t"] = time.time()
+            for k in list(srv_cache):
+                srv_cache.pop(k)
+
+            def ping_all(lst):
+                def one(sv):
+                    try:
+                        srv_cache[sv["ip"]] = server_status(sv["ip"])
+                    except Exception as e:
+                        srv_cache[sv["ip"]] = {"err": str(e)}
+                with concurrent.futures.ThreadPoolExecutor(6) as ex:
+                    list(ex.map(one, lst))
+            threading.Thread(target=ping_all, args=(load_servers(),), daemon=True).start()
+
+        def refresh_status():
+            alive = False
+            for ip, lab in srv_labels.items():
+                try:
+                    if not lab.winfo_exists():
+                        continue
+                except tk.TclError:
+                    continue
+                alive = True
+                st = srv_cache.get(ip)
+                lab.configure(text=srv_text(st), fg=srv_color(st))
+            if alive and any(srv_cache.get(ip) is None for ip in srv_labels):
+                win.after(500, refresh_status)
+        win.after(500, refresh_status)
         for i, s in enumerate(load_servers()):
             r = tk.Frame(box, bg=CARD if i % 2 else CARD_HI, padx=12, pady=8)
             r.pack(fill="x")
@@ -3153,7 +3808,13 @@ def gui():
             icon = os.path.join(ROOT, s.get("icon", ""))
             if s.get("icon") and os.path.isfile(icon):
                 tk.Label(r, image=image(icon), bg=r["bg"]).pack(side="left", padx=(0, 12))
-            tk.Label(r, text=name, font=(FONT, 11, "bold"), fg=TEXT, bg=r["bg"], width=15, anchor="w").pack(side="left")
+            nf = tk.Frame(r, bg=r["bg"])
+            nf.pack(side="left")
+            tk.Label(nf, text=name, font=(FONT, 11, "bold"), fg=TEXT, bg=r["bg"], width=15, anchor="w").pack(anchor="w")
+            st = srv_cache.get(s["ip"])
+            lab = tk.Label(nf, text=srv_text(st), font=(FONT, 8, "bold"), fg=srv_color(st), bg=r["bg"], anchor="w")
+            lab.pack(anchor="w")
+            srv_labels[s["ip"]] = lab
             tk.Label(r, text=modes, font=(FONT, 10), fg="#c3c7d1", bg=r["bg"], width=26, anchor="w").pack(side="left")
             tk.Label(r, text=s["ip"], font=("Consolas", 10), fg=ACCENT_HI, bg=r["bg"], width=23, anchor="w").pack(side="left")
             tk.Label(r, text="%s   %s" % (s.get("versions", ""), s.get("lang", "")), font=(FONT, 9),
@@ -3162,7 +3823,7 @@ def gui():
             def copy(ip=s["ip"]):
                 win.clipboard_clear(); win.clipboard_append(ip)
                 toast("Адрес скопирован: " + ip)
-            small_button(r, "Копировать адрес", copy, bg=r["bg"]).pack(side="right")
+            small_button(r, "Копировать адрес", copy, bg=r["bg"], icon="ic_copy.png").pack(side="right")
             small_button(r, "Подробнее", lambda s=s: open_server(s), bg=r["bg"]).pack(side="right")
             clickable(r, lambda s=s: open_server(s))
         tk.Label(inner, text="Как играть: выбери «Без модов» или «Только шейдеры», зайди в «Сетевую игру», "
@@ -3171,14 +3832,45 @@ def gui():
                  ).grid(row=2, column=0, columnspan=2, sticky="we", pady=(12, 0))
 
     # --- вкладка «С другом» ---
+    def net_info():
+        """Адреса Hamachi/Radmin и роутера. PowerShell отвечает до 20 с, поэтому в фоне и с кэшем на минуту."""
+        c = state.get("net_cache")
+        if c and time.time() - c["t"] < 60:
+            return c
+        if not state.get("net_loading"):
+            state["net_loading"] = True
+
+            def work():
+                res = {"vpn": vpn_addresses(), "lan": lan_ip(), "t": time.time()}
+                state["net_cache"] = res
+                state["net_loading"] = False
+            threading.Thread(target=work, daemon=True).start()
+
+            def poll():
+                if state.get("net_loading"):
+                    win.after(300, poll)
+                elif state["tab"] == "friend":
+                    show("friend", animated=False)
+            win.after(300, poll)
+        return c or {"vpn": {}, "lan": None, "t": 0, "loading": True}
+
     def build_friend():
         section("Игра с другом", 0, "свой сервер не нужен: один играет в свой мир, второй к нему подключается")
-        vpn = vpn_addresses()
+        hero = tk.Canvas(inner, height=150, bg=BG, highlightthickness=0, bd=0)
+        hero.grid(row=1, column=0, columnspan=2, sticky="we", padx=(0, 14), pady=(0, 14))
+        hero_img = art("friends_wide.png", 1, 1)
+        hid = hero.create_image(0, -20, image=hero_img, anchor="ne")
+        hero.create_text(22, 52, text="Играйте вместе", font=(FONT, 20, "bold"), fill="white", anchor="w")
+        hero.create_text(22, 88, text="Hamachi, Radmin VPN, ZeroTier или одна Wi-Fi сеть: выбери ниже и следуй шагам",
+                         font=(FONT, 10), fill="#d7deea", anchor="w")
+        hero.bind("<Configure>", lambda e: hero.coords(hid, e.width, -20))
+        nc = net_info()
+        vpn = nc["vpn"]
         if state.get("net") not in NET_KINDS:
             state["net"] = "Hamachi" if "Hamachi" in vpn or not vpn else next(iter(vpn))
         kind = state["net"]
         info = NET_SETUP[kind]
-        addr = lan_ip() if kind == LAN_KIND else vpn.get(kind)
+        addr = nc["lan"] if kind == LAN_KIND else vpn.get(kind)
         sites = {"Hamachi": "vpn.net", "Radmin VPN": "radmin-vpn.com", "ZeroTier": "zerotier.com"}
 
         def copy(text, what):
@@ -3205,13 +3897,16 @@ def gui():
             if addr:
                 tk.Label(parent, text="● %s: %s" % (kind, addr), font=(FONT, 10, "bold"), fg=ACCENT_HI,
                          bg=CARD).pack(anchor="w", pady=(6, 10))
+            elif nc.get("loading"):
+                tk.Label(parent, text="● Проверяю подключение...", font=(FONT, 10, "bold"), fg=GOLD,
+                         bg=CARD).pack(anchor="w", pady=(6, 10))
             else:
                 text = "● Нет подключения к роутеру" if kind == LAN_KIND else "● %s не включён" % kind
                 tk.Label(parent, text=text, font=(FONT, 10, "bold"), fg="#e05a5a", bg=CARD).pack(anchor="w", pady=(6, 10))
 
         # выбор сети
         sel = tk.Frame(inner, bg=BG)
-        sel.grid(row=1, column=0, columnspan=2, sticky="we", pady=(0, 12))
+        sel.grid(row=2, column=0, columnspan=2, sticky="we", pady=(0, 12))
         tk.Label(sel, text="Через что играете:", font=(FONT, 11, "bold"), fg=TEXT, bg=BG).pack(side="left", padx=(0, 10))
         for k in NET_KINDS:
             on = k == kind
@@ -3224,7 +3919,7 @@ def gui():
 
         # настройка
         setup = tk.Frame(inner, bg=CARD, padx=16, pady=14)
-        setup.grid(row=2, column=0, columnspan=2, sticky="we", padx=(0, 14), pady=(0, 14))
+        setup.grid(row=3, column=0, columnspan=2, sticky="we", padx=(0, 14), pady=(0, 14))
         tk.Label(setup, text="Настройка перед первой игрой: делают оба", font=(FONT, 14, "bold"),
                  fg=TEXT, bg=CARD, anchor="w").pack(fill="x", pady=(0, 6))
         for i, line in enumerate(info["setup"], 1):
@@ -3235,7 +3930,7 @@ def gui():
         def check():
             run_task("Проверяю настройки Windows, до 20 секунд", lambda log: network_checks(kind),
                      lambda res, logs: state.update(checks=res))
-        big_button(br, "Проверить настройки", check).pack(side="left")
+        big_button(br, "Проверить настройки", check, icon="ic_check.png").pack(side="left")
         if kind != LAN_KIND:
             small_button(br, "Открыть %s" % kind, open_net).pack(side="left", padx=(8, 0))
         small_button(br, "Открыть брандмауэр", open_firewall).pack(side="left", padx=(8, 0))
@@ -3250,7 +3945,7 @@ def gui():
                          fg=color, bg=PANEL, justify="left", anchor="w", wraplength=900).pack(fill="x", pady=1)
 
         # хост
-        host = card(inner, 0, 3)
+        host = card(inner, 0, 4)
         tk.Label(host, text="Я создаю игру", font=(FONT, 15, "bold"), fg=TEXT, bg=CARD, anchor="w").pack(fill="x")
         net_line(host)
         for i, line in enumerate([info["host"],
@@ -3264,7 +3959,7 @@ def gui():
 
         def find_game():
             run_task("Ищу твою игру", lambda log: host_setup(kind), lambda res, logs: state.update(host=res))
-        big_button(row, "Найти мою игру", find_game).pack(side="left")
+        big_button(row, "Найти мою игру", find_game, icon="ic_compass.png").pack(side="left")
         h = state.get("host")
         if h:
             box = tk.Frame(host, bg=PANEL, padx=12, pady=10)
@@ -3273,19 +3968,19 @@ def gui():
             ar = tk.Frame(box, bg=PANEL)
             ar.pack(fill="x")
             tk.Label(ar, text=h["address"], font=("Consolas", 15, "bold"), fg=ACCENT_HI, bg=PANEL).pack(side="left")
-            small_button(ar, "Копировать", lambda: copy(h["address"], "Адрес"), bg=PANEL).pack(side="right")
+            small_button(ar, "Копировать", lambda: copy(h["address"], "Адрес"), bg=PANEL, icon="ic_copy.png").pack(side="right")
             tk.Label(box, text="Код приглашения: друг вставит его, и программа сама всё настроит",
                      font=(FONT, 9), fg=MUTED, bg=PANEL).pack(anchor="w", pady=(8, 2))
             cr = tk.Frame(box, bg=PANEL)
             cr.pack(fill="x")
             field(cr, h["code"], readonly=True).pack(side="left", fill="x", expand=True, ipady=4)
-            small_button(cr, "Копировать код", lambda: copy(h["code"], "Код"), bg=PANEL).pack(side="right", padx=(8, 0))
+            small_button(cr, "Копировать код", lambda: copy(h["code"], "Код"), bg=PANEL, icon="ic_invite.png").pack(side="right", padx=(8, 0))
             tk.Label(box, text="Игра отвечает: %s, игроков %s из %s. Сборка: %s" % (
                 h["info"]["version"], h["info"]["online"], h["info"]["max"], h["pack"] or "без модов, " + str(h["tl"])),
                 font=(FONT, 9), fg=MUTED, bg=PANEL, wraplength=400, justify="left").pack(anchor="w", pady=(8, 0))
 
         # гость
-        guest = card(inner, 1, 3)
+        guest = card(inner, 1, 4)
         tk.Label(guest, text="Я подключаюсь", font=(FONT, 15, "bold"), fg=TEXT, bg=CARD, anchor="w").pack(fill="x")
         net_line(guest)
         for i, line in enumerate([info["guest"],
@@ -3313,9 +4008,11 @@ def gui():
             pk = next((p for p in find_packs() if p["name"] == pack_name), None) if pack_name else None
             ids = missing_items(pack=pk) if pk else []
             if ids:  # у друга сборка, которую ещё не скачивали: сначала скачать
-                ensure_items(ids, join, "Скачать «%s»" % pack_name.rsplit(" (", 1)[0])
+                ensure_items(ids, lambda: do_join(text), "Скачать «%s»" % pack_name.rsplit(" (", 1)[0])
                 return
+            do_join(text)
 
+        def do_join(text):
             def after(ok, logs):
                 state["join_logs"] = logs
                 if auto_var.get() and not tlauncher_running():
@@ -3324,7 +4021,7 @@ def gui():
                     toast("Готово: игра друга добавлена в «Сетевую игру».", "ok",
                           ("Запустить", launch_now), 9000)
             run_task("Подключаюсь к другу", lambda log: join_friend(text, None, log), after)
-        big_button(row2, "Подключиться", join).pack(side="left")
+        big_button(row2, "Подключиться", join, icon="ic_invite.png").pack(side="left")
         for line in state.get("join_logs", []):
             color = ACCENT_HI if "отвечает:" in line else ("#e0a45a" if "не отвечает" in line or "Внимание" in line else "#c3c7d1")
             tk.Label(guest, text=line, font=(FONT, 9), fg=color, bg=CARD, wraplength=410,
@@ -3334,7 +4031,7 @@ def gui():
                              "Сеть выбирайте одну и ту же. Если друг не подключается, у хоста первым делом "
                              "нажмите «Проверить настройки».",
                  font=(FONT, 10), fg=MUTED, bg=BG, wraplength=900, justify="left", anchor="w"
-                 ).grid(row=4, column=0, columnspan=2, sticky="we", pady=(4, 0))
+                 ).grid(row=5, column=0, columnspan=2, sticky="we", pady=(4, 0))
 
     def auto_wrap(root):
         """Перенос текста по фактической ширине: растянутые по ширине подписи не обрезаются в узком окне."""
@@ -3358,7 +4055,7 @@ def gui():
     # --- вкладка «Лаунчеры» ---
     def build_launchers():
         launchers = load_launchers()
-        section("Лаунчеры", 0, "чем запускать Minecraft: плюсы, минусы и ссылки на официальные сайты")
+        section("Лаунчеры", 0, "чем запускать Minecraft: Куботека умеет работать с каждым из них")
         if not launchers:
             empty_note(1, LIBRARY_NOTE if not library_found() else "Нет файла Лаунчеры\\launchers.json.")
             return
@@ -3373,19 +4070,47 @@ def gui():
                     win.after(250, poll); return
                 state["installed_launchers"] = box.get("found", {})
                 if state["tab"] == "launchers":
-                    show("launchers")
+                    show("launchers", animated=False)
             poll()
             installed = {}
         mine = chosen_launcher()
+        mode = launcher_mode(mine)
         info = tk.Frame(inner, bg=PANEL, padx=16, pady=12)
         info.grid(row=1, column=0, columnspan=2, sticky="we", padx=(0, 14), pady=(0, 14))
         tk.Label(info, text="Мой лаунчер: %s" % launcher_title(mine), font=(FONT, 12, "bold"), fg=TEXT, bg=PANEL,
                  anchor="w").pack(fill="x")
-        tk.Label(info, text=("Программа открывает его после выбора карты или сборки. " +
-                             ("Версию в нём она выбирает сама." if mine == "tlauncher" else
-                              "Версию в нём выбери сам: программа подскажет, какую.")) +
-                 ("" if state.get("installed_launchers") is not None else "  Ищу установленные лаунчеры..."),
+        how = {"tl": "Куботека ставит карты и моды в папку игры и сама выбирает в нём версию.",
+               "legacy": "Куботека ставит карты и моды в его папку игры и сама выбирает версию, если лаунчер закрыт.",
+               "profiles": "Куботека ставит карты и моды в папку игры и создаёт в нём профиль «Куботека» с нужной версией.",
+               "mrpack": "Куботека собирает пакет (сборка, мир карты, серверы) и передаёт его лаунчеру: "
+                         "он сам создаст экземпляр с нужной версией."}.get(mode, "")
+        tk.Label(info, text=how + ("" if state.get("installed_launchers") is not None else "   Ищу установленные лаунчеры..."),
                  font=(FONT, 10), fg=MUTED, bg=PANEL, anchor="w", justify="left", wraplength=900).pack(fill="x", pady=(4, 0))
+        if mode != "mrpack":
+            gr = tk.Frame(info, bg=PANEL)
+            gr.pack(fill="x", pady=(8, 0))
+            custom = bool(load_settings().get("game_dir"))
+            tk.Label(gr, text="Папка игры: " + MC + ("  (своя)" if custom else ""), font=(FONT, 9), fg="#c3c7d1",
+                     bg=PANEL, anchor="w").pack(side="left")
+
+            def pick_dir():
+                d = filedialog.askdirectory(parent=win, title="Папка игры (где лежат mods, saves, versions)", initialdir=MC)
+                if d:
+                    s = load_settings(); s["game_dir"] = os.path.normpath(d); save_settings(s)
+                    set_game_dir()
+                    toast("Папка игры: " + MC)
+                    show("launchers", animated=False)
+
+            def reset_dir():
+                s = load_settings(); s.pop("game_dir", None); save_settings(s)
+                set_game_dir()
+                toast("Папка игры по умолчанию: " + MC)
+                show("launchers", animated=False)
+            if custom:
+                small_button(gr, "Как у лаунчера", reset_dir, bg=PANEL).pack(side="right")
+            small_button(gr, "Другая папка...", pick_dir, bg=PANEL, icon="ic_settings.png").pack(side="right", padx=4)
+            small_button(gr, "Открыть", lambda: os.makedirs(MC, exist_ok=True) or os.startfile(MC), bg=PANEL,
+                         icon="ic_folder.png").pack(side="right", padx=4)
         for i, x in enumerate(launchers):
             c = card(inner, i % 2, 2 + i // 2)
             top = tk.Frame(c, bg=CARD)
@@ -3411,24 +4136,67 @@ def gui():
             for p in x["cons"]:
                 tk.Label(c, text="−  " + p, font=(FONT, 10), fg="#e0a45a", bg=CARD, anchor="w", justify="left",
                          wraplength=400).pack(fill="x", pady=(1, 0))
-            tk.Label(c, text="С нашей программой: " + x["compat_text"], font=(FONT, 9, "bold"), fg="#c3c7d1", bg=CARD,
-                     anchor="w", justify="left", wraplength=400).pack(fill="x", pady=(8, 8))
+            tk.Label(c, text="С Куботекой: " + x["compat_text"], font=(FONT, 9, "bold"), fg="#c3c7d1", bg=CARD,
+                     anchor="w", justify="left", wraplength=400).pack(fill="x", pady=(8, 2))
+            where = installed.get(x["id"])
+            if where and os.path.isabs(where):
+                tk.Label(c, text="Найден: " + where, font=(FONT, 8), fg=MUTED, bg=CARD, anchor="w", justify="left",
+                         wraplength=400).pack(fill="x", pady=(0, 6))
             row = tk.Frame(c, bg=CARD)
-            row.pack(fill="x", side="bottom")
+            row.pack(fill="x", side="bottom", pady=(6, 0))
 
             def make_mine(x=x):
                 s = load_settings(); s["launcher"] = x["id"]; save_settings(s)
+                set_game_dir()
                 toast("Теперь мой лаунчер: " + x["name"]); refresh_foot()
-                show("launchers")
+                show("launchers", animated=False)
 
             def site(x=x):
                 webbrowser.open(x["site"])
                 toast("Открываю официальный сайт: " + x["site"], "info")
-            big_button(row, "Скачать с сайта", site, color=CARD_HI, hover=LINE).pack(side="right")
+
+            def install(x=x):
+                def done(path, logs):
+                    state["installed_launchers"] = None
+                    if path:
+                        os.startfile(path)
+                        toast("Запускаю установщик %s. После установки вернись в Куботеку: лаунчер появится "
+                              "в списке сам." % x["name"], "ok", ms=9000)
+                last = {"t": 0}
+
+                def work(log):
+                    def prog(d):
+                        if time.time() - last["t"] > 0.4:
+                            last["t"] = time.time()
+                            log("Скачиваю установщик %s: %s" % (x["name"], fmt_mb(d)))
+                    try:
+                        return download_installer(x, log, prog)
+                    except Exception as e:
+                        log("Прямая ссылка не сработала (%s), открываю сайт" % e)
+                        webbrowser.open(x["site"])
+                        return None
+                run_task("Скачиваю установщик %s" % x["name"], work, done)
+
+            def set_path(x=x):
+                f = filedialog.askopenfilename(parent=win, title="Где лежит %s?" % x["name"],
+                                               filetypes=[("Программа", "*.exe"), ("Все файлы", "*.*")])
+                if f:
+                    s = load_settings(); s.setdefault("launcher_paths", {})[x["id"]] = os.path.normpath(f); save_settings(s)
+                    state["installed_launchers"] = None
+                    toast("Запомнила путь к %s." % x["name"])
+                    show("launchers", animated=False)
+            direct = (x.get("download") or {}).get("kind") in ("url", "github", "modrinth")
             if x["id"] in installed:
-                small_button(row, "▶ Запустить", lambda t=installed[x["id"]], n=x["name"]: (run_target(t), toast("Открываю " + n)), bg=CARD).pack(side="right", padx=6)
-            if x["id"] != mine and x["compat"] != "manual":
-                small_button(row, "Сделать моим", make_mine, bg=CARD).pack(side="left")
+                big_button(row, "Запустить", lambda t=installed[x["id"]], n=x["name"]: (run_target(t), toast("Открываю " + n)),
+                           color=CARD_HI, hover=LINE, icon="ic_play.png").pack(side="right")
+            elif direct:
+                big_button(row, "Скачать и установить", install, icon="ic_download.png").pack(side="right")
+            else:
+                big_button(row, "Скачать с сайта", site, color=CARD_HI, hover=LINE, icon="ic_globe.png").pack(side="right")
+            small_button(row, "Сайт", site, bg=CARD, icon="ic_globe.png").pack(side="right", padx=4)
+            if x["id"] != mine:
+                small_button(row, "Сделать моим", make_mine, bg=CARD, icon="ic_check.png").pack(side="left")
+            small_button(row, "Указать путь...", set_path, bg=CARD, icon="ic_settings.png").pack(side="left", padx=4)
 
     def show(key, animated=True):
         prev = state.get("tab")
@@ -3469,7 +4237,7 @@ def gui():
         def later():
             upd_bar.pack_forget()
         small_button(upd_bar, "Позже", later, bg=ubg).pack(side="right", padx=(4, 12))
-        big_button(upd_bar, "Обновить", lambda: open_update(remote)).pack(side="right", pady=6)
+        big_button(upd_bar, "Обновить", lambda: open_update(remote), icon="ic_download.png").pack(side="right", pady=6)
         if not upd_bar.winfo_ismapped():
             upd_bar.pack(fill="x", padx=24, pady=(10, 0), before=body)
 
@@ -3641,23 +4409,25 @@ def gui():
                      font=(FONT, 10), fg=TEXT, bg=PANEL, anchor="w", justify="left", wraplength=W - 110).pack(fill="x")
             br = tk.Frame(brow, bg=PANEL)
             br.pack(fill="x", pady=(8, 0))
-            small_button(br, "Открыть страницу ещё раз", lambda: webbrowser.open(a["page"]), bg=PANEL).pack(side="left")
+            small_button(br, "Открыть страницу ещё раз", lambda: webbrowser.open(a["page"]), bg=PANEL, icon="ic_globe.png").pack(side="left")
 
             def pick():
                 f = filedialog.askopenfilename(parent=t, title="Где лежит %s?" % a["name"],
                                                filetypes=[("Архив", "*.zip"), ("Все файлы", "*.*")])
                 if f:
                     box["manual"]["file"] = f
-            small_button(br, "Указать файл вручную...", pick, bg=PANEL).pack(side="left", padx=(8, 0))
+            small_button(br, "Указать файл вручную...", pick, bg=PANEL, icon="ic_folder.png").pack(side="left", padx=(8, 0))
             brow.pack(fill="x", pady=(12, 0), before=row)
 
         def ask_browser(a, err):
-            box["browser"] = (a, err)
+            seq = box.get("bseq", 0) + 1
+            box["bseq"] = seq
+            box["browser"] = (seq, a, err)
             webbrowser.open(a["page"])
             try:
                 return wait_archive_in_downloads(a, box["cancel"], manual=box["manual"])
             finally:
-                box["browser_done"] = True
+                box["browser_done"] = seq
 
         def planning():
             try:
@@ -3681,7 +4451,7 @@ def gui():
                 return
             plan = box["plan"]
             if not plan["need"] and not plan["extra"] and not plan["remove"]:
-                if not items:
+                if not items or plan.get("with_update"):
                     apply_plan(remote, plan, log=lambda m: None)
                 set_bar(1.0)
                 upd_bar.pack_forget()
@@ -3730,13 +4500,14 @@ def gui():
             def poll():
                 if th2.is_alive():
                     if t.winfo_exists():
-                        if box.get("browser") and not box.get("browser_shown"):
-                            box["browser_shown"] = True
-                            show_browser(*box["browser"])
-                        if box.pop("browser_done", None):
+                        done_seq = box.pop("browser_done", None)
+                        cur = box.get("browser")
+                        if done_seq and box.get("browser_shown") == done_seq:
                             brow.pack_forget()
-                            box["browser_shown"] = False
-                            box.pop("browser", None)
+                            box["browser_shown"] = None
+                        if cur and cur[0] != done_seq and box.get("browser_shown") != cur[0]:
+                            box["browser_shown"] = cur[0]
+                            show_browser(cur[1], cur[2])
                         if box["manual"].pop("bad", None):
                             toast("Это не тот файл: не совпала контрольная сумма.", "err")
                         if time.perf_counter() - last["t"] > 0.25:
@@ -3790,13 +4561,47 @@ def gui():
 
     # --- запуск: заставка, потом окно ---
     win._hooks = {"finish": finish, "open_update": open_update, "toast": toast, "show": show, "body": canvas}
-    show("maps", animated=False)
+    # Окно открывается там же и таким же, каким его закрыли; горячие клавиши.
+    g = settings.get("geometry", "")
+    mg = re.match(r"^(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$", g)
+    if mg:
+        gw, gh, gx, gy = (int(v) for v in mg.groups())
+        if gw >= 1000 and gh >= 660 and -50 < gx < win.winfo_screenwidth() - 200 and -10 < gy < win.winfo_screenheight() - 200:
+            win.geometry(g)
+
+    def on_close():
+        s = load_settings()
+        if win.state() == "normal":
+            s["geometry"] = win.geometry()
+        s["zoomed"] = win.state() == "zoomed"
+        s["tab"] = state["tab"]
+        save_settings(s)
+        win.destroy()
+    win.protocol("WM_DELETE_WINDOW", on_close)
+
+    def focus_search(e=None):
+        en = state.get("search_entry")
+        if state["tab"] not in ("maps", "packs"):
+            show("maps")
+            win.after(350, focus_search)
+            return
+        try:
+            en.focus_set()
+            en.select_range(0, "end")
+        except Exception:
+            pass
+    for key in ("<Control-f>", "<Control-F>", "<Control-Cyrillic_a>", "<Control-Cyrillic_A>"):
+        win.bind_all(key, focus_search)
+    for i, k in enumerate(TAB_ORDER, 1):
+        win.bind_all("<Control-Key-%d>" % i, lambda e, k=k: show(k))
+    win.bind_all("<F5>", lambda e: (state.update(installed_launchers=None, net_cache=None), show(state["tab"], animated=False)))
+    show(settings.get("tab") if settings.get("tab") in TAB_ORDER else "maps", animated=False)
 
     def reveal():
         def gone():
             splash.destroy()
             win.deiconify()
-            win.state("normal")  # Windows иногда показывает первое окно свёрнутым (зависит от того, кто запустил)
+            win.state("zoomed" if settings.get("zoomed") else "normal")  # первое окно бывает свёрнутым
             win.lift()
             try:
                 win.focus_force()
@@ -3829,6 +4634,9 @@ def gui():
 
 
 if __name__ == "__main__":
+    if migrate_old_name(sys.argv[1:]):
+        sys.exit(0)
+    set_game_dir()
     if len(sys.argv) > 1:
         cleanup_after_update()
         sys.exit(cli(sys.argv[1:]))

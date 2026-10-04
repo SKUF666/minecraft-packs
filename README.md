@@ -1,4 +1,4 @@
-# Minecraft Packs
+# Куботека
 
 Программа для Windows, которая одной кнопкой ставит карты и сборки модов Minecraft, выбирает нужную версию в TLauncher, добавляет серверы и помогает играть с другом через Hamachi или Radmin VPN.
 
@@ -6,9 +6,9 @@
 
 ## Как скачать
 
-1. Скачай **[Minecraft-Packs.zip](https://github.com/SKUF666/minecraft-packs/releases/latest/download/Minecraft-Packs.zip)**.
-2. Распакуй его в любую папку и запусти «Выбор карты и сборки.exe».
-3. Программа сама предложит скачать карты и сборки (около 1 ГБ). Моды она берёт прямо с Modrinth.
+1. Скачай **[Minecraft-Packs.zip](https://github.com/SKUF666/minecraft-packs/releases/latest/download/Kuboteka.zip)**.
+2. Распакуй его в любую папку и запусти «Куботека.exe».
+3. Выбирай карту или сборку: программа скачает её с сайта автора, моды с Modrinth и CurseForge.
 
 Потом программа сама проверяет обновления при запуске и скачивает только то, что изменилось.
 

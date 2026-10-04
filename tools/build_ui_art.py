@@ -53,3 +53,36 @@ rounded(Image.open(os.path.join(RAW, '03_ready.png')), 190, 22).save(os.path.joi
 rounded(Image.open(os.path.join(RAW, '04_update.png')), 160, 20).save(os.path.join(OUT, 'update.png'))
 rounded(Image.open(os.path.join(RAW, '05_empty.png')), 110, 16).save(os.path.join(OUT, 'empty.png'))
 print('ok', sorted(os.listdir(OUT)))
+
+
+# --- значки кнопок и иллюстрации 2026-10-05 ---
+def slice_sheet(name, names, size=18):
+    sh = Image.open(os.path.join(RAW, name)).convert('RGBA')
+    cw, ch = sh.width // 4, sh.height // 2
+    for i, n in enumerate(names):
+        cell = sh.crop(((i % 4) * cw, (i // 4) * ch, (i % 4 + 1) * cw, (i // 4 + 1) * ch))
+        bbox = cell.getchannel('A').point(lambda a: 255 if a > 24 else 0).getbbox()
+        cell = cell.crop(bbox)
+        side = max(cell.size)
+        sq = Image.new('RGBA', (side, side), (0, 0, 0, 0))
+        sq.paste(cell, ((side - cell.width) // 2, (side - cell.height) // 2), cell)
+        sq.resize((size, size), Image.LANCZOS).save(os.path.join(OUT, 'ic_%s.png' % n))
+        sq.resize((48, 48), Image.LANCZOS).save(os.path.join(OUT, 'ic_%s_48.png' % n))
+
+
+slice_sheet('11_btn_a.png', ['play', 'folder', 'backup', 'copy', 'download', 'delete', 'search', 'settings'])
+slice_sheet('12_btn_b.png', ['globe', 'check', 'cross', 'server', 'invite', 'compass', 'hourglass', 'bolt'])
+fr = Image.open(os.path.join(RAW, '13_friends.png')).convert('RGB')
+fr = fr.resize((1400, int(fr.height * 1400 / fr.width)), Image.LANCZOS)
+fr.crop((0, 385, 1400, 385 + 200)).save(os.path.join(OUT, 'friends_wide.png'))
+rounded(Image.open(os.path.join(RAW, '14_offline.png')), 110, 16).save(os.path.join(OUT, 'offline.png'))
+icon = Image.open(os.path.join(RAW, '10_appicon.png')).convert('RGBA')
+bb = icon.getchannel('A').point(lambda a: 255 if a > 20 else 0).getbbox()
+icon = icon.crop(bb)
+side = int(max(icon.size) * 1.04)
+sq = Image.new('RGBA', (side, side), (0, 0, 0, 0))
+sq.paste(icon, ((side - icon.width) // 2, (side - icon.height) // 2), icon)
+for n, sz in (('appicon_72.png', 72), ('appicon_96.png', 96)):
+    sq.resize((sz, sz), Image.LANCZOS).save(os.path.join(OUT, n))
+sq.resize((256, 256), Image.LANCZOS).save(os.path.join(os.path.dirname(OUT), 'icon.png'))
+print('значки и иллюстрации готовы')
