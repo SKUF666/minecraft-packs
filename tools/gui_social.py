@@ -97,12 +97,22 @@ def patched(self, *a):
             g.set_lobby(mine[0]['id'], {'map': 'oneblock', 'title': 'OneBlock', 'version': '26.1.2',
                                         'pack': 'Удобства и шейдеры (21)'})
             as_other(lambda: h.set_ready(mine[0]['id'], True))
+            as_other(lambda: (h.propose(mine[0]['id'], 'text', 'Строим базу на выживании'),
+                              h.propose(mine[0]['id'], 'server', 'Hypixel', {'ip': 'mc.hypixel.net'})))
+            g.propose(mine[0]['id'], 'map', 'SkyBlock', {'map': 'skyblock', 'version': '1.8.9'})
+            pr = g.proposals(mine[0]['id'])
+            sky = [x for x in pr if x['title'] == 'SkyBlock'][0]
+            g.vote(sky['id']); as_other(lambda: h.vote(sky['id']))
         as_other(lambda: (h.update_profile(avatar='preset:11', presence='dnd', mood='Строю замок',
                                             favorites=['SkyBlock']), h.post_wall(h.uid, 'Мой замок почти готов!')))
         as_other(lambda: h.post_wall(g.uid, 'Привет! Сыграем сегодня?'))
         print('обновить2:', click('Обновить'))
     at(500, profiles)
-    at(5000, lambda: (grab(self, 'prof_head'), print('профиль:', click(self_name()))))
+    at(16000, lambda: (hk['body'].yview_moveto(0.2), None))
+    at(1500, lambda: (grab(self, 'party_lobby'), print('пати:', [str(x.cget('text')) for x in walk(self) if isinstance(x, tk.Label)
+                                                               and any(k in str(x.cget('text')) for k in ('Предлож', '▲', 'предложил', 'Строим', 'Hypixel', 'SkyBlock', 'Карта пати', 'Готовы', 'Все готовы'))])))
+    at(300, lambda: (hk['body'].yview_moveto(0), None))
+    at(500, lambda: (grab(self, 'prof_head'), print('профиль:', click(self_name()))))
     at(5000, lambda: grab([w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1], 'prof_mine'))
     at(300, lambda: [w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1]._cv.yview_moveto(0.3))
     at(1500, lambda: grab([w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1], 'prof_mine2'))

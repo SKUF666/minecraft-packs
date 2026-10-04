@@ -921,6 +921,31 @@ class Social:
     def set_ready(self, pid, ready):
         self.rest("PATCH", "party_members", {"party_id": "eq." + pid, "user_id": "eq." + self.uid}, {"ready": bool(ready)})
 
+    def proposals(self, pid):
+        """Предложения пати с голосами: самые поддержанные выше, при равенстве - новые."""
+        rows = self.rest("GET", "party_proposals", {"party_id": "eq." + pid, "order": "id.desc", "limit": "20",
+                                                    "select": "id,author,kind,title,payload,created_at"}) or []
+        if rows:
+            votes = self.rest("GET", "party_votes", {"proposal_id": "in.(%s)" % ",".join(str(r["id"]) for r in rows),
+                                                     "select": "proposal_id,user_id"}) or []
+            for r in rows:
+                r["votes"] = [v["user_id"] for v in votes if v["proposal_id"] == r["id"]]
+        rows.sort(key=lambda r: (-len(r.get("votes", [])), -r["id"]))
+        return rows
+
+    def propose(self, pid, kind, title, payload=None):
+        self.rest("POST", "party_proposals", body={"party_id": pid, "author": self.uid, "kind": kind,
+                                                   "title": (title or "").strip()[:80] or "?", "payload": payload or {}})
+
+    def vote(self, prop_id, on=True):
+        if on:
+            self.rest("POST", "party_votes", body={"proposal_id": prop_id, "user_id": self.uid})
+        else:
+            self.rest("DELETE", "party_votes", {"proposal_id": "eq.%d" % prop_id, "user_id": "eq." + self.uid})
+
+    def delete_proposal(self, prop_id):
+        self.rest("DELETE", "party_proposals", {"id": "eq.%d" % prop_id})
+
     def set_lobby(self, pid, lobby):
         """Карта пати (выбирает хозяин): {map, title, version, pack}."""
         self.rest("PATCH", "parties", {"id": "eq." + pid}, {"lobby": lobby})
@@ -5719,6 +5744,10 @@ def gui():
                    lambda: (t.destroy(), start_map(m, var.get(), packs)),
                    icon="ic_download.png" if miss else "ic_play.png").pack(side="right")
         remove_button(row, it, m["title"], t)
+        if soc_data().get("sel"):
+            small_button(row, "Предложить в пати", lambda: propose_to_party(
+                "map", m["title"], {"map": m["id"], "version": m["version"], "pack": m.get("recommended")}),
+                bg=BG, icon="ic_invite.png").pack(side="right", padx=8)
         if map_installed(m):
             small_button(row, "Папка мира", lambda: os.startfile(os.path.join(SAVES, m["save"])), icon="ic_folder.png",
                          bg=BG).pack(side="right", padx=8)
@@ -5869,6 +5898,10 @@ def gui():
             messagebox.showinfo("Сервер", "Сервер добавлен в «Сетевую игру»." if ok else "Этот сервер уже есть в списке игры.",
                                 parent=t)
         big_button(row, "Добавить в игру", add, icon="ic_server.png").pack(side="right")
+        if soc_data().get("sel"):
+            small_button(row, "Предложить в пати", lambda: propose_to_party(
+                "server", s["name"], {"ip": s["ip"], "version": s.get("version")}), bg=BG, icon="ic_invite.png").pack(
+                side="right", padx=8)
         small_button(row, "Копировать адрес", copy, bg=BG, icon="ic_copy.png").pack(side="right", padx=8)
         auto_wrap(body)
 
@@ -6368,6 +6401,10 @@ def gui():
             if maps_dl:
                 big_button(row, "Скачать и играть", lambda: (t.destroy(), web_play(x, var.get() or None)),
                            icon="ic_play.png").pack(side="right")
+                if soc_data().get("sel"):
+                    small_button(row, "Предложить в пати", lambda: propose_to_party(
+                        "web", x["title"], {"url": x["url"], "version": var.get() or (x["versions"] or [None])[0]}),
+                        bg=BG, icon="ic_invite.png").pack(side="right", padx=8)
             auto_wrap(rest)
         threading.Thread(target=load, daemon=True).start()
         fill()
@@ -8296,8 +8333,9 @@ def gui():
             if r["sel"]:
                 r["party"] = next(x for x in r["parties"] if x["id"] == r["sel"])
                 r["members"] = c.members(r["sel"])
+                r["proposals"] = c.proposals(r["sel"])
             else:
-                r["party"], r["members"] = None, []
+                r["party"], r["members"], r["proposals"] = None, [], []
             return r
 
         def done(r):
@@ -8306,7 +8344,7 @@ def gui():
                           for k in r)
             if r["sel"] != d.get("sel"):
                 d.update(msgs=[], last=0)
-            old = {k: d.get(k) for k in ("loaded", "friends", "invites", "parties")}
+            old = {k: d.get(k) for k in ("loaded", "friends", "invites", "parties", "proposals", "sel")}
             d.update(r, loaded=True, err=None)
             try:
                 soc_notify(old, r)
@@ -8595,11 +8633,15 @@ def gui():
         lb_ = tk.Frame(box, bg=PANEL, padx=10, pady=8)
         lb_.pack(fill="x", pady=(4, 6))
         if lob.get("title"):
-            tk.Label(lb_, text="Карта пати: %s" % lob["title"], font=(FONT, 10, "bold"), fg=TEXT, bg=PANEL,
-                     anchor="w").pack(fill="x")
-            tk.Label(lb_, text="Minecraft %s%s" % (lob.get("version", "?"), ("  ·  сборка " + lob["pack"].rsplit(" (", 1)[0])
-                                                  if lob.get("pack") else "  ·  без модов"),
-                     font=(FONT, 9), fg=MUTED, bg=PANEL, anchor="w").pack(fill="x")
+            kind = lob.get("kind") or "map"
+            tk.Label(lb_, text={"server": "Идём на сервер: %s", "text": "Пати решила: %s", "web": "Карта пати: %s"}.get(
+                kind, "Карта пати: %s") % lob["title"], font=(FONT, 10, "bold"), fg=TEXT, bg=PANEL, anchor="w",
+                justify="left", wraplength=420).pack(fill="x")
+            sub_ = {"server": "адрес %s" % lob.get("ip", ""), "text": "идея без карты - договоритесь в чате",
+                    "web": "из интернета%s" % ("  ·  Minecraft " + lob["version"] if lob.get("version") else "")}.get(
+                kind, "Minecraft %s%s" % (lob.get("version", "?"), ("  ·  сборка " + lob["pack"].rsplit(" (", 1)[0])
+                                          if lob.get("pack") else "  ·  без модов"))
+            tk.Label(lb_, text=sub_, font=(FONT, 9), fg=MUTED, bg=PANEL, anchor="w").pack(fill="x")
         else:
             tk.Label(lb_, text="Карта пати не выбрана" + (" - выбери, во что играете" if own else " - ждём хозяина"),
                      font=(FONT, 10), fg=MUTED, bg=PANEL, anchor="w").pack(fill="x")
@@ -8610,7 +8652,8 @@ def gui():
                 menu = tk.Menu(win, tearoff=0, bg=CARD_HI, fg=TEXT, activebackground=ACCENT, activeforeground="white",
                                font=(FONT, 10), bd=0)
                 for m in find_maps():
-                    lobby = {"map": m["id"], "title": m["title"], "version": m["version"], "pack": m.get("recommended")}
+                    lobby = {"kind": "map", "map": m["id"], "title": m["title"], "version": m["version"],
+                             "pack": m.get("recommended")}
                     menu.add_command(label="  %s  (%s)  " % (m["title"], m["version"]), command=lambda lobby=lobby: soc_bg(
                         lambda: (c.set_lobby(d["sel"], lobby), c.send("Карта пати: %s" % lobby["title"], pid=d["sel"])),
                         lambda r: soc_refresh()))
@@ -8618,17 +8661,9 @@ def gui():
             cb_ = small_button(lr, "Выбрать карту" if not lob.get("title") else "Сменить карту", choose_map, bg=PANEL,
                                icon="tab_maps.png")
             cb_.pack(side="left")
-        if lob.get("map"):
-            def prepare(lob=lob):
-                m = next((x for x in find_maps() if x["id"] == lob["map"]), None)
-                if not m:
-                    toast("У тебя нет этой карты в каталоге - обнови Portalis.", "warn")
-                    return
-                pk = lob.get("pack")
-                packs = find_packs()
-                choice = pk if pk and any(x["name"] == pk for x in packs) else "%s (чистая %s)" % (NO_MODS, m["version"])
-                start_map(m, choice, packs)
-            small_button(lr, "Подготовить у себя", prepare, bg=PANEL, icon="ic_download.png").pack(side="left", padx=6)
+        if lob.get("title") and (lob.get("kind") or "map") != "text":
+            small_button(lr, "Подготовить у себя", lambda lob=lob: prepare_lobby(lob), bg=PANEL,
+                         icon="ic_download.png").pack(side="left", padx=6)
         me_ready = next((m.get("ready") for m in d["members"] if m.get("id") == c.uid), False)
         small_button(lr, "✓ Я готов" if not me_ready else "Не готов", lambda: soc_bg(
             lambda: c.set_ready(d["sel"], not me_ready), lambda r: soc_refresh()), bg=PANEL).pack(side="right")
@@ -8636,6 +8671,66 @@ def gui():
         tk.Label(lr, text=("Все готовы!" if n_ready == len(d["members"]) and n_ready > 1 else
                            "Готовы: %d из %d" % (n_ready, len(d["members"]))), font=(FONT, 9, "bold"),
                  fg=ACCENT_HI if n_ready == len(d["members"]) else GOLD, bg=PANEL).pack(side="right", padx=8)
+        # предложения «во что пойти»
+        ph = tk.Frame(box, bg=CARD)
+        ph.pack(fill="x", pady=(2, 2))
+        tk.Label(ph, text="Предложения", font=(FONT, 10, "bold"), fg=TEXT, bg=CARD).pack(side="left")
+        tk.Label(ph, text="  голосуй ▲, хозяин выбирает", font=(FONT, 8), fg=MUTED, bg=CARD).pack(side="left")
+
+        def propose_menu():
+            menu = tk.Menu(win, tearoff=0, bg=CARD_HI, fg=TEXT, activebackground=ACCENT, activeforeground="white",
+                           font=(FONT, 10), bd=0)
+            sub = tk.Menu(menu, tearoff=0, bg=CARD_HI, fg=TEXT, activebackground=ACCENT, activeforeground="white",
+                          font=(FONT, 10), bd=0)
+            for m in find_maps():
+                sub.add_command(label="  %s  (%s)  " % (m["title"], m["version"]), command=lambda m=m: propose_to_party(
+                    "map", m["title"], {"map": m["id"], "version": m["version"], "pack": m.get("recommended")}))
+            menu.add_cascade(label="  Карту из каталога Portalis  ", menu=sub)
+            menu.add_command(label="  Карту из интернета...  ", command=lambda: (
+                state.update(maps_src="web"), show("maps"),
+                toast("Открой карту («Подробнее и скриншоты») и нажми «Предложить в пати».", "info", ms=8000)))
+            srv = tk.Menu(menu, tearoff=0, bg=CARD_HI, fg=TEXT, activebackground=ACCENT, activeforeground="white",
+                          font=(FONT, 10), bd=0)
+            for sv in load_servers()[:20]:
+                srv.add_command(label="  %s  " % sv["name"], command=lambda sv=sv: propose_to_party(
+                    "server", sv["name"], {"ip": sv["ip"], "version": sv.get("version")}))
+            menu.add_cascade(label="  Сервер  ", menu=srv)
+
+            def idea():
+                n = simpledialog.askstring("Идея", "Во что пойти? (например: «строим базу на выживании»)", parent=win)
+                if n and n.strip():
+                    propose_to_party("text", n.strip()[:80])
+            menu.add_command(label="  Свою идею...  ", command=idea)
+            menu.tk_popup(pb_.winfo_rootx(), pb_.winfo_rooty() + pb_.winfo_height())
+        pb_ = small_button(ph, "Предложить ▾", propose_menu, bg=CARD, icon="ic_add.png")
+        pb_.pack(side="right")
+        kind_icon = {"map": "tab_maps.png", "web": "ic_globe.png", "server": "ic_server.png", "text": "ic_bolt.png"}
+        for pr in (d.get("proposals") or [])[:6]:
+            rw = tk.Frame(box, bg=PANEL, padx=8, pady=4)
+            rw.pack(fill="x", pady=(0, 3))
+            mine_v = c.uid in pr.get("votes", [])
+            vb = tk.Label(rw, text="▲ %d" % len(pr.get("votes", [])), font=(FONT, 9, "bold"), bg=ACCENT if mine_v else CARD_HI,
+                          fg="white" if mine_v else TEXT, padx=7, pady=2, cursor="hand2")
+            vb.pack(side="left")
+            vb.bind("<Button-1>", lambda e, pr=pr, on=not mine_v: soc_bg(lambda: c.vote(pr["id"], on), lambda r: soc_refresh()))
+            tk.Label(rw, image=art(kind_icon.get(pr["kind"], "ic_bolt.png"), 18, 18), bg=PANEL).pack(side="left", padx=(8, 4))
+            tx = tk.Frame(rw, bg=PANEL)
+            tx.pack(side="left", fill="x", expand=True)
+            tk.Label(tx, text=pr["title"], font=(FONT, 9, "bold"), fg=TEXT, bg=PANEL, anchor="w").pack(fill="x")
+            tk.Label(tx, text="предложил(а) %s" % soc_name(pr["author"]), font=(FONT, 8), fg=MUTED, bg=PANEL,
+                     anchor="w").pack(fill="x")
+            if pr["author"] == c.uid or own:
+                small_button(rw, "✕", lambda pr=pr: soc_bg(lambda: c.delete_proposal(pr["id"]), lambda r: soc_refresh()),
+                             bg=PANEL).pack(side="right")
+            if own:
+                def accept(pr=pr):
+                    lobby = lobby_from(pr)
+                    soc_bg(lambda: (c.set_lobby(d["sel"], lobby), c.send("Выбрано: %s" % pr["title"], pid=d["sel"]),
+                                    c.delete_proposal(pr["id"])), lambda r: soc_refresh())
+                small_button(rw, "Выбрать", accept, bg=PANEL, icon="ic_check.png").pack(side="right")
+        if not d.get("proposals"):
+            tk.Label(box, text="Пока никто ничего не предложил - нажми «Предложить».", font=(FONT, 9), fg=MUTED, bg=CARD,
+                     anchor="w").pack(fill="x")
         # приглашение в игру от хозяина
         if party.get("game_code") and party.get("game_at"):
             try:
@@ -8840,6 +8935,13 @@ def gui():
             if i["id"] not in was_inv:
                 toast("Тебя зовут в пати «%s»" % i["name"], "info", ("Открыть", lambda: show("friend")), 8000)
                 set_friend_badge(state.get("badge", 0) + 1)
+        if old.get("sel") and old.get("sel") == new.get("sel"):
+            seen_p = {x["id"] for x in old.get("proposals") or []}
+            for pr in new.get("proposals") or []:
+                if pr["id"] not in seen_p and pr["author"] != soc().uid:
+                    toast("%s предлагает: %s" % (soc_name(pr["author"]), pr["title"]), "info",
+                          ("Открыть", lambda: show("friend")), 9000)
+                    set_friend_badge(state.get("badge", 0) + 1)
         op = {x["id"]: x for x in old.get("parties", [])}
         for pt in new["parties"]:
             info = pt.get("game_info") or {}
@@ -8875,6 +8977,41 @@ def gui():
                 toast("%s: %s" % (f.get("nick"), m["body"][:60]), "info", ("Ответить", lambda f=f: soc_dm(f)), 9000)
                 set_friend_badge(state.get("badge", 0) + 1)
         soc_bg(lambda: c.inbox(last), done, err_toast=False)
+
+    def propose_to_party(kind, title, payload=None):
+        """Предложить пати: карту из каталога, карту из интернета, сервер или идею."""
+        c, d = soc(), soc_data()
+        if not (c.ready() and c.logged_in() and d.get("sel")):
+            toast("Сначала создай пати или вступи в неё на вкладке «Друзья».", "warn", ("Друзья", lambda: show("friend")), 7000)
+            return
+        pname = (d.get("party") or {}).get("name", "")
+        soc_bg(lambda: c.propose(d["sel"], kind, title, payload),
+               lambda r: (toast("Предложено в пати «%s»: %s" % (pname, title), "ok"), soc_refresh()))
+
+    def lobby_from(pr):
+        """Предложение -> карта пати."""
+        pl = dict(pr.get("payload") or {})
+        pl.update(kind=pr["kind"], title=pr["title"])
+        return pl
+
+    def prepare_lobby(lob):
+        """«Подготовить у себя» для любой карты пати."""
+        kind = lob.get("kind") or "map"
+        if kind == "map":
+            m = next((x for x in find_maps() if x["id"] == lob.get("map")), None)
+            if not m:
+                toast("У тебя нет этой карты в каталоге - обнови Portalis.", "warn")
+                return
+            pk = lob.get("pack")
+            packs = find_packs()
+            choice = pk if pk and any(x["name"] == pk for x in packs) else "%s (чистая %s)" % (NO_MODS, m["version"])
+            start_map(m, choice, packs)
+        elif kind == "web":
+            web_play({"url": lob["url"], "title": lob["title"], "versions": [lob["version"]] if lob.get("version") else []})
+        elif kind == "server":
+            ok = add_server_entry(lob["title"], lob["ip"])
+            toast(("Сервер «%s» добавлен в «Сетевую игру»." if ok else "Сервер «%s» уже есть в «Сетевой игре».")
+                  % lob["title"], "ok", ("Запустить", launch_now), 8000)
 
     def soc_tick():
         """Раз в минуту - «я в сети» (или «играет»), раз в 4 секунды - новые сообщения и уведомления."""

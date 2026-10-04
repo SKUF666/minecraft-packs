@@ -170,6 +170,33 @@ try:
     check(False, 'перенести себя в другую пати нельзя')
 except ps.SocialError:
     check(True, 'перенести себя в другую пати без приглашения нельзя')
+# предложения «во что пойти» и голоса
+use(b).propose(party['id'], 'text', 'Строим базу на выживании')
+use(b).propose(party['id'], 'server', 'Hypixel', {'ip': 'mc.hypixel.net'})
+use(a).propose(party['id'], 'map', 'SkyBlock', {'map': 'skyblock', 'version': '1.8.9'})
+props = use(a).proposals(party['id'])
+check(len(props) == 3, 'в пати три предложения от двух участников')
+sky = next(p_ for p_ in props if p_['title'] == 'SkyBlock')
+use(b).vote(sky['id'], True)
+use(a).vote(sky['id'], True)
+props = use(b).proposals(party['id'])
+check(props[0]['title'] == 'SkyBlock' and len(props[0]['votes']) == 2, 'голоса: SkyBlock наверху с двумя голосами')
+use(b).vote(sky['id'], False)
+check(len(use(a).proposals(party['id'])[0]['votes']) == 1, 'голос можно забрать')
+check(use(x).proposals(party['id']) == [], 'посторонний не видит предложения пати')
+try:
+    use(x).propose(party['id'], 'text', 'спам')
+    check(False, 'посторонний не должен предлагать')
+except ps.SocialError:
+    check(True, 'посторонний не может предлагать в чужой пати')
+try:
+    use(x).vote(sky['id'], True)
+    check(False, 'посторонний не должен голосовать')
+except ps.SocialError:
+    check(True, 'посторонний не может голосовать')
+idea = next(p_ for p_ in props if p_['title'] == 'Строим базу на выживании')
+use(a).delete_proposal(idea['id'])
+check(all(p_['id'] != idea['id'] for p_ in use(b).proposals(party['id'])), 'хозяин убрал чужое предложение')
 use(b).leave(party)
 check(not use(b).parties()[0], 'Б вышел из пати')
 use(a).leave(party)
