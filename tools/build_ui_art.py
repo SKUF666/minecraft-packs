@@ -134,3 +134,23 @@ for x in range(760):
         sh.putpixel((x, y), (10, 11, 15, a))
 sh.save(os.path.join(OUT, 'shade_left.png'))
 print('тень готова')
+
+
+# --- вкладка «Версии» (2026-10-04): лист значков на прозрачном фоне и широкая картинка ---
+VER_SHEET = '35_versions_icons_t.png' if os.path.isfile(os.path.join(RAW, '35_versions_icons_t.png')) else None
+if VER_SHEET:
+    sh = Image.open(os.path.join(RAW, VER_SHEET)).convert('RGBA')
+    cw, ch = sh.width // 3, sh.height // 2
+    for i, n in enumerate(['tab_versions', 'ic_versions', 'ic_java', 'ic_loader', 'ic_tag', 'ic_chest']):
+        cell = sh.crop(((i % 3) * cw, (i // 3) * ch, (i % 3 + 1) * cw, (i // 3 + 1) * ch))
+        cell = cell.crop(cell.getchannel('A').point(lambda a: 255 if a > 24 else 0).getbbox())
+        side = max(cell.size)
+        sq = Image.new('RGBA', (side, side), (0, 0, 0, 0))
+        sq.paste(cell, ((side - cell.width) // 2, (side - cell.height) // 2), cell)
+        sq.resize((26 if n.startswith('tab_') else 18,) * 2, Image.LANCZOS).save(os.path.join(OUT, n + '.png'))
+        sq.resize((48, 48), Image.LANCZOS).save(os.path.join(OUT, n + '_48.png'))
+im = Image.open(os.path.join(RAW, '34_versions_hero.png')).convert('RGB')
+im = im.resize((1400, int(im.height * 1400 / im.width)), Image.LANCZOS)
+im.crop((0, 250, 1400, 450)).save(os.path.join(OUT, 'versions_wide.png'))
+darken_left('versions_wide.png')
+print('вкладка «Версии»: картинки готовы')

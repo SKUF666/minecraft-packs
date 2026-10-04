@@ -27,8 +27,17 @@ d = json.load(open(os.path.join(ps.MC, 'launcher_profiles.json'), encoding='utf-
 check(ok and d['profiles']['portalis']['lastVersionId'] == '1.20.1', 'профиль Portalis с версией 1.20.1')
 check('mine' in d['profiles'], 'свой профиль пользователя сохранился')
 check(d['profiles']['portalis']['icon'].startswith('data:image/png;base64,'), 'у профиля значок Portalis')
-ok, hint = ps.select_version('Forge 1.20.1', 'RPG Pack', lambda *a: None)
-check('Forge' in hint and 'установщик' in hint, 'подсказка поставить Forge, если его версии нет')
+real_plan, real_apply = ps.plan_version, ps.apply_version
+ps.plan_version = lambda gv, loader, lv=None, assets=True, log=None: {'gv': gv, 'loader': loader, 'lv': lv, 'id': '%s-forge-%s' % (gv, lv)}
+ps.apply_version = lambda pl, log=None: pl['id']
+ok, hint = ps.select_version('Forge 1.20.1', 'RPG Pack', lambda *a: None, '47.4.20')
+d = json.load(open(os.path.join(ps.MC, 'launcher_profiles.json'), encoding='utf-8'))
+check(d['profiles']['portalis']['lastVersionId'] == '1.20.1-forge-47.4.20', 'нет версии Forge - Portalis ставит её сам и выбирает: '
+      + d['profiles']['portalis']['lastVersionId'])
+ps.apply_version = lambda pl, log=None: (_ for _ in ()).throw(RuntimeError('нет интернета'))
+ok, hint = ps.select_version('Forge 1.20.1', 'RPG Pack', lambda *a: None, '47.4.20')
+check('Forge' in hint and 'установщик' in hint, 'не скачалось - подсказка поставить Forge')
+ps.plan_version, ps.apply_version = real_plan, real_apply
 
 # 2. Legacy Launcher: login.version в tl.properties, папка игры из minecraft.gamedir.
 props = os.path.join(tmp, 'tl.properties')

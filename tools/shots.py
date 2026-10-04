@@ -29,7 +29,7 @@ def patched(self, *a):
     seq = []
     if not ONLY:
         seq += [('splash', 450)]
-    seq += [('maps', 2300), ('packs', 900), ('builder', 5000), ('skins', 6000), ('servers', 900), ('friend', 900), ('launchers', 3500),
+    seq += [('maps', 2300), ('packs', 900), ('builder', 5000), ('skins', 6000), ('versions', 3000), ('servers', 900), ('friend', 900), ('launchers', 3500),
             ('done', 900), ('toast', 900), ('update', 4000)]
     if ONLY:
         seq = [s for s in seq if s[0] in ONLY.split(',')]

@@ -21,6 +21,7 @@ import struct
 import threading
 import subprocess
 import urllib.request
+import http.client
 # Всё нужное грузим сразу: exe из PyInstaller подгружает модули из самого себя по ходу работы,
 # и после самообновления (exe подменён новым) поздняя подгрузка читала бы уже чужой файл.
 import zipfile
@@ -513,7 +514,7 @@ def switch(pack, packs, copy_configs=True, log=print):
         log("Серверы не добавлены: %s" % e)
 
     # 4. Версия в «моём» лаунчере и отметка активной сборки.
-    ok, hint = select_version(pack.get("tl_version", ""), pack["name"].rsplit(" (", 1)[0], log)
+    ok, hint = select_version(pack.get("tl_version", ""), pack["name"].rsplit(" (", 1)[0], log, pack.get("loader_version"))
     if hint:
         log("Подсказка: " + hint)
     os.makedirs(MODS, exist_ok=True)
@@ -625,6 +626,391 @@ def install_map(m, pack=None, fresh=False, packs=None, log=print):
     if hint:
         log("Подсказка: " + hint)
     return ok
+
+
+# ---------- карты из интернета (каталог minecraft-inside.ru) ----------
+# Список, описание, скриншоты и файлы берутся со страниц сайта; скачивается файл автора с самого сайта
+# (как в браузере), мир раскладывается в saves. Сайт ничего у себя не меняет: только чтение страниц.
+
+MI = "https://minecraft-inside.ru"
+MI_CATS = [(None, "Все"), ("games", "Мини-игры"), ("horror", "Хоррор"), ("parkour", "Паркур"),
+           ("survival", "Выживание"), ("skyblock", "Скайблок"), ("adventure", "Приключения"), ("pvp", "PvP"),
+           ("puzzles", "Головоломки"), ("finding", "Найди кнопку"), ("simulators", "Симуляторы"), ("dropper", "Дроппер"),
+           ("zombie", "Зомби"), ("trials", "Испытания"), ("ctm", "CTM"), ("cities", "Города"), ("houses", "Дома"),
+           ("buildings", "Постройки"), ("terraforming", "Местности"), ("russian", "Русские"), ("mods", "С модами")]
+MI_SORTS = [(None, "Новые"), ("visits", "Популярные"), ("rating", "Лучшие"), ("comments", "Обсуждаемые")]
+MI_VERSIONS = ["26.2", "26.1.2", "1.21.11", "1.21.8", "1.21.4", "1.21.1", "1.20.4", "1.20.1", "1.19.2", "1.18.2",
+               "1.16.5", "1.12.2"]
+SEVEN_ZIP = [r"C:\Program Files\7-Zip\7z.exe", r"C:\Program Files (x86)\7-Zip\7z.exe"]
+_MI_PAGES = {}
+
+
+def _html_text(h):
+    """HTML -> текст с абзацами и пунктами."""
+    h = re.sub(r"(?is)<(script|style).*?</\1>", "", h)
+    h = re.sub(r"(?i)<li[^>]*>", "\n• ", h)
+    h = re.sub(r"(?i)<br\s*/?>|</p>|</li>|</div>|</h\d>", "\n", h)
+    h = re.sub(r"<[^>]+>", "", h)
+    for a, b in (("&nbsp;", " "), ("&quot;", '"'), ("&laquo;", "«"), ("&raquo;", "»"), ("&mdash;", "—"),
+                 ("&ndash;", "–"), ("&#039;", "'"), ("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">")):
+        h = h.replace(a, b)
+    lines = [re.sub(r"[ \t]+", " ", x).strip() for x in h.splitlines()]
+    out = []
+    for x in lines:
+        if x or (out and out[-1]):
+            out.append(x)
+    return "\n".join(out).strip()
+
+
+def _mi_abs(u):
+    return u if u.startswith("http") else MI + u
+
+
+def _title_versions(title):
+    """«The magic fishing [1.21.11] [1.20.1]» -> («The magic fishing», ['1.21.11', '1.20.1'])."""
+    vers = re.findall(r"\[([0-9][0-9.]*[0-9x])\]", title)
+    clean = re.sub(r"\s*\[[^\]]*\]", "", title).strip()
+    return clean or title, vers
+
+
+def mi_list(page=1, cat=None, version=None, sort=None, query=None):
+    """Страница каталога карт: ([карта, ...], есть ли следующая страница)."""
+    path = "/maps/" + ("%s/" % cat if cat and not query else "%s/" % version if version and not query else "")
+    if page > 1:
+        path += "page/%d/" % page
+    params = {}
+    if query:
+        params["q"] = query
+    if sort and not query:
+        params["sort"] = sort
+    url = MI + path + ("?" + urllib.parse.urlencode(params) if params else "")
+    html = _get(url, 30, 3, {"User-Agent": UA_BROWSER}).decode("utf-8", "ignore")
+    out = []
+    for chunk in html.split('class="box box_grass post')[1:]:
+        m = re.search(r'<h2 class="box__title"><a href="(/maps/(\d+)-[^"]+\.html)">(.*?)</a>', chunk, re.S)
+        if not m:
+            continue
+        title, vers = _title_versions(_html_text(m.group(3)))
+        cover = re.search(r'class="post__cover"><img[^>]*src="([^"]+)"', chunk)
+        desc = re.search(r'class="post__cover">.*?</a>\s*(?:<br\s*/?>)?(.*?)</div>', chunk, re.S)
+        author = re.search(r"Автор:.*?<a [^>]*>([^<]+)</a>", chunk, re.S)
+        views = re.search(r"Просмотров: ([\d\s\xa0]+)", chunk)
+        date = re.search(r'post__time">([^<]+)<', chunk)
+        out.append({"id": m.group(2), "url": _mi_abs(m.group(1)), "title": title, "versions": vers,
+                    "cover": _mi_abs(cover.group(1)) if cover else None,
+                    "desc": _html_text(desc.group(1))[:400] if desc else "",
+                    "author": author.group(1).strip() if author else "",
+                    "views": int(re.sub(r"\D", "", views.group(1)) or 0) if views else 0,
+                    "date": date.group(1).strip() if date else "", "ru": "icon_ru" in chunk})
+    has_next = ("page/%d/" % (page + 1)) in html
+    return out, has_next
+
+
+_MI_LOCKS = {}
+_MI_LOCK = threading.Lock()
+
+
+def mi_page(url):
+    """Страница карты: описание, как играть, скриншоты (маленькие и большие) и файлы для скачивания.
+    Кэш: в памяти и на диске на 3 дня."""
+    if url in _MI_PAGES:
+        return _MI_PAGES[url]
+    with _MI_LOCK:
+        lock = _MI_LOCKS.setdefault(url, threading.Lock())
+    with lock:
+        if url in _MI_PAGES:
+            return _MI_PAGES[url]
+        cache = os.path.join(_web_dir("pages"), hashlib.sha1(url.encode("utf-8")).hexdigest()[:20] + ".json")
+        try:
+            if time.time() - os.path.getmtime(cache) < 3 * 86400:
+                with open(cache, encoding="utf-8") as fh:
+                    _MI_PAGES[url] = json.load(fh)
+                    return _MI_PAGES[url]
+        except (OSError, ValueError):
+            pass
+        info = _mi_page_fetch(url)
+        try:
+            with open(cache, "w", encoding="utf-8") as fh:
+                json.dump(info, fh, ensure_ascii=False)
+        except OSError:
+            pass
+        return info
+
+
+def _mi_page_fetch(url):
+    html = _get(url, 30, 3, {"User-Agent": UA_BROWSER}).decode("utf-8", "ignore")
+    h1 = re.search(r'<h1 class="box__title">(.*?)</h1>', html, re.S)
+    title, vers = _title_versions(_html_text(h1.group(1)) if h1 else "")
+    body = html[h1.end():] if h1 else html
+    main = re.search(r'<img[^>]*src="(/uploads/files/[^"]+)"', body)
+    shots = [(_mi_abs(a), _mi_abs(big or a)) for a, big in
+             re.findall(r'<img src="(/uploads/files/[^"]*/mini/[^"]+)"(?: data-big="([^"]+)")?', body)]
+    sections = {}
+    for m in re.finditer(r"<h2>(.*?)</h2>(.*?)(?=<h2>|<div class=\"dl-filter\"|<div class=\"box__footer|$)", body, re.S):
+        name = _html_text(m.group(1))
+        if name.startswith("Скриншоты"):
+            continue
+        sections[name] = _html_text(m.group(2))
+    downloads = []
+    for row in re.findall(r'<tr class="dl__row">(.*?)</tr>', body, re.S):
+        link = re.search(r'<td class="dl__info"[^>]*>\s*<a href="([^"]+)"', row)
+        name = re.search(r'class="dl__name">(.*?)</span>', row, re.S)
+        size = re.search(r'class="dl__size">(.*?)</td>', row, re.S)
+        if link:
+            n = _html_text(name.group(1)) if name else ""
+            downloads.append({"url": link.group(1), "name": n, "size": _html_text(size.group(1)) if size else "",
+                              "versions": re.findall(r"\d+\.\d+(?:\.\d+)?", n),
+                              "kind": "rp" if re.search(r"(?i)ресурс|текстур|resource", n) else
+                              "mod" if re.search(r"(?i)\bмод|forge|fabric", n) else "map"})
+    info = {"url": url, "title": title, "versions": vers, "main": _mi_abs(main.group(1)) if main else None,
+            "shots": shots, "sections": sections, "downloads": downloads,
+            "mods": any(d["kind"] == "mod" for d in downloads)}
+    _MI_PAGES[url] = info
+    return info
+
+
+def mi_pick_download(info, want=None):
+    """Какой файл карты брать: под нужную версию игры, иначе самый первый файл с картой."""
+    maps = [d for d in info["downloads"] if d["kind"] == "map"] or \
+        [d for d in info["downloads"] if d["kind"] != "rp"]
+    if not maps:
+        return None, []
+    pick = next((d for d in maps if want and want in d["versions"]), maps[0])
+    gv = (pick["versions"] or info["versions"] or [None])[0]
+    rps = [d for d in info["downloads"] if d["kind"] == "rp" and (not d["versions"] or not gv or gv in d["versions"])]
+    return dict(pick, gv=gv), rps[:1]
+
+
+def direct_link(url):
+    """Прямая ссылка на файл для известных хостингов; None - качать только через браузер."""
+    u = urllib.parse.urlsplit(url)
+    host = u.netloc.lower().replace("www.", "")
+    if host == "minecraft-inside.ru":
+        return url
+    if host in ("drive.google.com", "docs.google.com"):
+        m = re.search(r"/d/([\w-]{10,})", url) or re.search(r"[?&]id=([\w-]{10,})", url)
+        if m:
+            return "https://drive.usercontent.google.com/download?id=%s&export=download&confirm=t" % m.group(1)
+    if host in ("disk.yandex.ru", "yadi.sk", "disk.yandex.com"):
+        try:
+            j = json.loads(_get("https://cloud-api.yandex.net/v1/disk/public/resources/download?public_key="
+                                + urllib.parse.quote(url, safe=""), 20, 2).decode("utf-8"))
+            return j.get("href")
+        except Exception:
+            return None
+    if host.endswith("dropbox.com"):
+        return url.replace("dl=0", "dl=1") if "dl=0" in url else url + ("&" if "?" in url else "?") + "dl=1"
+    if host.endswith("mediafire.com"):
+        try:
+            h = _get(url, 20, 2, {"User-Agent": UA_BROWSER}).decode("utf-8", "ignore")
+            m = re.search(r'href="(https?://download[^"]+mediafire\.com/[^"]+)"', h)
+            return m.group(1) if m else None
+        except Exception:
+            return None
+    return None
+
+
+def _web_dir(*parts):
+    d = os.path.join(ROOT, "_update", "web", *parts)
+    os.makedirs(lp(d), exist_ok=True)
+    return d
+
+
+def web_image(url, size, key=None):
+    """Картинка с сайта -> PIL, вписанная в size=(ш, в), с кэшем на диске."""
+    key = key or hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
+    p = os.path.join(_web_dir("img"), "%s_%dx%d.png" % (key, size[0], size[1]))
+    if os.path.isfile(p):
+        return PILImage.open(p).convert("RGBA")
+    im = PILImage.open(io.BytesIO(_get(url, 30, 2, {"User-Agent": UA_BROWSER, "Referer": MI + "/"}))).convert("RGBA")
+    im.thumbnail(size, PILImage.LANCZOS)
+    im.save(p)
+    return im
+
+
+def _extract_archive(path, dst):
+    """zip, а если стоит 7-Zip - ещё rar и 7z."""
+    if zipfile.is_zipfile(lp(path)):
+        with zipfile.ZipFile(lp(path)) as z:
+            for info in z.infolist():
+                name = zip_member_name(info).replace("\\", "/")
+                if info.is_dir() or name.startswith("/") or ".." in name.split("/"):
+                    continue
+                out = os.path.join(dst, *name.split("/"))
+                os.makedirs(os.path.dirname(lp(out)), exist_ok=True)
+                with z.open(info) as src, open(lp(out), "wb") as fh:
+                    shutil.copyfileobj(src, fh)
+        return
+    exe = next((x for x in SEVEN_ZIP if os.path.isfile(x)), None)
+    if not exe:
+        raise RuntimeError("архив не zip; чтобы открыть rar или 7z, поставь бесплатный 7-Zip (7-zip.org)")
+    r = subprocess.run([exe, "x", "-y", "-o" + dst, path], capture_output=True, creationflags=0x08000000)
+    if r.returncode:
+        raise RuntimeError("7-Zip не смог распаковать архив (код %d)" % r.returncode)
+
+
+def _find_worlds(root):
+    """Папки миров внутри распакованного архива (где лежит level.dat), верхние уровни."""
+    found = []
+    for d, dirs, files in os.walk(root):
+        if "level.dat" in files:
+            found.append(d)
+            dirs[:] = []
+    return found
+
+
+def enable_resource_pack(fname, log=print):
+    """Включает ресурс-пак в options.txt (если игра уже запускалась и файл есть)."""
+    opt = os.path.join(MC, "options.txt")
+    if not os.path.isfile(opt):
+        return False
+    with open(opt, encoding="utf-8", errors="ignore") as fh:
+        lines = fh.read().splitlines()
+    entry = "file/" + fname
+    for i, line in enumerate(lines):
+        if line.startswith("resourcePacks:"):
+            try:
+                lst = json.loads(line.split(":", 1)[1])
+            except Exception:
+                lst = ["vanilla"]
+            if entry not in lst:
+                lst.append(entry)
+                lines[i] = "resourcePacks:" + json.dumps(lst, ensure_ascii=False)
+            break
+    else:
+        lines.append("resourcePacks:" + json.dumps(["vanilla", entry], ensure_ascii=False))
+    with open(opt, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    log("Ресурс-пак «%s» включён в настройках игры" % fname)
+    return True
+
+
+def wait_new_download(since, cancel=None, timeout=900):
+    """Ждёт, пока в «Загрузках» появится новый архив (скачанный человеком в браузере). Путь или None."""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if cancel and cancel.is_set():
+            return None
+        try:
+            d = downloads_dir()
+            for f in sorted(os.listdir(d), key=lambda f: -os.path.getmtime(os.path.join(d, f))):
+                p = os.path.join(d, f)
+                if f.lower().endswith((".zip", ".rar", ".7z")) and os.path.getmtime(p) > since:
+                    s1 = os.path.getsize(p)
+                    time.sleep(1.5)
+                    if os.path.getsize(p) == s1:
+                        return p
+                    break
+        except OSError:
+            pass
+        time.sleep(2)
+    return None
+
+
+def web_maps_installed():
+    try:
+        with open(os.path.join(ROOT, "_web_maps.json"), encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def install_web_map(info, want=None, fresh=False, log=print, progress=None, cancel=None, browser_download=None):
+    """Скачивает карту со страницы сайта и ставит мир в saves, ресурс-пак - в resourcepacks.
+    Возвращает (версия игры, имя сохранения)."""
+    dl, rps = mi_pick_download(info, want)
+    if not dl:
+        raise RuntimeError("на странице карты нет файла для скачивания")
+    work = _web_dir("maps", re.sub(r"\D", "", info["url"])[:12] or "map")
+    arc = os.path.join(work, "map.bin")
+    log("Скачиваю «%s»: %s" % (info["title"], dl["name"] or dl["size"]))
+    direct = direct_link(dl["url"])
+    got = False
+    if direct:
+        try:
+            hdr = {"User-Agent": UA_BROWSER}
+            if "minecraft-inside.ru" in direct:  # Google Диск с Referer показывает «проверку на вирусы» вместо файла
+                hdr["Referer"] = info["url"]
+            _fetch_to(direct, arc, progress, None, cancel, hdr)
+            got = zipfile.is_zipfile(lp(arc)) or open(lp(arc), "rb").read(4)[:2] in (b"Ra", b"7z")
+        except Exception as e:
+            log("Напрямую не скачалось (%s), открываю ссылку в браузере" % str(e)[:80])
+    if not got:
+        if not browser_download:
+            raise RuntimeError("файл лежит на %s - его можно скачать только через браузер"
+                               % urllib.parse.urlsplit(dl["url"]).netloc)
+        found = browser_download(dl["url"])
+        if not found:
+            raise RuntimeError("файл карты не появился в «Загрузках»")
+        shutil.copy2(found, arc)
+    tmp = os.path.join(work, "unpacked")
+    shutil.rmtree(lp(tmp), ignore_errors=True)
+    os.makedirs(lp(tmp))
+    _extract_archive(arc, tmp)
+    worlds = _find_worlds(tmp)
+    if not worlds:
+        inner = [os.path.join(d, f) for d, _, fs in os.walk(tmp) for f in fs if f.lower().endswith((".zip", ".rar", ".7z"))]
+        for i, a in enumerate(inner[:3]):  # архив в архиве
+            _extract_archive(a, os.path.join(tmp, "_inner%d" % i))
+        worlds = _find_worlds(tmp)
+    if not worlds:
+        raise RuntimeError("в архиве нет мира (level.dat). Возможно, это не карта, а мод или постройка - "
+                           "открой страницу карты и посмотри, как её ставить.")
+    src = worlds[0]
+    save = _safe_name(info["title"]) or "Карта"
+    os.makedirs(SAVES, exist_ok=True)
+    dst = os.path.join(SAVES, save)
+    if os.path.isdir(dst) and fresh:
+        backup = "%s (старое сохранение %s)" % (save, time.strftime("%Y-%m-%d %H-%M-%S"))
+        os.rename(dst, os.path.join(SAVES, backup))
+        log("Старое сохранение переименовано в «%s»" % backup)
+    if not os.path.isdir(dst):
+        n = copy_long(src, dst + ".portalis-tmp")
+        os.replace(lp(dst + ".portalis-tmp"), lp(dst))
+        log("Карта «%s» установлена, файлов: %d" % (info["title"], n))
+    else:
+        log("Карта «%s» уже установлена, продолжаешь своё сохранение" % info["title"])
+    for rp in rps:
+        rpath = os.path.join(work, "rp.bin")
+        if not direct_link(rp["url"]):
+            log("Ресурс-пак лежит на внешнем сайте: скачай его со страницы карты, если он нужен")
+            continue
+        rd = direct_link(rp["url"])
+        _fetch_to(rd, rpath, None, None, cancel, dict({"User-Agent": UA_BROWSER},
+                                                      **({"Referer": info["url"]} if "minecraft-inside.ru" in rd else {})))
+        fname = _safe_name(info["title"]) + " - ресурспак.zip"
+        os.makedirs(os.path.join(MC, "resourcepacks"), exist_ok=True)
+        shutil.copy2(rpath, os.path.join(MC, "resourcepacks", fname))
+        log("Ресурс-пак положен в resourcepacks: %s" % fname)
+        enable_resource_pack(fname, log)
+    shutil.rmtree(lp(tmp), ignore_errors=True)
+    gv = dl.get("gv")
+    reg = web_maps_installed()
+    reg[info["url"]] = {"title": info["title"], "save": save, "version": gv, "time": time.time()}
+    with open(os.path.join(ROOT, "_web_maps.json"), "w", encoding="utf-8") as fh:
+        json.dump(reg, fh, ensure_ascii=False, indent=1)
+    return gv, save
+
+
+def real_game_version(gv):
+    """«1.21.x» -> свежий релиз этой линейки (1.21.11); обычная версия - как есть."""
+    if gv and gv.endswith(".x"):
+        pre = gv[:-1]
+        try:
+            return next(v["id"] for v in mojang_versions() if v["type"] == "release" and v["id"].startswith(pre))
+        except (StopIteration, Exception):
+            return gv[:-2]
+    return gv
+
+
+def map_page_url(m):
+    """Страница карты из каталога на сайте автора (для скриншотов): из описи (archives) или map.json."""
+    if m.get("page"):
+        return m["page"]
+    for a in load_local_manifest().get("archives", []):
+        if a.get("id") == m.get("id") and "minecraft-inside.ru/maps/" in (a.get("page") or ""):
+            return a["page"]
+    return None
 
 
 # ---------- игра с другом через Hamachi / Radmin VPN ----------
@@ -1260,13 +1646,42 @@ def set_launcher_profile(version, title):
     return True
 
 
-def select_version(version, title="", log=print):
-    """Выбирает версию в «моём» лаунчере. Возвращает (получилось, подсказка человеку)."""
+def version_spec(version, lv=None):
+    """Имя версии (в том числе как его пишет TLauncher: «Forge 1.20.1») -> (версия игры, загрузчик, версия загрузчика)."""
+    if re.match(r"^\d+(\.\d+)+$", version):
+        return version, "vanilla", None
+    m = re.match(r"^(Forge|NeoForge|Fabric|Quilt) (\d\S*)$", version)
+    if m:
+        return m.group(2), m.group(1).lower(), lv
+    m = re.match(r"^(fabric|quilt)-loader-(\d[^-]*)-(\d\S*)$", version)
+    if m:
+        return m.group(3), m.group(1), m.group(2)
+    m = re.match(r"^(\d[\d.]*)-forge-(\S+)$", version)
+    if m:
+        return m.group(1), "forge", m.group(2)
+    m = re.match(r"^neoforge-(\S+)$", version)
+    if m:
+        return None
+    return None
+
+
+def select_version(version, title="", log=print, lv=None):
+    """Выбирает версию в «моём» лаунчере. Возвращает (получилось, подсказка человеку).
+    Официальному лаунчеру и Legacy Launcher недостающую версию (Forge, NeoForge, Fabric) Portalis скачивает сам."""
     lid = chosen_launcher()
     mode = launcher_mode(lid)
     name = launcher_title(lid)
     vdir = os.path.join(MC, "versions", version)
     missing = not os.path.isfile(os.path.join(vdir, version + ".json"))
+    spec = version_spec(version, lv) if missing and mode in ("profiles", "legacy") else None
+    if spec and spec[1] != "vanilla":
+        try:
+            log("Версии «%s» нет в папке игры - скачиваю %s %s" % (version, LOADER_TITLES[spec[1]], spec[0]))
+            pl = plan_version(spec[0], spec[1], spec[2], assets=False, log=log)
+            version = apply_version(pl, log=log)
+            missing = False
+        except Exception as e:
+            log("Версию скачать не вышло: %s" % e)
     if mode == "tl":
         ok = set_tlauncher_version(version)
         log("Версия в TLauncher: %s%s" % (version, "" if ok else " (TLauncher открыт, выбери версию в нём вручную)"))
@@ -2618,7 +3033,8 @@ def loader_version(loader, gv):
         return st[0]["loader"]["version"]
     if loader == "quilt":
         lst = json.loads(_get("https://meta.quiltmc.org/v3/versions/loader/%s" % gv).decode("utf-8"))
-        return lst[0]["loader"]["version"]
+        st = [x for x in lst if not re.search(r"beta|alpha|pre|rc", x["loader"]["version"])] or lst
+        return st[0]["loader"]["version"]
     if loader == "forge":
         pr = json.loads(_get("https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json").decode("utf-8"))
         v = pr["promos"].get("%s-recommended" % gv) or pr["promos"].get("%s-latest" % gv)
@@ -2635,6 +3051,442 @@ def loader_version(loader, gv):
             raise RuntimeError("для %s нет NeoForge" % gv)
         return (stable or cand)[-1]
     raise RuntimeError("неизвестный загрузчик " + loader)
+
+
+# ---------- версии игры без лаунчера ----------
+# Всё, что нужно для запуска версии, скачивается с серверов Mojang, Fabric, Quilt, Forge и NeoForge прямо
+# в папку игры: описание версии, клиент, библиотеки, звуки и текстуры (assets) и Java той версии, которую
+# просит игра. Forge и NeoForge ставятся своим установщиком (java -jar installer.jar --installClient).
+
+JAVA_RUNTIMES = ("https://launchermeta.mojang.com/v1/products/java-runtime/"
+                 "2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json")
+ASSETS_URL = "https://resources.download.minecraft.net/"
+VERSION_LOADERS = [("vanilla", "Без модов"), ("fabric", "Fabric"), ("quilt", "Quilt"), ("forge", "Forge"),
+                   ("neoforge", "NeoForge")]
+_MOJANG = {}
+
+
+def mojang_versions():
+    """Версии Mojang (новые сверху): [{id, type: release/snapshot/old_beta..., url, sha1, releaseTime}]."""
+    if "list" not in _MOJANG:
+        _MOJANG["list"] = json.loads(_get(MANIFEST, 30, 4).decode("utf-8"))["versions"]
+    return _MOJANG["list"]
+
+
+def _rules_ok(rules):
+    """Правила Mojang для библиотек: подходит ли файл для Windows 64-бит в обычном режиме."""
+    if not rules:
+        return True
+    ok = False
+    for r in rules:
+        o = r.get("os") or {}
+        hit = not r.get("features") and o.get("name", "windows") == "windows" and o.get("arch") != "x86"
+        if hit:
+            ok = r.get("action") == "allow"
+    return ok
+
+
+def _maven_path(name):
+    """net.fabricmc:fabric-loader:0.16.5 -> net/fabricmc/fabric-loader/0.16.5/fabric-loader-0.16.5.jar"""
+    parts = name.split(":")
+    ext = "jar"
+    if "@" in parts[-1]:
+        parts[-1], ext = parts[-1].split("@", 1)
+    g, a, v = parts[0], parts[1], parts[2]
+    cls = "-" + parts[3] if len(parts) > 3 else ""
+    return "%s/%s/%s/%s-%s%s.%s" % (g.replace(".", "/"), a, v, a, v, cls, ext)
+
+
+def _lib_path(rel):
+    return os.path.join(MC, "libraries", *rel.split("/"))
+
+
+def _lib_tasks(info):
+    """Библиотеки версии: [(url, путь, sha1, размер)]. Файлы без ссылки (их делает установщик Forge) - отдельно."""
+    out, made = [], []
+    for lib in info.get("libraries", []):
+        if not _rules_ok(lib.get("rules")):
+            continue
+        dl = lib.get("downloads") or {}
+        art = dl.get("artifact")
+        if art is not None:
+            rel = art.get("path") or _maven_path(lib["name"])
+            if art.get("url"):
+                out.append((art["url"], _lib_path(rel), art.get("sha1"), art.get("size", 0)))
+            else:
+                made.append(_lib_path(rel))
+        elif not dl and lib.get("name"):
+            rel = _maven_path(lib["name"])
+            base = (lib.get("url") or "https://libraries.minecraft.net/").rstrip("/")
+            out.append((base + "/" + rel, _lib_path(rel), lib.get("sha1"), lib.get("size", 0)))
+        nat = (lib.get("natives") or {}).get("windows")
+        if nat:
+            c = (dl.get("classifiers") or {}).get(nat.replace("${arch}", "64"))
+            if c:
+                out.append((c["url"], _lib_path(c["path"]), c.get("sha1"), c.get("size", 0)))
+    return out, made
+
+
+def java_dirs(component):
+    """Где лежит Java игры: так кладёт официальный лаунчер (windows-x64) и так TLauncher (windows)."""
+    return [os.path.join(MC, "runtime", component, plat, component) for plat in ("windows-x64", "windows")]
+
+
+def find_game_java(component, console=False):
+    exe = "java.exe" if console else "javaw.exe"
+    off, tl = java_dirs(component)
+    if os.path.isfile(os.path.join(off, "bin", exe)) and (
+            os.path.isfile(os.path.join(off, ".portalis-ok")) or os.path.isfile(os.path.join(os.path.dirname(off), component + ".version"))):
+        return os.path.join(off, "bin", exe)
+    if os.path.isfile(os.path.join(tl, "bin", exe)):
+        return os.path.join(tl, "bin", exe)
+    return None
+
+
+def _java_tasks(component):
+    if find_game_java(component):
+        return []
+    allj = json.loads(_get(JAVA_RUNTIMES, 30, 4).decode("utf-8"))
+    ent = (allj.get("windows-x64") or {}).get(component) or []
+    if not ent:
+        raise RuntimeError("у Mojang нет Java «%s» для Windows" % component)
+    man = json.loads(_get(ent[0]["manifest"]["url"], 30, 4).decode("utf-8"))
+    base = java_dirs(component)[0]
+    return [(f["downloads"]["raw"]["url"], os.path.join(base, *rel.split("/")), f["downloads"]["raw"]["sha1"],
+             f["downloads"]["raw"]["size"]) for rel, f in man["files"].items() if f.get("type") == "file"]
+
+
+def _need(task, deep):
+    """Нужно ли качать: файла нет, другой размер или (для важных файлов) другая контрольная сумма."""
+    url, path, sha1, size = task
+    try:
+        st = os.stat(lp(path))
+    except OSError:
+        return True
+    if size and st.st_size != size:
+        return True
+    return bool(deep and sha1 and _sha1_file(path) != sha1)
+
+
+def version_id(gv, loader, lv):
+    """Как будет называться версия в папке versions."""
+    if loader == "vanilla":
+        return gv
+    if loader == "fabric":
+        return "fabric-loader-%s-%s" % (lv, gv)
+    if loader == "quilt":
+        return "quilt-loader-%s-%s" % (lv, gv)
+    if loader == "forge":
+        return "%s-forge-%s" % (gv, lv)
+    return "neoforge-%s" % lv
+
+
+def installer_url(gv, loader, lv):
+    if loader == "forge":
+        v = "%s-%s" % (gv, lv)
+        return "https://maven.minecraftforge.net/net/minecraftforge/forge/%s/forge-%s-installer.jar" % (v, v)
+    return "https://maven.neoforged.net/releases/net/neoforged/neoforge/%s/neoforge-%s-installer.jar" % (lv, lv)
+
+
+def plan_version(gv, loader="vanilla", lv=None, assets=True, log=print):
+    """Что скачать, чтобы версия была готова к игре в любом лаунчере (и без интернета).
+    Возвращает план: id, задачи на скачивание, размер, файлы описаний и нужен ли установщик Forge/NeoForge."""
+    entry = next((v for v in mojang_versions() if v["id"] == gv), None)
+    if not entry:
+        raise RuntimeError("версии %s нет в списке Mojang" % gv)
+    log("Читаю описание Minecraft %s" % gv)
+    vjson = os.path.join(MC, "versions", gv, gv + ".json")
+    if os.path.isfile(vjson) and _sha1_file(vjson) == entry.get("sha1"):
+        with open(vjson, "rb") as fh:
+            raw = fh.read()
+    else:
+        raw = _get(entry["url"], 30, 4)
+    info = json.loads(raw.decode("utf-8"))
+    writes = {vjson: raw}
+    tasks = []
+    cl = info["downloads"]["client"]
+    tasks.append((cl["url"], os.path.join(MC, "versions", gv, gv + ".jar"), cl["sha1"], cl["size"]))
+    libs, made = _lib_tasks(info)
+    tasks += libs
+    lg = ((info.get("logging") or {}).get("client") or {}).get("file")
+    if lg:
+        tasks.append((lg["url"], os.path.join(MC, "assets", "log_configs", lg["id"]), lg.get("sha1"), lg.get("size", 0)))
+    n_assets = 0
+    ai = info.get("assetIndex")
+    if ai:
+        ipath = os.path.join(MC, "assets", "indexes", ai["id"] + ".json")
+        if os.path.isfile(ipath) and _sha1_file(ipath) == ai.get("sha1"):
+            with open(ipath, "rb") as fh:
+                idx_raw = fh.read()
+        else:
+            log("Читаю список звуков и текстур")
+            idx_raw = _get(ai["url"], 60, 4)
+        writes[ipath] = idx_raw
+        if assets:
+            seen = set()
+            for o in json.loads(idx_raw.decode("utf-8")).get("objects", {}).values():
+                h = o["hash"]
+                if h not in seen:
+                    seen.add(h)
+                    tasks.append((ASSETS_URL + h[:2] + "/" + h, os.path.join(MC, "assets", "objects", h[:2], h), h, o["size"]))
+            n_assets = len(seen)
+    java = (info.get("javaVersion") or {}).get("component") or "jre-legacy"
+    log("Проверяю Java для игры (%s)" % java)
+    tasks += _java_tasks(java)
+    vid, installer = gv, None
+    if loader != "vanilla":
+        lv = lv or loader_version(loader, gv)
+        vid = version_id(gv, loader, lv)
+        log("Загрузчик: %s %s" % (LOADER_TITLES[loader], lv))
+        if loader in ("fabric", "quilt"):
+            meta = ("https://meta.fabricmc.net/v2/versions/loader/%s/%s/profile/json" if loader == "fabric"
+                    else "https://meta.quiltmc.org/v3/versions/loader/%s/%s/profile/json") % (gv, lv)
+            praw = _get(meta, 30, 4)
+            prof = json.loads(praw.decode("utf-8"))
+            vid = prof["id"]
+            writes[os.path.join(MC, "versions", vid, vid + ".json")] = praw
+            tasks += _lib_tasks(prof)[0]
+        else:
+            ljson = os.path.join(MC, "versions", vid, vid + ".json")
+            ready = False
+            if os.path.isfile(ljson):
+                try:
+                    with open(ljson, encoding="utf-8") as fh:
+                        linfo = json.load(fh)
+                    more, made2 = _lib_tasks(linfo)
+                    tasks += more
+                    ready = all(os.path.isfile(lp(x)) for x in made2)
+                except Exception:
+                    ready = False
+            if not ready:
+                installer = installer_url(gv, loader, lv)
+    seen, uniq = set(), []
+    for t in tasks:
+        key = os.path.normcase(t[1])
+        if key not in seen:
+            seen.add(key)
+            uniq.append(t)
+    deep_dirs = (os.path.join(MC, "assets", "objects"), os.path.join(MC, "runtime"))
+    need = [t for t in uniq if _need(t, not t[1].startswith(deep_dirs))]
+    return {"gv": gv, "loader": loader, "lv": lv, "id": vid, "java": java, "tasks": need, "writes": writes,
+            "installer": installer, "size": sum(t[3] or 0 for t in need), "files": len(uniq), "assets": n_assets}
+
+
+_KA = threading.local()
+KEEPALIVE_HOSTS = ("resources.download.minecraft.net", "libraries.minecraft.net", "piston-data.mojang.com")
+
+
+def _fetch_small(url, dst, tick, sha1):
+    """Мелкий файл через постоянное соединение потока: звуков и текстур тысячи, и новое HTTPS-соединение
+    на каждый файл съедает больше времени, чем само скачивание."""
+    u = urllib.parse.urlsplit(url)
+    conns = getattr(_KA, "c", None)
+    if conns is None:
+        conns = _KA.c = {}
+    data = None
+    for attempt in range(2):
+        c = conns.get(u.netloc)
+        if c is None:
+            c = conns[u.netloc] = http.client.HTTPSConnection(u.netloc, timeout=30)
+        try:
+            c.request("GET", u.path, headers={"User-Agent": "Portalis/1.0"})
+            r = c.getresponse()
+            data = r.read()
+            if r.status != 200:
+                raise RuntimeError("HTTP %d" % r.status)
+            break
+        except Exception:
+            c.close()
+            conns.pop(u.netloc, None)
+            if attempt:
+                raise
+    if sha1 and hashlib.sha1(data).hexdigest() != sha1:
+        raise RuntimeError("файл скачался с ошибкой")
+    os.makedirs(os.path.dirname(lp(dst)), exist_ok=True)
+    with open(lp(dst) + ".part", "wb") as fh:
+        fh.write(data)
+    os.replace(lp(dst) + ".part", lp(dst))
+    tick(len(data))
+
+
+def apply_version(plan, log=print, progress=None, cancel=None, threads=12):
+    """Скачивает всё по плану (по 12 файлов сразу, с проверкой), пишет описания и при необходимости
+    запускает установщик Forge/NeoForge. Возвращает id готовой версии."""
+    total = max(1, plan["size"])
+    done = [0]
+    lock = threading.Lock()
+
+    def tick(n):
+        with lock:
+            done[0] += n
+            if progress:
+                progress(max(0, done[0]), total)
+    tasks = plan["tasks"]
+    errors = []
+    if tasks:
+        log("Скачиваю %d файлов (%s)" % (len(tasks), fmt_mb(plan["size"])))
+
+        def one(t):
+            if cancel and cancel.is_set():
+                return
+            try:
+                if (t[3] or 0) < 4 << 20 and urllib.parse.urlsplit(t[0]).netloc in KEEPALIVE_HOSTS:
+                    try:
+                        return _fetch_small(t[0], t[1], tick, t[2])
+                    except Exception:
+                        pass  # напрямую не вышло (бывает за VPN) - обычным путём, с прокси и повторами
+                _fetch_to(t[0], t[1], tick, t[2], cancel, {"User-Agent": "Portalis/1.0"})
+            except Exception as e:
+                errors.append((t, e))
+        with concurrent.futures.ThreadPoolExecutor(threads) as ex:
+            list(ex.map(one, tasks))
+    if cancel and cancel.is_set():
+        raise RuntimeError("отменено")
+    if errors:
+        t, e = errors[0]
+        raise RuntimeError("не скачалось файлов: %d (например %s: %s)" % (len(errors), os.path.basename(t[1]), e))
+    off = java_dirs(plan["java"])[0]
+    if os.path.isdir(off) and os.path.isfile(os.path.join(off, "bin", "javaw.exe")):
+        open(os.path.join(off, ".portalis-ok"), "w").close()
+    for path, data in plan["writes"].items():
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".tmp", "wb") as fh:
+            fh.write(data)
+        os.replace(path + ".tmp", path)
+    if plan.get("installer"):
+        run_loader_installer(plan, log, cancel)
+    if plan["loader"] in ("forge", "neoforge"):
+        # Forge ищет клиент под именем своей версии (versions/<id>/<id>.jar); официальный лаунчер кладёт эту
+        # копию сам при запуске, остальные - не всегда. Кладём заранее.
+        own = os.path.join(MC, "versions", plan["id"], plan["id"] + ".jar")
+        src = os.path.join(MC, "versions", plan["gv"], plan["gv"] + ".jar")
+        if not os.path.isfile(own) and os.path.isfile(src):
+            shutil.copy2(src, own)
+    log("Готово: %s" % plan["id"])
+    return plan["id"]
+
+
+def run_loader_installer(plan, log=print, cancel=None):
+    """Ставит Forge или NeoForge их собственным установщиком, без окон."""
+    name = plan["installer"].rsplit("/", 1)[-1]
+    jar = os.path.join(ROOT, "_update", "installers", name)
+    if not os.path.isfile(jar):
+        log("Скачиваю установщик %s" % LOADER_TITLES[plan["loader"]])
+        _fetch_to(plan["installer"], jar, None, None, cancel, {"User-Agent": "Portalis/1.0"})
+    prof = os.path.join(MC, "launcher_profiles.json")
+    if not os.path.isfile(prof):  # установщик Forge без этого файла отказывается ставить
+        with open(prof, "w", encoding="utf-8") as fh:
+            json.dump({"profiles": {}, "version": 3}, fh)
+    java = find_game_java(plan["java"], console=True) or find_game_java("java-runtime-gamma", console=True)
+    if not java:
+        raise RuntimeError("нет Java для установщика")
+    before = set(_listdir(os.path.join(MC, "versions")))
+    log("Устанавливаю %s %s (это минута-две)" % (LOADER_TITLES[plan["loader"]], plan["lv"]))
+    p = subprocess.Popen([java, "-jar", jar, "--installClient", MC], cwd=os.path.dirname(jar),
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                         errors="ignore", creationflags=0x08000000)
+    tail = []
+    t0 = time.time()
+    for line in p.stdout:
+        line = line.strip()
+        if line:
+            tail = (tail + [line])[-15:]
+            if line.startswith(("Downloading library", "Extracting:", "Building Processors", "Installing", "Task:")):
+                log(line[:110])
+        if cancel and cancel.is_set():
+            p.kill()
+            raise RuntimeError("отменено")
+        if time.time() - t0 > 1200:
+            p.kill()
+            raise RuntimeError("установщик работал дольше 20 минут")
+    code = p.wait()
+    vdir = os.path.join(MC, "versions", plan["id"])
+    if not os.path.isfile(os.path.join(vdir, plan["id"] + ".json")):
+        new = sorted(set(_listdir(os.path.join(MC, "versions"))) - before)
+        if code == 0 and len(new) == 1:
+            plan["id"] = new[0]
+        else:
+            raise RuntimeError("установщик %s не справился (код %s): %s" % (
+                LOADER_TITLES[plan["loader"]], code, " | ".join(tail[-3:])))
+
+
+def version_missing(vid):
+    """Чего не хватает версии для запуска (с учётом родительской версии): список коротких описаний."""
+    miss, chain, cur = [], [], vid
+    while cur and len(chain) < 5:
+        j = os.path.join(MC, "versions", cur, cur + ".json")
+        try:
+            with open(j, encoding="utf-8") as fh:
+                info = json.load(fh)
+        except Exception:
+            miss.append("описание версии %s" % cur)
+            break
+        chain.append((cur, info))
+        cur = info.get("inheritsFrom")
+    if not chain:
+        return miss
+    base_id, base = chain[-1]
+    if not os.path.isfile(os.path.join(MC, "versions", base_id, base_id + ".jar")):
+        miss.append("клиент %s.jar" % base_id)
+    for _cid, info in chain:
+        for t in _lib_tasks(info)[0]:
+            if not os.path.isfile(lp(t[1])):
+                miss.append("библиотека " + os.path.basename(t[1]))
+        for path in _lib_tasks(info)[1]:
+            if not os.path.isfile(lp(path)):
+                miss.append("файл установщика " + os.path.basename(path))
+    ai = base.get("assetIndex")
+    ipath = os.path.join(MC, "assets", "indexes", ai["id"] + ".json") if ai else None
+    if ai and not os.path.isfile(ipath):
+        miss.append("звуки и текстуры")
+    elif ai:
+        try:  # выборочно (каждый 40-й файл): все тысячи проверять долго
+            with open(ipath, encoding="utf-8") as fh:
+                hashes = sorted(o["hash"] for o in json.load(fh).get("objects", {}).values())
+            if any(not os.path.isfile(os.path.join(MC, "assets", "objects", h[:2], h)) for h in hashes[::40]):
+                miss.append("звуки и текстуры (лаунчер докачает сам)")
+        except Exception:
+            pass
+    comp = (base.get("javaVersion") or {}).get("component") or "jre-legacy"
+    if not find_game_java(comp):
+        miss.append("Java (%s)" % comp)
+    return miss
+
+
+def installed_versions():
+    """Версии в папке игры: [{id, kind, gv, time, size}] (новые сверху)."""
+    out = []
+    root = os.path.join(MC, "versions")
+    for v in _listdir(root):
+        j = os.path.join(root, v, v + ".json")
+        if not os.path.isfile(j):
+            continue
+        try:
+            with open(j, encoding="utf-8") as fh:
+                info = json.load(fh)
+        except Exception:
+            continue
+        low = (v + " " + str(info.get("mainClass", ""))).lower()
+        kind = ("NeoForge" if "neoforge" in low else "Forge" if "forge" in low or "fml" in low else
+                "Fabric" if "fabric" in low else "Quilt" if "quilt" in low else
+                "OptiFine" if "optifine" in low else "Без модов")
+        jar = os.path.join(root, v, v + ".jar")
+        gv = info.get("inheritsFrom") or info.get("id", v)
+        # (версия игры, загрузчик, версия загрузчика) - для «Проверить и докачать». Версии TLauncher
+        # («Forge 1.20.1») он собирает по-своему: их не трогаем.
+        spec = None if " " in v else version_spec(v)
+        if v.startswith("neoforge-") and info.get("inheritsFrom"):
+            spec = (info["inheritsFrom"], "neoforge", v[len("neoforge-"):])
+        if spec and (spec[1] == "vanilla") != (kind == "Без модов"):
+            spec = None
+        if not info.get("inheritsFrom"):
+            m = re.search(r"\d+\.\d+(\.\d+)?", v if " " in v or v.count("-") else gv)
+            gv = spec[0] if spec else (m.group(0) if m else gv)
+        out.append({"id": v, "kind": kind, "gv": gv, "spec": spec,
+                    "time": os.path.getmtime(j), "size": os.path.getsize(jar) if os.path.isfile(jar) else 0,
+                    "type": info.get("type", "")})
+    out.sort(key=lambda x: x["time"], reverse=True)
+    return out
 
 
 def _safe_name(name):
@@ -3006,8 +3858,41 @@ def mineskin_popular(after=None, size=24):
     return items, nxt
 
 
+_TEX_CACHE = {}
+
+
 def texture_png(texture_hash):
-    return _get("https://textures.minecraft.net/texture/" + texture_hash, 20, 3, SKIN_UA)
+    if texture_hash not in _TEX_CACHE:
+        if len(_TEX_CACHE) > 400:
+            _TEX_CACHE.clear()
+        _TEX_CACHE[texture_hash] = _get("https://textures.minecraft.net/texture/" + texture_hash, 20, 3, SKIN_UA)
+    return _TEX_CACHE[texture_hash]
+
+
+def skin_is_full(png):
+    """У скина есть тело. На MineSkin много «скинов» из одной головы (для голов-украшений на серверах):
+    в игре и в превью от них видна только голова."""
+    try:
+        im = PILImage.open(io.BytesIO(png)).convert("RGBA")
+        k = max(1, im.width // 64)
+        return im.crop((16 * k, 16 * k, 40 * k, 32 * k)).getextrema()[3][1] > 0
+    except Exception:
+        return False
+
+
+def mineskin_page(after=None, want=21):
+    """Страница галереи: только настоящие скины (с телом), без повторов. Текстуры скачиваются заранее,
+    чтобы в сетке не было пустых или «недогруженных» карточек."""
+    out, seen = [], set()
+    for _ in range(4):
+        items, after = mineskin_popular(after, 24)
+        items = [g for g in items if g["texture"] not in seen and not seen.add(g["texture"])]
+        with concurrent.futures.ThreadPoolExecutor(8) as ex:
+            ok = list(ex.map(lambda g: skin_is_full(texture_png(g["texture"])) if g["texture"] else False, items))
+        out += [g for g, good in zip(items, ok) if good]
+        if len(out) >= want or not after:
+            break
+    return out, after
 
 
 def _skins_meta():
@@ -3178,6 +4063,18 @@ def cli(argv):
                 return wait_archive_in_downloads(a)
             res = apply_plan(remote, plan, log=log, ask_browser=ask)
             log("Готово:", res)
+    elif cmd == "--get-version" and len(argv) > 1:
+        # --get-version 1.20.1 [forge|neoforge|fabric|quilt|vanilla] [версия загрузчика] [--no-assets]
+        rest = [x for x in argv[1:] if not x.startswith("--")]
+        gv, loader = rest[0], (rest[1] if len(rest) > 1 else "vanilla").lower()
+        pl = plan_version(gv, loader, rest[2] if len(rest) > 2 else None, "--no-assets" not in argv, log=log)
+        log("Скачать: %d файлов, %s%s" % (len(pl["tasks"]), fmt_mb(pl["size"]), ", установщик" if pl["installer"] else ""))
+        log("Версия готова: %s" % apply_version(pl, log=log))
+    elif cmd == "--versions":
+        for v in installed_versions():
+            miss = version_missing(v["id"])
+            log("%s | %s | Minecraft %s | %s" % (v["id"], v["kind"], v["gv"], "готова" if not miss else
+                                                "не хватает: " + ", ".join(miss[:3])))
     elif cmd == "--shortcut":
         log("Ярлыки:", create_shortcuts())
     elif cmd == "--join" and len(argv) > 1:
@@ -3243,7 +4140,7 @@ FONT = "Segoe UI"
 
 
 ART = os.path.join(ROOT, "Оформление")
-TAB_ORDER = ["maps", "packs", "builder", "skins", "servers", "friend", "launchers"]
+TAB_ORDER = ["maps", "packs", "builder", "skins", "versions", "servers", "friend", "launchers"]
 
 
 def gui():
@@ -3445,8 +4342,8 @@ def gui():
 
     def tab_button(key, text, icon):
         b = tk.Label(tabs, text=" " + text, image=art(icon, 24, 24), compound="left", font=(FONT, 11, "bold"),
-                     bg=BG, fg=MUTED, padx=9, pady=9, cursor="hand2")
-        b.pack(side="left", padx=(0, 4), pady=(0, 3))
+                     bg=BG, fg=MUTED, padx=5, pady=9, cursor="hand2")
+        b.pack(side="left", padx=(0, 2), pady=(0, 3))
         b.bind("<Button-1>", lambda e: show(key))
         b.bind("<Enter>", lambda e: key != state["tab"] and fade_color(b, "fg", TEXT, 120))
         b.bind("<Leave>", lambda e: key != state["tab"] and fade_color(b, "fg", MUTED, 160))
@@ -3456,6 +4353,7 @@ def gui():
     tab_button("packs", "Сборки", "tab_packs.png")
     tab_button("builder", "Конструктор", "tab_builder.png")
     tab_button("skins", "Скины", "tab_skins.png")
+    tab_button("versions", "Версии", "tab_versions.png")
     tab_button("servers", "Серверы", "tab_servers.png")
     tab_button("friend", "С другом", "tab_friend.png")
     tab_button("launchers", "Лаунчеры", "tab_launchers.png")
@@ -3482,7 +4380,12 @@ def gui():
     body.pack(fill="both", expand=True, padx=(24, 8), pady=12)
     canvas = tk.Canvas(body, bg=BG, highlightthickness=0, bd=0)
     sb = tk.Scrollbar(body, orient="vertical", command=canvas.yview)
-    canvas.configure(yscrollcommand=sb.set)
+
+    def on_yscroll(a, b):
+        sb.set(a, b)
+        if state.get("more") and float(b) > 0.93 and not wheel:
+            win.after_idle(check_more)
+    canvas.configure(yscrollcommand=on_yscroll)
     sb.pack(side="right", fill="y")
     canvas.pack(side="left", fill="both", expand=True)
     inner = tk.Frame(canvas, bg=BG)
@@ -3492,7 +4395,8 @@ def gui():
     wheel = {}
 
     def on_wheel(e):
-        """Плавная прокрутка колесом."""
+        """Плавная прокрутка колесом. Шаги идут своим циклом, а новые щелчки колеса только сдвигают цель,
+        и между шагами окно успевает перерисоваться (иначе на Windows список «рвётся» на полосы)."""
         try:
             top = e.widget.winfo_toplevel()
         except Exception:
@@ -3506,13 +4410,34 @@ def gui():
             return
         if total <= view:
             return
-        cur = cv.yview()[0] * total
         key = str(cv)
-        target = wheel.get(key, cur) - e.delta / 120.0 * 110
-        target = max(0.0, min(float(total - view), target))
-        wheel[key] = target
-        animate(("wheel", key), 230, lambda k: cv.yview_moveto((cur + (target - cur) * k) / total),
-                done=lambda: wheel.pop(key, None))
+        w = wheel.get(key)
+        if w is None:
+            w = wheel[key] = {"pos": cv.yview()[0] * total, "run": False}
+        w["target"] = max(0.0, min(float(total - view), w.get("target", w["pos"]) - e.delta / 120.0 * 110))
+        if not w["run"]:
+            w["run"] = True
+            win.after(0, lambda: wheel_step(cv, key))
+
+    def wheel_step(cv, key):
+        w = wheel.get(key)
+        try:
+            region = cv.bbox("all")
+            total = (region[3] - region[1]) if region else 0
+            if not w or total <= 0:
+                raise tk.TclError
+            d = w["target"] - w["pos"]
+            w["pos"] = w["target"] if abs(d) < 1.5 else w["pos"] + d * 0.3
+            cv.yview_moveto(w["pos"] / total)
+            cv.update()  # дорисовать всё до следующего шага
+        except tk.TclError:
+            wheel.pop(key, None)
+            return
+        if w["pos"] == w["target"]:
+            wheel.pop(key, None)
+            check_more()
+        else:
+            win.after(12, lambda: wheel_step(cv, key))
     win.bind_all("<MouseWheel>", on_wheel)
 
     # --- подвал ---
@@ -3688,7 +4613,7 @@ def gui():
         box = tk.Frame(parent, bg=bg)
         tk.Label(box, text="Сборка", font=(FONT, 8), fg=MUTED, bg=bg).pack(anchor="w")
         b = tk.Label(box, textvariable=disp, font=(FONT, 10), bg=CARD_HI, fg=TEXT, padx=10, pady=6,
-                     anchor="w", width=30, cursor="hand2")
+                     anchor="w", width=25, cursor="hand2")
         b.pack(anchor="w")
         menu = tk.Menu(win, tearoff=0, bg=CARD_HI, fg=TEXT, activebackground=ACCENT, activeforeground="white",
                        font=(FONT, 10), bd=0, relief="flat")
@@ -3721,7 +4646,21 @@ def gui():
         else:
             now_ver.configure(text="Лаунчер: %s" % launcher_title(lid))
 
+    def check_more():
+        """Долистали почти до низа - догружаем следующую страницу (конструктор, галерея скинов)."""
+        fn = state.get("more")
+        if not fn:
+            return
+        try:
+            if canvas.yview()[1] < 0.93:
+                return
+        except tk.TclError:
+            return
+        state["more"] = None
+        fn()
+
     def clear():
+        state["more"] = None
         for w in inner.winfo_children():
             w.destroy()
         images.clear()
@@ -4128,6 +5067,9 @@ def gui():
         detail_header(t, body, img, m["title"], badges, sub)
         dsection(body, "О карте")
         dpara(body, m["desc"])
+        if map_page_url(m):
+            dsection(body, "Скриншоты")
+            gallery(t, body, map_page_url(m))
         if m.get("how"):
             dsection(body, "Как играть")
             for line in m["how"]:
@@ -4329,10 +5271,20 @@ def gui():
             except tk.TclError:
                 pass
 
+    def maps_switch(head_f):
+        box = tk.Frame(head_f, bg=BG)
+        box.pack(side="right", padx=(12, 0))
+        n = len(find_maps())
+        chip_row(box, [("ours", "Каталог Portalis (%d)" % n), ("web", "Из интернета: тысячи карт")],
+                 state.get("maps_src", "ours"), lambda v: (state.update(maps_src=v), show("maps", animated=False)), BG)
+
     def build_maps():
+        if state.get("maps_src") == "web":
+            return build_web_maps()
         packs = find_packs()
         maps = find_maps()
         head_f = section("Карты", 0, "выбери карту и сборку, остальное программа сделает сама")
+        maps_switch(head_f)
         search_box(head_f, "q_maps", "Поиск карты").pack(side="right")
         if not maps:
             empty_note(2, LIBRARY_NOTE if not library_found() else "Карт пока нет. Добавь папку с картой в «Карты».")
@@ -4384,7 +5336,22 @@ def gui():
             if map_installed(m):
                 tk.Label(pl, text="   ● уже установлена", font=(FONT, 9, "bold"), fg=ACCENT_HI, bg=CARD).pack(side="left")
             tk.Label(c, text=m["desc"], font=(FONT, 10), fg="#c3c7d1", bg=CARD, justify="left",
-                     anchor="w", wraplength=400).pack(fill="x", pady=(10, 10))
+                     anchor="w", wraplength=400).pack(fill="x", pady=(10, 6))
+            page = map_page_url(m)
+            if page:
+                strip = tk.Frame(c, bg=CARD)
+                strip.pack(fill="x", pady=(0, 10))
+                for k in range(4):
+                    lb = tk.Label(strip, bg=CARD, image=blank(96, 54), cursor="hand2")
+                    lb.pack(side="left", padx=(0, 6))
+
+                    def shot(page=page, k=k):
+                        sh = mi_page(page)["shots"]
+                        if k >= len(sh):
+                            return None
+                        return web_image(sh[k][0], (96, 54))
+                    want_pic("mshot:%s:%d" % (page, k), shot, lb)
+                    lb.bind("<Button-1>", lambda e, page=page, k=k: shots_viewer(page, k))
             row = tk.Frame(c, bg=CARD)
             row.pack(fill="x", side="bottom")
             opts = [p["name"] for p in packs_for_map(m, packs)]
@@ -4397,6 +5364,373 @@ def gui():
                        icon="ic_download.png" if miss else "ic_play.png").pack(side="right")
             small_button(row, "Подробнее", lambda m=m: open_map(m), bg=CARD).pack(side="right", padx=8)
             clickable(c, lambda m=m: open_map(m))
+
+    # --- скриншоты карт: полоса превью и просмотр крупно ---
+    def gallery(t, body, page, cols=4, size=(176, 99)):
+        """Сетка скриншотов со страницы карты (грузятся в фоне); нажатие - крупно."""
+        g = tk.Frame(body, bg=BG)
+        g.pack(fill="x")
+        note = tk.Label(g, text="Загружаю скриншоты...", font=(FONT, 10), fg=MUTED, bg=BG, anchor="w")
+        note.grid(row=0, column=0, columnspan=cols, sticky="w")
+        box = {}
+
+        def load():
+            try:
+                box["shots"] = mi_page(page)["shots"]
+            except Exception as e:
+                box["err"] = str(e)[:80]
+
+        def fill():
+            if not g.winfo_exists():
+                return
+            if "shots" not in box and "err" not in box:
+                g.after(150, fill)
+                return
+            note.destroy()
+            shots = box.get("shots") or []
+            if not shots:
+                tk.Label(g, text="У этой карты нет скриншотов." if "err" not in box else
+                         "Скриншоты не загрузились: %s" % box["err"], font=(FONT, 10), fg=MUTED, bg=BG).grid(row=0, column=0)
+                return
+            for i, (small, big) in enumerate(shots[:16]):
+                lb = tk.Label(g, bg=CARD, image=blank(*size), cursor="hand2", bd=0)
+                lb.grid(row=i // cols, column=i % cols, padx=(0, 8), pady=(0, 8))
+                want_pic("shot:%s:%dx%d" % (small, size[0], size[1]), lambda u=small: web_image(u, size), lb, t._imgs)
+                lb.bind("<Button-1>", lambda e, i=i: shots_viewer(page, i))
+        threading.Thread(target=load, daemon=True).start()
+        fill()
+        return g
+
+    def shots_viewer(page, idx=0):
+        """Скриншот крупно, стрелки листают."""
+        v = tk.Toplevel(win)
+        v.title("Скриншоты")
+        v.configure(bg="#0b0c10")
+        v.transient(win)
+        W, H = 1040, 660
+        v.geometry("%dx%d+%d+%d" % (W, H, win.winfo_rootx() + 20, win.winfo_rooty() + 20))
+        v._imgs = []
+        pic = tk.Label(v, bg="#0b0c10", text="Загружаю...", fg=MUTED, font=(FONT, 12), compound="center")
+        pic.pack(fill="both", expand=True)
+        bar = tk.Frame(v, bg="#0b0c10")
+        bar.pack(fill="x", pady=8)
+        cap = tk.Label(bar, text="", font=(FONT, 10), fg=MUTED, bg="#0b0c10")
+        st = {"i": idx, "shots": None}
+
+        def draw():
+            sh = st["shots"]
+            if not sh:
+                return
+            st["i"] %= len(sh)
+            cap.configure(text="%d из %d   ·   ← →  листать,  Esc  закрыть" % (st["i"] + 1, len(sh)))
+            pic.configure(image="", text="Загружаю...")
+            want_pic("big:%s" % sh[st["i"]][1], lambda u=sh[st["i"]][1]: web_image(u, (W - 40, H - 90)), pic, v._imgs)
+
+        small_button(bar, "←  Назад", lambda: (st.update(i=st["i"] - 1), draw()), bg="#0b0c10").pack(side="left", padx=12)
+        small_button(bar, "Дальше  →", lambda: (st.update(i=st["i"] + 1), draw()), bg="#0b0c10").pack(side="right", padx=12)
+        cap.pack(side="top")
+        v.bind("<Left>", lambda e: (st.update(i=st["i"] - 1), draw()))
+        v.bind("<Right>", lambda e: (st.update(i=st["i"] + 1), draw()))
+        v.bind("<Escape>", lambda e: v.destroy())
+
+        def load():
+            try:
+                st["shots"] = mi_page(page)["shots"]
+            except Exception:
+                st["shots"] = []
+            v.after(0, lambda: v.winfo_exists() and (draw() if st["shots"] else pic.configure(text="Скриншотов нет")))
+        threading.Thread(target=load, daemon=True).start()
+        fade_in_window(v)
+
+    # --- карты из интернета ---
+    def wm_state():
+        wm = state.get("wm")
+        if wm is None:
+            wm = state["wm"] = {"q": "", "cat": None, "ver": None, "sort": "visits", "items": [], "page": 0,
+                                "next": True, "loading": False, "err": None, "qid": 0}
+            wm_query()
+        return wm
+
+    def wm_query(more=False):
+        wm = state["wm"]
+        if not more:
+            wm.update(items=[], page=0, next=True, err=None)
+        wm["qid"] += 1
+        qid = wm["qid"]
+        wm["loading"] = True
+        page = wm["page"] + 1
+        start = len(wm["items"])
+
+        def work():
+            try:
+                items, nxt = mi_list(page, wm["cat"], None if wm["cat"] else wm["ver"], wm["sort"], wm["q"] or None)
+                if wm["ver"] and (wm["cat"] or wm["q"]):  # раздел и версию сайт вместе не фильтрует
+                    items = [x for x in items if wm["ver"] in x["versions"]]
+                if qid == wm["qid"]:
+                    have = {x["url"] for x in wm["items"]}
+                    wm["items"] += [x for x in items if x["url"] not in have]
+                    wm["page"], wm["next"] = page, nxt
+            except Exception as e:
+                if qid == wm["qid"]:
+                    wm["err"] = str(e)[:120]
+                    wm["next"] = False
+            wm["loading"] = False
+
+            def redraw():
+                if qid != wm["qid"] or state["tab"] != "maps" or state.get("maps_src") != "web":
+                    return
+                if more and state.get("wm_more") is not None and state["wm_more"].winfo_exists():
+                    wm_cards(start)
+                    auto_wrap(inner)
+                    win.after_idle(check_more)
+                else:
+                    show("maps", animated=False)
+            win.after(0, redraw)
+        threading.Thread(target=work, daemon=True).start()
+
+    def wm_set(**kw):
+        state["wm"].update(kw)
+        wm_query()
+        show("maps", animated=False)
+
+    def build_web_maps():
+        wm = wm_state()
+        head_f = section("Карты", 0, "каталог minecraft-inside.ru: картинки, описание и установка одной кнопкой")
+        maps_switch(head_f)
+        sbox = tk.Frame(head_f, bg=CARD_HI, padx=8, pady=2)
+        sbox.pack(side="right")
+        tk.Label(sbox, image=art("ic_search.png", 1, 1), bg=CARD_HI).pack(side="left")
+        e = tk.Entry(sbox, font=(FONT, 10), bg=CARD_HI, fg=TEXT, insertbackground=TEXT, relief="flat", width=24,
+                     highlightthickness=0, bd=0)
+        e.pack(side="left", padx=(6, 0), ipady=4)
+        e.insert(0, wm["q"])
+        state["search_entry"] = e
+
+        def typed(ev=None):
+            v = e.get().strip()
+            if v == wm["q"]:
+                return
+            wm["q"] = v
+            if state.get("_wq"):
+                win.after_cancel(state["_wq"])
+            state["_wq"] = win.after(600, lambda: (state.update(focus_wm=True), wm_query(), show("maps", animated=False)))
+        e.bind("<KeyRelease>", typed)
+        e.bind("<Escape>", lambda ev: (e.delete(0, "end"), typed()))
+        if state.pop("focus_wm", None):
+            e.focus_set()
+            e.icursor("end")
+        fl = tk.Frame(inner, bg=BG)
+        fl.grid(row=1, column=0, columnspan=2, sticky="we", pady=(0, 12))
+        half = (len(MI_CATS) + 1) // 2
+        for part in (MI_CATS[:half], MI_CATS[half:]):
+            r = tk.Frame(fl, bg=BG)
+            r.pack(fill="x", pady=(0, 5))
+            chip_row(r, part, wm["cat"], lambda v: wm_set(cat=v), BG)
+        r = tk.Frame(fl, bg=BG)
+        r.pack(fill="x", pady=(4, 0))
+        tk.Label(r, text="Версия:", font=(FONT, 10, "bold"), fg=TEXT, bg=BG).pack(side="left", padx=(0, 8))
+        chip_row(r, [(None, "Любая")] + [(v, v) for v in MI_VERSIONS], wm["ver"], lambda v: wm_set(ver=v), BG)
+        r = tk.Frame(fl, bg=BG)
+        r.pack(fill="x", pady=(8, 0))
+        tk.Label(r, text="Сначала:", font=(FONT, 10, "bold"), fg=TEXT, bg=BG).pack(side="left", padx=(0, 8))
+        chip_row(r, MI_SORTS, wm["sort"], lambda v: wm_set(sort=v), BG)
+        if wm["q"]:
+            tk.Label(r, text="   поиск: «%s»" % wm["q"], font=(FONT, 9), fg=MUTED, bg=BG).pack(side="left")
+        state["wm_more"] = None
+        if wm["err"] and not wm["items"]:
+            empty_note(2, "Каталог не загрузился (%s). Проверь интернет и нажми F5." % wm["err"])
+            return
+        if not wm["items"]:
+            if wm["loading"] or wm["next"]:
+                tk.Label(inner, text="Загружаю каталог карт...", font=(FONT, 12, "bold"), fg=GOLD, bg=BG,
+                         anchor="w").grid(row=2, column=0, columnspan=2, sticky="we", pady=10)
+                if not wm["loading"]:
+                    wm_query(more=True)
+            else:
+                empty_note(2, "Ничего не нашлось. Попробуй другое слово, раздел «Все» или любую версию.")
+            return
+        wm_cards(0)
+
+    def wm_cards(start):
+        wm = state["wm"]
+        old = state.get("wm_more")
+        if old is not None and old.winfo_exists():
+            old.destroy()
+        done = web_maps_installed()
+        for i, x in enumerate(wm["items"][start:], start):
+            c = card(inner, i % 2, 2 + i // 2)
+            top = tk.Frame(c, bg=CARD)
+            top.pack(fill="x")
+            cv = tk.Label(top, bg=CARD_HI, image=blank(200, 105), cursor="hand2")
+            cv.pack(side="left", anchor="n")
+            if x.get("cover"):
+                want_pic("mi:%s" % x["cover"], lambda u=x["cover"]: web_image(u, (200, 105)), cv)
+            info = tk.Frame(top, bg=CARD, padx=12)
+            info.pack(side="left", fill="both", expand=True)
+            tk.Label(info, text=x["title"], font=(FONT, 13, "bold"), fg=TEXT, bg=CARD, anchor="w", justify="left",
+                     wraplength=200).pack(fill="x")
+            bl = tk.Frame(info, bg=CARD)
+            bl.pack(fill="x", pady=(4, 4))
+            for v in x["versions"][:2]:
+                badge(bl, v, BLUE, "white").pack(side="left", padx=(0, 5))
+            if x.get("ru"):
+                badge(bl, "RU").pack(side="left", padx=(0, 5))
+            meta = " · ".join(t for t in (x.get("author"), x.get("date"),
+                                           "%s просмотров" % fmt_count(x["views"]) if x.get("views") else "") if t)
+            tk.Label(info, text=meta, font=(FONT, 9), fg=MUTED, bg=CARD, anchor="w", justify="left",
+                     wraplength=200).pack(fill="x")
+            if x["url"] in done and os.path.isdir(os.path.join(SAVES, done[x["url"]]["save"])):
+                tk.Label(info, text="● уже установлена", font=(FONT, 9, "bold"), fg=ACCENT_HI, bg=CARD,
+                         anchor="w").pack(fill="x")
+            d = x.get("desc", "")
+            tk.Label(c, text=d[:230] + ("…" if len(d) > 230 else ""), font=(FONT, 9), fg="#c3c7d1", bg=CARD,
+                     anchor="w", justify="left", wraplength=400).pack(fill="x", pady=(8, 8))
+            row = tk.Frame(c, bg=CARD)
+            row.pack(fill="x", side="bottom")
+            big_button(row, "Играть", lambda x=x: web_play(x), icon="ic_play.png").pack(side="right")
+            small_button(row, "Подробнее и скриншоты", lambda x=x: open_web_map(x), bg=CARD).pack(side="right", padx=8)
+            clickable(c, lambda x=x: open_web_map(x))
+        mb = tk.Frame(inner, bg=BG)
+        mb.grid(row=2 + (len(wm["items"]) + 1) // 2, column=0, columnspan=2, pady=(4, 18))
+        state["wm_more"] = mb
+        if wm["next"]:
+            note = tk.Label(mb, text="Листай ниже — покажу ещё", font=(FONT, 10), fg=MUTED, bg=BG)
+            note.pack()
+
+            def more():
+                if mb.winfo_exists():
+                    note.configure(text="Загружаю ещё...", font=(FONT, 10, "bold"), fg=GOLD)
+                wm_query(more=True)
+            if wm["loading"]:
+                note.configure(text="Загружаю ещё...", font=(FONT, 10, "bold"), fg=GOLD)
+            else:
+                state["more"] = more
+        else:
+            tk.Label(mb, text="Это все карты по такому запросу.", font=(FONT, 10), fg=MUTED, bg=BG).pack()
+
+    def web_play(x, want=None):
+        if not check_game():
+            return
+        reg = web_maps_installed().get(x["url"])
+        fresh = False
+        if reg and os.path.isdir(os.path.join(SAVES, reg["save"])):
+            ans = messagebox.askyesnocancel(x["title"], "Карта уже установлена.\n\nДа: продолжить своё сохранение\n"
+                                                        "Нет: начать заново (старое сохранение останется копией)")
+            if ans is None:
+                return
+            fresh = not ans
+
+        def work(log):
+            info = mi_page(x["url"])
+            if info.get("mods"):
+                log("Внимание: автор пишет, что для карты нужны моды - открой страницу карты и поставь их сборкой")
+
+            def via_browser(url):
+                since = time.time() - 2
+                webbrowser.open(url)
+                log("Открыл ссылку в браузере: скачай там файл карты - Portalis сам подхватит его из «Загрузок»")
+                return wait_new_download(since)
+            gv, save = install_web_map(info, want, fresh, log, browser_download=via_browser)
+            gv = real_game_version(gv or (info.get("versions") or [None])[0])
+            if not gv:
+                log("Подсказка: версию игры для этой карты посмотри на её странице и выбери в лаунчере сам.")
+                return True
+            if re.match(r"^\d+(\.\d+)+$", gv):
+                try:
+                    ensure_vanilla(gv, log)
+                except Exception as e:
+                    log("Версию %s скачать не вышло (%s), лаунчер скачает её сам" % (gv, e))
+            ok, hint = select_version(gv, info["title"], log)
+            if hint:
+                log("Подсказка: " + hint)
+            return ok
+        run_task("Ставлю «%s»" % x["title"], work, finish)
+
+    def open_web_map(x):
+        t, body = detail_window(x["title"], 880, 740)
+        top = tk.Frame(body, bg=BG)
+        top.pack(fill="x")
+        cv = tk.Label(top, bg=CARD_HI, image=blank(320, 168))
+        cv.pack(side="left", anchor="n")
+        if x.get("cover"):
+            want_pic("mi:%s:320" % x["cover"], lambda: web_image(x["cover"], (320, 168)), cv, t._imgs)
+        info = tk.Frame(top, bg=BG, padx=20)
+        info.pack(side="left", fill="both", expand=True)
+        tk.Label(info, text=x["title"], font=(FONT, 20, "bold"), fg=TEXT, bg=BG, anchor="w", justify="left",
+                 wraplength=420).pack(fill="x")
+        bl = tk.Frame(info, bg=BG)
+        bl.pack(fill="x", pady=(8, 8))
+        for v in x["versions"][:4]:
+            badge(bl, v, BLUE, "white").pack(side="left", padx=(0, 5))
+        if x.get("ru"):
+            badge(bl, "на русском").pack(side="left")
+        for line in (("Автор: " + x["author"]) if x.get("author") else "",
+                     ("Опубликована: " + x["date"]) if x.get("date") else "",
+                     ("Просмотров: %s" % fmt_count(x["views"])) if x.get("views") else ""):
+            if line:
+                tk.Label(info, text=line, font=(FONT, 10), fg=MUTED, bg=BG, anchor="w").pack(fill="x")
+        small_button(info, "Страница на minecraft-inside.ru", lambda: webbrowser.open(x["url"]), bg=BG,
+                     icon="ic_globe.png").pack(anchor="w", pady=(8, 0))
+        dsection(body, "Скриншоты")
+        gallery(t, body, x["url"])
+        rest = tk.Frame(body, bg=BG)
+        rest.pack(fill="x")
+        wait = tk.Label(rest, text="Загружаю описание...", font=(FONT, 10), fg=MUTED, bg=BG, anchor="w")
+        wait.pack(fill="x", pady=10)
+        box = {}
+
+        def load():
+            try:
+                box["info"] = mi_page(x["url"])
+            except Exception as e:
+                box["err"] = str(e)[:100]
+
+        def fill():
+            if not t.winfo_exists():
+                return
+            if "info" not in box and "err" not in box:
+                t.after(150, fill)
+                return
+            wait.destroy()
+            if "err" in box:
+                dpara(rest, "Страница карты не загрузилась: %s" % box["err"], color="#e05a5a")
+                return
+            inf = box["info"]
+            for name, text in inf["sections"].items():
+                if name.startswith("Скачать") or not text.strip():
+                    continue
+                dsection(rest, name)
+                for para in [p for p in text.split("\n") if p.strip()][:40]:
+                    dpara(rest, para.strip())
+            dsection(rest, "Файлы")
+            if not inf["downloads"]:
+                dpara(rest, "Автор не выложил файл для скачивания.", color=GOLD)
+            for d in inf["downloads"]:
+                host = urllib.parse.urlsplit(d["url"]).netloc.replace("www.", "")
+                kind = {"rp": "ресурс-пак", "mod": "мод", "map": "карта"}[d["kind"]]
+                how = "" if direct_link(d["url"]) and host == "minecraft-inside.ru" else \
+                    ("  ·  %s" % host) + ("" if direct_link(d["url"]) else ", через браузер")
+                dpara(rest, "%s  —  %s, %s%s" % (d["name"] or "файл", kind, d["size"] or "размер не указан", how), bullet=True)
+            if inf.get("mods"):
+                dpara(rest, "Для этой карты нужны моды: поставь их сборкой (вкладка «Конструктор») или по инструкции автора.",
+                      color=GOLD, bullet=True)
+            row = dbuttons(rest)
+            maps_dl = [d for d in inf["downloads"] if d["kind"] != "rp"]
+            vers = []
+            for d in maps_dl:
+                for v in d["versions"] or [""]:
+                    if v not in vers:
+                        vers.append(v)
+            var = tk.StringVar(value=vers[0] if vers else "")
+            if len([v for v in vers if v]) > 1:
+                tk.Label(row, text="Версия:", font=(FONT, 10, "bold"), fg=TEXT, bg=BG).pack(side="left", padx=(0, 6))
+                option_menu(row, var, [v for v in vers if v]).pack(side="left")
+            if maps_dl:
+                big_button(row, "Скачать и играть", lambda: (t.destroy(), web_play(x, var.get() or None)),
+                           icon="ic_play.png").pack(side="right")
+            auto_wrap(rest)
+        threading.Thread(target=load, daemon=True).start()
+        fill()
 
     # --- вкладка «Сборки» ---
     def build_packs():
@@ -4951,16 +6285,19 @@ def gui():
         images.append(im)
         return im
 
-    def pil_photo(im):
+    def pil_photo(im, keep=None):
         ph = ImageTk.PhotoImage(im)
-        images.append(ph)
+        (keep if keep is not None else images).append(ph)
         return ph
 
-    def want_pic(key, producer, widget):
-        """producer() -> PIL-картинка; вызывается в фоне, результат кэшируется по key."""
+    def want_pic(key, producer, widget, keep=None):
+        """producer() -> PIL-картинка; вызывается в фоне, результат кэшируется по key.
+        keep - куда сложить картинку (у отдельного окна свой список, иначе - список вкладки)."""
+        if keep is not None:
+            widget._keep = keep
         if key in pic_cache:
             if pic_cache[key] is not None:
-                widget.configure(image=pil_photo(pic_cache[key]))
+                widget.configure(image=pil_photo(pic_cache[key], keep))
             return
         pic_wait.setdefault(key, []).append(widget)
         if key in pic_busy:
@@ -4982,7 +6319,7 @@ def gui():
             for w in pic_wait.pop(key):
                 try:
                     if w.winfo_exists() and pic_cache[key] is not None:
-                        w.configure(image=pil_photo(pic_cache[key]))
+                        w.configure(image=pil_photo(pic_cache[key], getattr(w, "_keep", None)))
                 except tk.TclError:
                     pass
         if pic_wait:
@@ -5082,8 +6419,11 @@ def gui():
             cb["loading"] = False
 
             def redraw():
-                if qid == cb["qid"] and state["tab"] == "builder":
-                    state["keep_scroll"] = more
+                if qid != cb["qid"] or state["tab"] != "builder":
+                    return
+                if more and state.get("b_append"):
+                    state["b_append"](offset)
+                else:
                     show("builder", animated=False)
             win.after(0, redraw)
         threading.Thread(target=work, daemon=True).start()
@@ -5097,7 +6437,6 @@ def gui():
     def build_builder():
         cb = builder_state()
         section("Конструктор сборок", 0, "любые моды с Modrinth: нужные библиотеки Portalis добавит сам")
-        n_sel = len(cb["sel"])
         hero(1, "builder_wide.png", "Собери свою сборку",
              "Найди моды, шейдеры и текстуры. Portalis проверит, что они подходят к версии игры, "
              "и сам добавит всё, без чего они не запустятся.")
@@ -5156,9 +6495,19 @@ def gui():
             half = (len(MR_CATEGORIES) + 1) // 2
             chip_row(r3, [(None, "Все")] + MR_CATEGORIES[:half - 1], cb["cat"], lambda v: builder_set(cat=v), PANEL)
             chip_row(r4, MR_CATEGORIES[half - 1:], cb["cat"], lambda v: builder_set(cat=v), PANEL)
-        # «Моя сборка»
+        builder_sel_panel()
+        builder_results()
+
+    def builder_sel_panel():
+        """Панель «Моя сборка» (строка 3). Перестраивается одна, без списка модов."""
+        cb = state["cb"]
+        n_sel = len(cb["sel"])
+        old = state.get("b_sel")
+        if old is not None and old.winfo_exists():
+            old.destroy()
         sel = tk.Frame(inner, bg=CARD, padx=14, pady=12, highlightthickness=1, highlightbackground=ACCENT if n_sel else CARD)
         sel.grid(row=3, column=0, columnspan=2, sticky="we", padx=(0, 14), pady=(0, 14))
+        state["b_sel"] = sel
         top = tk.Frame(sel, bg=CARD)
         top.pack(fill="x")
         tk.Label(top, image=art("tab_builder.png", 1, 1), bg=CARD).pack(side="left")
@@ -5173,7 +6522,7 @@ def gui():
                  font=(FONT, 10), fg=MUTED, bg=CARD).pack(side="left")
         if n_sel:
             big_button(top, "Собрать сборку", lambda: builder_build(), icon="ic_add.png").pack(side="right")
-            small_button(top, "Очистить", lambda: (cb["sel"].clear(), show("builder", animated=False)), bg=CARD,
+            small_button(top, "Очистить", lambda: (cb["sel"].clear(), builder_sel_panel(), builder_marks()), bg=CARD,
                          icon="ic_delete.png").pack(side="right", padx=6)
             chips = tk.Frame(sel, bg=CARD)
             chips.pack(fill="x", pady=(10, 0))
@@ -5190,14 +6539,18 @@ def gui():
                 width += w
                 b = tk.Label(line, text=t, font=(FONT, 9, "bold"), bg=CARD_HI, fg=TEXT, padx=9, pady=4, cursor="hand2")
                 b.pack(side="left", padx=(0, 5))
-                b.bind("<Button-1>", lambda ev, pid=pid: (cb["sel"].pop(pid, None), show("builder", animated=False)))
+                b.bind("<Button-1>", lambda ev, pid=pid: (cb["sel"].pop(pid, None), builder_sel_panel(), builder_marks()))
                 b.bind("<Enter>", lambda ev, b=b: fade_color(b, "bg", "#5a2b2b", 120))
                 b.bind("<Leave>", lambda ev, b=b: fade_color(b, "bg", CARD_HI, 160))
         else:
             tk.Label(sel, text="Нажимай «Добавить» у модов ниже. Потом «Собрать сборку»: Portalis подберёт версии, "
                                "добавит обязательные библиотеки и сохранит сборку — её можно будет включить, как любую другую.",
                      font=(FONT, 10), fg=MUTED, bg=CARD, anchor="w", justify="left", wraplength=900).pack(fill="x", pady=(8, 0))
-        # результаты
+        auto_wrap(sel)
+
+    def builder_results():
+        cb = state["cb"]
+        state["b_rows"] = {}
         if cb.get("error"):
             empty_note(4, "Modrinth не ответил: %s. Проверь интернет и нажми F5." % cb["error"])
             return
@@ -5211,8 +6564,50 @@ def gui():
             return
         tk.Label(inner, text="Найдено: %s" % fmt_count(cb["total"]), font=(FONT, 9), fg=MUTED, bg=BG, anchor="w").grid(
             row=4, column=0, columnspan=2, sticky="we", pady=(0, 6))
+        builder_cards(0)
+
+    def builder_append(offset):
+        """Новая страница результатов: карточки дописываются в конец, прокрутка не прыгает."""
+        builder_cards(offset)
+        auto_wrap(inner)
+        win.after_idle(check_more)
+    state["b_append"] = builder_append
+
+    def builder_marks():
+        """Кнопки «Добавить» / «В сборке» у всех карточек - по текущему выбору."""
+        for pid, (row, h) in list(state.get("b_rows", {}).items()):
+            if row.winfo_exists():
+                builder_card_buttons(row, h)
+
+    def builder_card_buttons(row, h):
+        cb = state["cb"]
+        for w in row.winfo_children():
+            w.destroy()
+        inn = h["project_id"] in cb["sel"]
+
+        def toggle(h=h):
+            if h["project_id"] in cb["sel"]:
+                cb["sel"].pop(h["project_id"])
+            else:
+                cb["sel"][h["project_id"]] = {"project_id": h["project_id"], "title": h["title"],
+                                              "type": cb["ptype"], "icon": h.get("icon_url")}
+            builder_sel_panel()
+            builder_card_buttons(row, h)
+        if inn:
+            big_button(row, "В сборке  ✓", toggle, color=CARD_HI, hover="#5a2b2b").pack(side="right")
+        else:
+            big_button(row, "Добавить", toggle, icon="ic_add.png").pack(side="right")
+        small_button(row, "Страница", lambda h=h: webbrowser.open("https://modrinth.com/%s/%s" % (
+            h.get("project_type", "mod"), h.get("slug") or h["project_id"])), bg=CARD, icon="ic_globe.png").pack(
+            side="right", padx=6)
+
+    def builder_cards(start):
+        cb = state["cb"]
+        old = state.get("b_more")
+        if old is not None and old.winfo_exists():
+            old.destroy()
         cats = dict(MR_CATEGORIES)
-        for i, h in enumerate(cb["results"]):
+        for i, h in enumerate(cb["results"][start:], start):
             c = card(inner, i % 2, 5 + i // 2)
             top = tk.Frame(c, bg=CARD)
             top.pack(fill="x")
@@ -5234,30 +6629,24 @@ def gui():
                      wraplength=400).pack(fill="x", pady=(8, 8))
             row = tk.Frame(c, bg=CARD)
             row.pack(fill="x", side="bottom")
-            inn = h["project_id"] in cb["sel"]
-
-            def toggle(h=h):
-                if h["project_id"] in cb["sel"]:
-                    cb["sel"].pop(h["project_id"])
-                else:
-                    cb["sel"][h["project_id"]] = {"project_id": h["project_id"], "title": h["title"],
-                                                  "type": cb["ptype"], "icon": h.get("icon_url")}
-                show("builder", animated=False)
-            if inn:
-                big_button(row, "В сборке  ✓", toggle, color=CARD_HI, hover="#5a2b2b").pack(side="right")
-            else:
-                big_button(row, "Добавить", toggle, icon="ic_add.png").pack(side="right")
-            small_button(row, "Страница", lambda h=h: webbrowser.open("https://modrinth.com/%s/%s" % (
-                h.get("project_type", "mod"), h.get("slug") or h["project_id"])), bg=CARD, icon="ic_globe.png").pack(
-                side="right", padx=6)
+            builder_card_buttons(row, h)
+            state["b_rows"][h["project_id"]] = (row, h)
         last = 5 + (len(cb["results"]) + 1) // 2
         if len(cb["results"]) < cb["total"]:
             mb = tk.Frame(inner, bg=BG)
-            mb.grid(row=last, column=0, columnspan=2, pady=(0, 14))
+            mb.grid(row=last, column=0, columnspan=2, pady=(4, 18))
+            state["b_more"] = mb
+            note = tk.Label(mb, text="Листай ниже — покажу ещё", font=(FONT, 10), fg=MUTED, bg=BG)
+            note.pack()
+
+            def more():
+                if mb.winfo_exists():
+                    note.configure(text="Загружаю ещё...", font=(FONT, 10, "bold"), fg=GOLD)
+                builder_query(more=True)
             if cb.get("loading"):
-                tk.Label(mb, text="Загружаю ещё...", font=(FONT, 10, "bold"), fg=GOLD, bg=BG).pack()
+                note.configure(text="Загружаю ещё...", font=(FONT, 10, "bold"), fg=GOLD)
             else:
-                big_button(mb, "Показать ещё", lambda: builder_query(more=True), color=CARD_HI, hover=LINE).pack()
+                state["more"] = more
 
     def builder_build():
         cb = state["cb"]
@@ -5419,6 +6808,307 @@ def gui():
         toast("Сборка «%s» открыта в конструкторе: добавь или убери моды и нажми «Собрать сборку»." % cb["name"], "info",
               ms=7000)
 
+    # --- вкладка «Версии»: любая версия игры без лаунчера ---
+    POPULAR_GV = ["26.2", "26.1.2", "1.21.8", "1.21.4", "1.21.1", "1.20.1", "1.19.2", "1.18.2", "1.16.5", "1.12.2",
+                  "1.8.9", "1.7.10"]
+
+    def versions_state():
+        vv = state.get("vv")
+        if vv is None:
+            vv = state["vv"] = {"gv": POPULAR_GV[1], "loader": "vanilla", "assets": True, "list": None, "err": None}
+
+            def load():
+                try:
+                    vv["list"] = mojang_versions()
+                except Exception as e:
+                    vv["err"] = str(e)[:100]
+                win.after(0, lambda: state["tab"] == "versions" and show("versions", animated=False))
+            threading.Thread(target=load, daemon=True).start()
+        return vv
+
+    def version_menu(anchor_w, on_pick):
+        """Все версии Mojang: релизы по линейкам (1.21, 1.20, ...) и свежие снапшоты."""
+        vv = versions_state()
+        menu = tk.Menu(win, tearoff=0, bg=CARD_HI, fg=TEXT, activebackground=ACCENT, activeforeground="white",
+                       font=(FONT, 10), bd=0)
+        if not vv["list"]:
+            menu.add_command(label="  Список версий ещё загружается...  ", state="disabled")
+        else:
+            groups = {}
+            for v in vv["list"]:
+                if v["type"] != "release":
+                    continue
+                parts = v["id"].split(".")
+                key = ".".join(parts[:2]) if parts[0] == "1" else parts[0]
+                groups.setdefault(key, []).append(v["id"])
+            for key, ids in groups.items():
+                if len(ids) == 1:
+                    menu.add_command(label="  %s  " % ids[0], command=lambda v=ids[0]: on_pick(v))
+                    continue
+                sub = tk.Menu(menu, tearoff=0, bg=CARD_HI, fg=TEXT, activebackground=ACCENT, activeforeground="white",
+                              font=(FONT, 10), bd=0)
+                for i in ids:
+                    sub.add_command(label="  %s  " % i, command=lambda v=i: on_pick(v))
+                menu.add_cascade(label="  %s.x  " % key if key.count(".") or key.isdigit() else key, menu=sub)
+            snaps = [v["id"] for v in vv["list"] if v["type"] == "snapshot"][:12]
+            if snaps:
+                sub = tk.Menu(menu, tearoff=0, bg=CARD_HI, fg=TEXT, activebackground=ACCENT, activeforeground="white",
+                              font=(FONT, 10), bd=0)
+                for i in snaps:
+                    sub.add_command(label="  %s  " % i, command=lambda v=i: on_pick(v))
+                menu.add_separator()
+                menu.add_cascade(label="  Снапшоты (тестовые)  ", menu=sub)
+        menu.tk_popup(anchor_w.winfo_rootx(), anchor_w.winfo_rooty() + anchor_w.winfo_height())
+
+    def build_versions():
+        vv = versions_state()
+        section("Версии игры", 0, "любая версия Minecraft — без лаунчера")
+        hero(1, "versions_wide.png", "Любая версия — одним нажатием",
+             "Portalis скачает игру, загрузчик модов, звуки и нужную Java прямо в папку игры. "
+             "Потом её увидит любой лаунчер, даже без интернета.")
+        opt = tk.Frame(inner, bg=PANEL, padx=14, pady=12)
+        opt.grid(row=2, column=0, columnspan=2, sticky="we", padx=(0, 14), pady=(0, 14))
+        r1 = tk.Frame(opt, bg=PANEL)
+        r1.pack(fill="x")
+        tk.Label(r1, text="Версия игры:", font=(FONT, 10, "bold"), fg=TEXT, bg=PANEL).pack(side="left", padx=(0, 8))
+        gb = tk.Label(r1, text="%s   ▾" % vv["gv"], font=(FONT, 11, "bold"), bg=ACCENT, fg="white", padx=12, pady=5,
+                      cursor="hand2")
+        gb.pack(side="left", padx=(0, 12))
+
+        def pick_gv(v):
+            vv["gv"] = v
+            show("versions", animated=False)
+        gb.bind("<Button-1>", lambda e: version_menu(gb, pick_gv))
+        tk.Label(r1, text="все версии — по нажатию", font=(FONT, 9), fg=MUTED, bg=PANEL).pack(side="left")
+        r2 = tk.Frame(opt, bg=PANEL)
+        r2.pack(fill="x", pady=(10, 0))
+        tk.Label(r2, text="Часто нужные:", font=(FONT, 10, "bold"), fg=TEXT, bg=PANEL).pack(side="left", padx=(0, 8))
+        chip_row(r2, [(v, v) for v in POPULAR_GV], vv["gv"], pick_gv, PANEL)
+        r3 = tk.Frame(opt, bg=PANEL)
+        r3.pack(fill="x", pady=(10, 0))
+        tk.Label(r3, text="Загрузчик модов:", font=(FONT, 10, "bold"), fg=TEXT, bg=PANEL).pack(side="left", padx=(0, 8))
+        chip_row(r3, VERSION_LOADERS, vv["loader"], lambda v: (vv.update(loader=v), show("versions", animated=False)), PANEL)
+        r4 = tk.Frame(opt, bg=PANEL)
+        r4.pack(fill="x", pady=(12, 0))
+        av = tk.BooleanVar(value=vv["assets"])
+        tk.Checkbutton(r4, text="Звуки, музыку и языки тоже (можно играть без интернета)", variable=av,
+                       command=lambda: vv.update(assets=bool(av.get())), font=(FONT, 10), bg=PANEL, fg=TEXT,
+                       selectcolor=CARD, activebackground=PANEL, activeforeground=TEXT, highlightthickness=0,
+                       bd=0).pack(side="left")
+        title = "Minecraft %s%s" % (vv["gv"], "" if vv["loader"] == "vanilla" else " + " + dict(VERSION_LOADERS)[vv["loader"]])
+        big_button(r4, "Скачать  " + title, lambda: version_dialog(vv["gv"], vv["loader"], None, vv["assets"]),
+                   icon="ic_download.png").pack(side="right")
+        tk.Label(opt, text="Скачивается всё нужное для запуска: сама игра, библиотеки, звуки и текстуры и Java той версии, "
+                           "которую просит игра. Forge и NeoForge ставятся своими официальными установщиками, Fabric и "
+                           "Quilt — профилем. Файлы берутся с серверов Mojang и авторов загрузчиков, с проверкой.",
+                 font=(FONT, 9), fg=MUTED, bg=PANEL, anchor="w", justify="left", wraplength=900).pack(fill="x", pady=(12, 0))
+        if vv.get("err"):
+            empty_note(3, "Список версий Mojang не загрузился (%s). Популярные версии всё равно можно скачать." % vv["err"])
+        # Уже скачанные
+        have = installed_versions()
+        section("Уже в папке игры  (%d)" % len(have), 4, os.path.join(MC, "versions"))
+        if not have:
+            empty_note(5, "Пока ни одной версии. Выбери версию сверху и нажми «Скачать».")
+            return
+        for i, v in enumerate(have):
+            c = card(inner, i % 2, 5 + i // 2)
+            top = tk.Frame(c, bg=CARD)
+            top.pack(fill="x")
+            tk.Label(top, image=art("ic_versions_48.png" if v["kind"] == "Без модов" else "ic_loader_48.png", 48, 48),
+                     bg=CARD).pack(side="left", padx=(0, 10))
+            tk.Label(top, text=v["id"], font=(FONT, 12, "bold"), fg=TEXT, bg=CARD, anchor="w", justify="left",
+                     wraplength=280).pack(side="left", fill="x", expand=True)
+            badge(top, v["kind"], ACCENT if v["kind"] != "Без модов" else LINE).pack(side="right")
+            tk.Label(c, text="Minecraft %s  ·  %s" % (v["gv"], time.strftime("%d.%m.%Y", time.localtime(v["time"]))),
+                     font=(FONT, 9), fg=MUTED, bg=CARD, anchor="w").pack(fill="x", pady=(2, 0))
+            miss = version_missing(v["id"])
+            tk.Label(c, text=("●  готова к игре" if not miss else "●  не хватает: %s%s" % (
+                ", ".join(miss[:2]), " и ещё %d" % (len(miss) - 2) if len(miss) > 2 else "")),
+                font=(FONT, 9, "bold"), fg=ACCENT_HI if not miss else "#e0a45a", bg=CARD, anchor="w", justify="left",
+                wraplength=400).pack(fill="x", pady=(2, 8))
+            row = tk.Frame(c, bg=CARD)
+            row.pack(fill="x", side="bottom")
+
+            def choose(v=v):
+                ok, hint = select_version(v["id"], v["id"])
+                toast(hint or "Версия «%s» выбрана в лаунчере %s." % (v["id"], launcher_title(chosen_launcher())),
+                      "ok" if ok else "info", ms=7000)
+                refresh_head()
+
+            def remove(v=v):
+                if not messagebox.askyesno("Убрать версию?", "Убрать версию «%s» в Корзину?\n\nМиры, сборки и настройки "
+                                                             "не пострадают: уберётся только папка versions\\%s."
+                                           % (v["id"], v["id"])):
+                    return
+                if recycle(os.path.join(MC, "versions", v["id"])):
+                    toast("Версия «%s» в Корзине." % v["id"], "ok")
+                else:
+                    toast("Не получилось убрать в Корзину: папка занята или диск без Корзины.", "warn")
+                show("versions", animated=False)
+            if miss and v.get("spec"):
+                big_button(row, "Докачать", lambda sp=v["spec"]: version_dialog(sp[0], sp[1], sp[2], True),
+                           icon="ic_download.png").pack(side="right")
+            else:
+                big_button(row, "Выбрать", choose, color=CARD_HI, hover=LINE, icon="ic_check.png").pack(side="right")
+            if v.get("spec") and not miss:
+                small_button(row, "Проверить", lambda sp=v["spec"]: version_dialog(sp[0], sp[1], sp[2], True),
+                             bg=CARD, icon="ic_download.png").pack(side="left")
+            small_button(row, "Папка", lambda v=v: os.startfile(os.path.join(MC, "versions", v["id"])), bg=CARD,
+                         icon="ic_folder.png").pack(side="left")
+            small_button(row, "Убрать", remove, bg=CARD, icon="ic_delete.png").pack(side="left")
+            for b in row.winfo_children():
+                if b.cget("bg") == CARD:
+                    b.configure(padx=5)
+
+    def version_dialog(gv, loader, lv=None, assets=True):
+        """Окно скачивания версии: что будет скачано, сколько, прогресс, итог."""
+        title = "Minecraft %s%s" % (gv, "" if loader == "vanilla" else " + " + dict(VERSION_LOADERS)[loader])
+        t = tk.Toplevel(win)
+        t.title(title)
+        t.configure(bg=BG)
+        t.transient(win)
+        W, H = 640, 470
+        t.geometry("%dx%d+%d+%d" % (W, H, win.winfo_rootx() + (win.winfo_width() - W) // 2, win.winfo_rooty() + 70))
+        fr = tk.Frame(t, bg=BG, padx=24, pady=20)
+        fr.pack(fill="both", expand=True)
+        hd = tk.Frame(fr, bg=BG)
+        hd.pack(fill="x")
+        tk.Label(hd, image=art("tab_versions_48.png", 48, 48), bg=BG).pack(side="left")
+        tk.Label(hd, text="  " + title, font=(FONT, 16, "bold"), fg=TEXT, bg=BG).pack(side="left")
+        msg = tk.Label(fr, text="Проверяю, что уже есть в папке игры...", font=(FONT, 10, "bold"), fg=GOLD, bg=BG,
+                       anchor="w", justify="left", wraplength=W - 60)
+        msg.pack(fill="x", pady=(12, 6))
+        bar = tk.Canvas(fr, height=10, bg=LINE, highlightthickness=0, bd=0)
+        bar.pack(fill="x")
+        fill = bar.create_rectangle(0, 0, 0, 10, fill=ACCENT, width=0)
+        lst = tk.Text(fr, bg=PANEL, fg="#c3c7d1", font=(FONT, 10), relief="flat", wrap="word", height=11,
+                      highlightthickness=0, padx=12, pady=10)
+        lst.pack(fill="both", expand=True, pady=(12, 0))
+        lst.tag_configure("h", foreground=TEXT, font=(FONT, 11, "bold"))
+        lst.tag_configure("muted", foreground=MUTED)
+        row = tk.Frame(fr, bg=BG)
+        row.pack(fill="x", pady=(12, 0))
+        box = {"cancel": threading.Event(), "step": "", "done": 0, "total": 1, "t0": 0}
+
+        def buttons(*bs):
+            for w in row.winfo_children():
+                w.destroy()
+            for kind, text, cmd in bs:
+                (big_button(row, text, cmd) if kind == "big" else small_button(row, text, cmd, bg=BG)).pack(
+                    side="right", padx=(8, 0))
+        buttons(("small", "Отмена", lambda: (box["cancel"].set(), t.destroy())))
+
+        def planning():
+            try:
+                box["plan"] = plan_version(gv, loader, lv, assets, log=lambda m: box.__setitem__("step", m))
+            except Exception as e:
+                box["err"] = str(e)
+        th = threading.Thread(target=planning, daemon=True)
+        th.start()
+
+        def ready_buttons(vid):
+            def pick():
+                ok, hint = select_version(vid, vid)
+                toast(hint or "Версия «%s» выбрана в лаунчере %s." % (vid, launcher_title(chosen_launcher())),
+                      "ok" if ok else "info", ms=7000)
+                refresh_head()
+                t.destroy()
+            buttons(("big", "Выбрать в моём лаунчере", pick), ("small", "Закрыть", t.destroy))
+
+        def poll():
+            if not t.winfo_exists():
+                return
+            if th.is_alive():
+                msg.configure(text="Проверяю, что уже есть в папке игры...  " + box.get("step", ""))
+                t.after(150, poll)
+                return
+            if "err" in box:
+                msg.configure(text="Не получилось: " + box["err"], fg="#e05a5a")
+                buttons(("small", "Закрыть", t.destroy))
+                return
+            pl = box["plan"]
+            kinds = {"jar": 0, "lib": 0, "asset": 0, "java": 0}
+            for u, path, sha, size in pl["tasks"]:
+                k = ("asset" if os.sep + "objects" + os.sep in path else "java" if os.sep + "runtime" + os.sep in path
+                     else "lib" if os.sep + "libraries" + os.sep in path else "jar")
+                kinds[k] += size or 0
+            lst.insert("end", "Версия в папке игры: ", "h")
+            lst.insert("end", "%s\n\n" % pl["id"])
+            for k, text in (("jar", "Игра (клиент и описание)"), ("lib", "Библиотеки"),
+                            ("asset", "Звуки, музыка и языки"), ("java", "Java для игры (%s)" % pl["java"])):
+                lst.insert("end", "  •  %s:  " % text)
+                lst.insert("end", (fmt_mb(kinds[k]) if kinds[k] else "не качаю, лаунчер докачает сам при запуске"
+                                   if k == "asset" and not assets else "уже есть") + "\n", "muted")
+            if loader != "vanilla":
+                lst.insert("end", "  •  %s %s:  " % (LOADER_TITLES[loader], pl["lv"]))
+                lst.insert("end", ("поставит официальный установщик\n" if pl["installer"] else
+                                   "уже стоит\n" if loader in ("forge", "neoforge") else "профиль Fabric\n"
+                                   if loader == "fabric" else "профиль Quilt\n"), "muted")
+            lst.configure(state="disabled")
+            if not pl["tasks"] and not pl["installer"]:
+                bar.coords(fill, 0, 0, bar.winfo_width(), 10)
+                msg.configure(text=("Всё уже скачано: версия «%s» готова к игре." if assets else
+                                    "Всё уже скачано: версия «%s» на месте, звуки и музыку лаунчер докачает сам.")
+                              % pl["id"], fg=ACCENT_HI)
+                ready_buttons(pl["id"])
+                return
+            msg.configure(text="Скачаю %s (%d %s)%s." % (fmt_mb(pl["size"]), len(pl["tasks"]),
+                                                       plural(len(pl["tasks"]), "файл", "файла", "файлов"),
+                                                       " и запущу установщик" if pl["installer"] else ""), fg=TEXT)
+            buttons(("big", "Скачать  (%s)" % fmt_mb(pl["size"]), lambda: start(pl)), ("small", "Отмена", t.destroy))
+
+        def start(pl):
+            if state["busy"]:
+                toast("Подожди, программа сейчас занята.", "warn")
+                return
+            state["busy"] = True
+            busy_anim(True)
+            box["t0"] = time.time()
+            buttons(("small", "Отмена", lambda: box["cancel"].set()))
+
+            def work():
+                try:
+                    box["vid"] = apply_version(pl, log=lambda m: box.__setitem__("step", m),
+                                               progress=lambda d, tot: box.update(done=d, total=tot), cancel=box["cancel"])
+                except Exception as e:
+                    box["err2"] = str(e)
+            th2 = threading.Thread(target=work, daemon=True)
+            th2.start()
+
+            def poll2():
+                if th2.is_alive():
+                    if t.winfo_exists():
+                        frac = min(1.0, box["done"] / float(max(1, box["total"])))
+                        bar.coords(fill, 0, 0, bar.winfo_width() * frac, 10)
+                        speed = box["done"] / max(0.5, time.time() - box["t0"])
+                        left = (box["total"] - box["done"]) / speed if speed > 1 and frac < 1 else 0
+                        msg.configure(text="%s   %d%%%s" % (box.get("step", ""), frac * 100, (
+                            "  ·  %s/с, осталось ~%s" % (fmt_mb(speed), "%d мин" % (left // 60 + 1) if left > 60 else
+                                                        "%d с" % max(1, left))) if frac < 0.995 and left else ""),
+                                      fg=GOLD)
+                    win.after(200, poll2)
+                    return
+                state["busy"] = False
+                busy_anim(False)
+                if not t.winfo_exists():
+                    if "vid" in box:
+                        toast("Версия «%s» скачана." % box["vid"], "ok")
+                    return
+                if "err2" in box:
+                    msg.configure(text=("Отменено. Уже скачанное останется, в следующий раз докачаю остальное."
+                                        if "отменено" in box["err2"] else "Не получилось: " + box["err2"]), fg="#e05a5a")
+                    buttons(("small", "Закрыть", t.destroy))
+                    return
+                bar.coords(fill, 0, 0, bar.winfo_width(), 10)
+                msg.configure(text="Готово! Версия «%s» в папке игры: её видит любой лаунчер." % box["vid"], fg=ACCENT_HI)
+                toast("Версия «%s» скачана." % box["vid"], "ok")
+                ready_buttons(box["vid"])
+                if state["tab"] == "versions":
+                    show("versions", animated=False)
+            poll2()
+        poll()
+        fade_in_window(t)
+
     # --- вкладка «Скины» ---
     def skin_photo_producer(png, slim=None, scale=5):
         return lambda: render_skin(png, slim, scale)
@@ -5455,15 +7145,29 @@ def gui():
             return
         sk["gal_loading"] = True
 
+        start = len(sk["gallery"])
+
         def work():
             try:
-                items, nxt = mineskin_popular(sk["after"], 24)
-                sk["gallery"] += items
+                have = {g["texture"] for g in sk["gallery"]}
+                items, nxt = mineskin_page(sk["after"])
+                sk["gallery"] += [g for g in items if g["texture"] not in have]
                 sk["after"] = nxt
             except Exception as e:
                 sk["gal_err"] = str(e)[:80]
             sk["gal_loading"] = False
-            win.after(0, lambda: state["tab"] == "skins" and (state.update(keep_scroll=True), show("skins", animated=False)))
+
+            def redraw():
+                if state["tab"] != "skins":
+                    return
+                g = state.get("gal_grid")
+                if start and g is not None and g.winfo_exists():
+                    gallery_cells(start)
+                    win.after_idle(check_more)
+                else:
+                    state["keep_scroll"] = True
+                    show("skins", animated=False)
+            win.after(0, redraw)
         threading.Thread(target=work, daemon=True).start()
 
     def wear_dialog(skin_path, cape_path=None, title=""):
@@ -5748,7 +7452,17 @@ def gui():
             row += 1
         grid = tk.Frame(inner, bg=BG)
         grid.grid(row=row, column=0, columnspan=2, sticky="we", pady=(0, 10))
-        for i, g in enumerate(sk["gallery"]):
+        state["gal_grid"] = grid
+        state["gal_row"] = row + 1
+        gallery_cells(0)
+
+    def gallery_cells(start):
+        sk = skins_state()
+        grid = state["gal_grid"]
+        old = state.get("gal_more")
+        if old is not None and old.winfo_exists():
+            old.destroy()
+        for i, g in enumerate(sk["gallery"][start:], start):
             cell = tk.Frame(grid, bg=CARD, padx=6, pady=6, cursor="hand2")
             cell.grid(row=i // 7, column=i % 7, padx=(0, 8), pady=(0, 8))
             lb = tk.Label(cell, bg=CARD, image=blank(104, 96))
@@ -5765,13 +7479,20 @@ def gui():
                                                                   show("skins", animated=False)))
             for w in (cell, lb) + tuple(cell.winfo_children()):
                 w.bind("<Button-1>", lambda e, f=take_g: f())
-        row += 1
         mb = tk.Frame(inner, bg=BG)
-        mb.grid(row=row, column=0, columnspan=2, pady=(0, 14))
+        mb.grid(row=state["gal_row"], column=0, columnspan=2, pady=(0, 14))
+        state["gal_more"] = mb
         if sk["gal_loading"]:
             tk.Label(mb, text="Загружаю галерею...", font=(FONT, 10, "bold"), fg=GOLD, bg=BG).pack()
         elif sk.get("after"):
-            big_button(mb, "Показать ещё", gallery_more, color=CARD_HI, hover=LINE).pack()
+            note = tk.Label(mb, text="Листай ниже — покажу ещё", font=(FONT, 10), fg=MUTED, bg=BG)
+            note.pack()
+
+            def more():
+                if mb.winfo_exists():
+                    note.configure(text="Загружаю ещё...", font=(FONT, 10, "bold"), fg=GOLD)
+                gallery_more()
+            state["more"] = more
 
     def import_skin():
         f = filedialog.askopenfilename(parent=win, title="Скин Minecraft (PNG 64x64 или 64x32)",
@@ -5805,7 +7526,8 @@ def gui():
         y = canvas.yview()[0] if keep else 0
         clear()
         {"maps": build_maps, "packs": build_packs, "servers": build_servers, "friend": build_friend,
-         "launchers": build_launchers, "builder": build_builder, "skins": build_skins}[key]()
+         "launchers": build_launchers, "builder": build_builder, "skins": build_skins,
+         "versions": build_versions}[key]()
         if keep:
             canvas.update_idletasks()
             canvas.configure(scrollregion=canvas.bbox("all"))
@@ -6159,7 +7881,8 @@ def gui():
         fade_in_window(t)
 
     # --- запуск: заставка, потом окно ---
-    win._hooks = {"finish": finish, "open_update": open_update, "toast": toast, "show": show, "body": canvas}
+    win._hooks = {"finish": finish, "open_update": open_update, "toast": toast, "show": show, "body": canvas,
+                  "version_dialog": version_dialog}
     # Окно открывается там же и таким же, каким его закрыли; горячие клавиши.
     g = settings.get("geometry", "")
     mg = re.match(r"^(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$", g)
@@ -6198,25 +7921,43 @@ def gui():
     show(settings.get("tab") if settings.get("tab") in TAB_ORDER else "maps", animated=False)
 
     def reveal():
-        def gone():
-            splash.destroy()
-            win.deiconify()
-            win.state("zoomed" if settings.get("zoomed") else "normal")  # первое окно бывает свёрнутым
-            win.lift()
+        """Окно показывается уже нарисованным: сначала оно прозрачное разворачивается под заставкой и
+        дорисовывается целиком (иначе Windows на миг показывает белые прямоугольники вместо картинок и
+        текста), потом заставка гаснет, а окно проявляется."""
+        try:
+            win.attributes("-alpha", 0.0)
+        except tk.TclError:
+            pass
+        win.deiconify()
+        win.state("zoomed" if settings.get("zoomed") else "normal")  # первое окно бывает свёрнутым
+        win.update_idletasks()
+        move_tab_line(state["tab"], instant=True)
+        place_head()
+        t_end = time.perf_counter() + 1.5
+        while time.perf_counter() < t_end:
+            win.update()
+            if not pic_wait:  # картинки из фона уже на местах
+                break
+            time.sleep(0.02)
+        for _ in range(3):
+            win.update()
+        try:
+            splash.attributes("-topmost", False)
+        except tk.TclError:
+            pass
+        win.lift()
+        try:
+            win.focus_force()
+        except tk.TclError:
+            pass
+
+        def step(k):
+            win.attributes("-alpha", k)
             try:
-                win.focus_force()
+                splash.attributes("-alpha", 1 - k)
             except tk.TclError:
                 pass
-            try:
-                win.attributes("-alpha", 0.0)
-            except tk.TclError:
-                pass
-            win.update_idletasks()
-            move_tab_line(state["tab"], instant=True)
-            place_head()
-            animate("win_in", 280, lambda k: win.attributes("-alpha", k))
-            win.after(500, after_start)
-        animate("splash_out", 220, lambda k: splash.attributes("-alpha", 1 - k), done=gone)
+        animate("win_in", 260, step, done=lambda: (splash.destroy(), win.after(250, after_start)))
 
     def after_start():
         if not library_found() or not load_local_manifest().get("items"):
