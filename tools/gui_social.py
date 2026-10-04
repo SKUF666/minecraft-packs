@@ -2,6 +2,8 @@
 Создаёт на сервере тестовых игроков zt_<...>_g / _h. python tools/gui_social.py"""
 import os, sys, random, string, importlib.machinery, importlib.util, tkinter as tk, traceback
 from PIL import ImageGrab
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import winshot
 sys.stdout.reconfigure(encoding='utf-8')
 OUT = os.path.join(os.environ.get('TEMP', '.'), 'minecraft-packs-shots')
 LIB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'library')
@@ -24,6 +26,7 @@ def as_other(fn):
 h = as_other(lambda: ps.Social())
 as_other(lambda: h.sign_up(tag + '_h', pw, 'Друг Б'))
 orig = tk.Tk.mainloop
+state_map = []
 errors = []
 
 
@@ -34,14 +37,11 @@ def walk(w):
 
 
 def grab(w, name):
-    w.attributes('-topmost', True)
-    w.update()
-    x, y = w.winfo_rootx(), w.winfo_rooty()
-    ImageGrab.grab(bbox=(x, y, x + w.winfo_width(), y + w.winfo_height())).save(os.path.join(OUT, name + '.png'))
+    winshot.shot(w, os.path.join(OUT, name + '.png'))
 
 
 def patched(self, *a):
-    self.geometry('1080x760+30+30')
+    self.geometry('1080x760+2200+30')
     hk = self._hooks
     steps = []
 
@@ -106,6 +106,29 @@ def patched(self, *a):
         as_other(lambda: (h.update_profile(avatar='preset:11', presence='dnd', mood='Строю замок',
                                             favorites=['SkyBlock']), h.post_wall(h.uid, 'Мой замок почти готов!')))
         as_other(lambda: h.post_wall(g.uid, 'Привет! Сыграем сегодня?'))
+        # этап 2: рамка, лента, ответы и реакции, картинка в чате, оценка карты
+        g.update_profile(frame=1)
+        w_ = g.wall(g.uid)
+        g.post_wall(g.uid, 'Да, в восемь вечера!', reply_to=w_[0]['id'])
+        as_other(lambda: (h.react('wall', w_[0]['id'], 'fire'), h.feed_post('achievement', 'получил(а) достижение «Первая карта»')))
+        g.react('wall', w_[0]['id'], 'like')
+        g.feed_post('level', 'достиг(ла) 3 уровня')
+        ev = g.feed()
+        as_other(lambda: h.like(ev[0]['id']))
+        if mine:
+            from PIL import Image as PI
+            im = PI.new('RGB', (640, 360), '#3d9be9')
+            for i in range(0, 640, 40):
+                im.paste('#4caf50' if (i // 40) % 2 else '#2b6a2f', (i, 240, i + 40, 360))
+            url = as_other(lambda: h.upload_image(im))
+            as_other(lambda: h.send('IMG ' + url, pid=mine[0]['id']))
+            ms = g.messages(pid=mine[0]['id'])
+            g.react('msg', ms[0]['id'], 'gg'); as_other(lambda: h.react('msg', ms[0]['id'], 'lol'))
+        mp = hk['find_maps']()
+        if mp:
+            state_map.append(mp[0])
+            g.review('portalis:%s' % mp[0]['id'], 5, 'Отличная карта, прошли вдвоём за вечер!')
+            as_other(lambda: h.review('portalis:%s' % mp[0]['id'], 4, None))
         print('обновить2:', click('Обновить'))
     at(500, profiles)
     at(16000, lambda: (hk['body'].yview_moveto(0.2), None))
@@ -116,9 +139,24 @@ def patched(self, *a):
     at(5000, lambda: grab([w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1], 'prof_mine'))
     at(300, lambda: [w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1]._cv.yview_moveto(0.3))
     at(1500, lambda: grab([w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1], 'prof_mine2'))
+    for k_, y_ in (('prof_mine3', 0.5), ('prof_mine4', 0.68), ('prof_mine5', 1.0)):
+        at(300, lambda y_=y_: [w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1]._cv.yview_moveto(y_))
+        at(1500, lambda k_=k_: grab([w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1], k_))
     at(300, lambda: [w.destroy() for w in self.winfo_children() if isinstance(w, tk.Toplevel)])
     at(500, lambda: print('друг:', click('Друг Б', True)))
     at(4000, lambda: grab([w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1], 'prof_friend'))
+    at(300, lambda: [w.destroy() for w in self.winfo_children() if isinstance(w, tk.Toplevel)])
+    at(300, lambda: (hk['body'].yview_moveto(1.0), None))
+    at(2500, lambda: (grab(self, 'soc_feed'), print('лента:', [str(x.cget('text')) for x in walk(self) if isinstance(x, tk.Label)
+                                                             and 'достиг' in str(x.cget('text'))])))
+    at(300, lambda: print('реакции в чате:', [len(t.image_names()) for t in walk(self) if isinstance(t, tk.Text)],
+                          [t.get('1.0', 'end').strip()[:200] for t in walk(self) if isinstance(t, tk.Text)]))
+    for k_, y_ in (('soc_feed2', 0.45), ('soc_feed3', 0.6), ('soc_chat2', 0.3)):
+        at(300, lambda y_=y_: (hk['body'].yview_moveto(y_), None))
+        at(1500, lambda k_=k_: grab(self, k_))
+    at(300, lambda: hk['open_map'](state_map[0]) if state_map else None)
+    at(4000, lambda: [w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1]._cv.yview_moveto(1.0))
+    at(1500, lambda: grab([w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1], 'map_reviews'))
     at(300, lambda: [w.destroy() for w in self.winfo_children() if isinstance(w, tk.Toplevel)])
 
     def self_name():

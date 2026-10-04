@@ -4,6 +4,8 @@
 import os, sys, random, string, importlib.machinery, importlib.util, tkinter as tk, traceback
 from PIL import ImageGrab
 sys.stdout.reconfigure(encoding='utf-8')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import winshot
 OUT = os.path.join(os.environ.get('TEMP', '.'), 'minecraft-packs-shots')
 LIB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'library')
 L = importlib.machinery.SourceFileLoader('ps', os.path.join(LIB, 'PackSwitcher.pyw'))
@@ -39,7 +41,7 @@ def walk(w):
 
 
 def patched(self, *a):
-    self.geometry('1080x760+30+30')
+    self.geometry('1080x760+2200+30')
     hk = self._hooks
     steps = []
 
@@ -74,8 +76,7 @@ def patched(self, *a):
     at(300, party)
     for k in range(9):
         at(4000, lambda k=k: watch('игра %d' % k))
-    at(300, lambda: (ImageGrab.grab(bbox=(self.winfo_rootx(), self.winfo_rooty(), self.winfo_rootx() + self.winfo_width(),
-                                         self.winfo_rooty() + self.winfo_height())).save(os.path.join(OUT, 'notify.png'))))
+    at(300, lambda: winshot.shot(self, os.path.join(OUT, 'notify.png')))
 
     def cleanup():
         try:

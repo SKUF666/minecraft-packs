@@ -197,6 +197,65 @@ except ps.SocialError:
 idea = next(p_ for p_ in props if p_['title'] == 'Строим базу на выживании')
 use(a).delete_proposal(idea['id'])
 check(all(p_['id'] != idea['id'] for p_ in use(b).proposals(party['id'])), 'хозяин убрал чужое предложение')
+# лента друзей и лайки
+use(a).feed_post('achievement', 'получил(а) достижение «Лидер»', {'ach': 8})
+fb_ = use(b).feed()
+check(fb_ and fb_[0]['text'].startswith('получил') and fb_[0]['profile']['nick'] == 'Тестер А', 'лента: друг видит событие А')
+use(b).like(fb_[0]['id'])
+check(use(a).feed()[0]['likes'] == [b.uid], 'лайк друга виден автору')
+check(use(x).feed() == [], 'посторонний не видит ленту')
+try:
+    use(x).like(fb_[0]['id'])
+    check(False, 'посторонний не должен лайкать')
+except ps.SocialError:
+    check(True, 'посторонний не может лайкать чужую ленту')
+# реакции и ответы на стене
+wl2 = use(b).wall(a.uid)
+use(b).react('wall', wl2[0]['id'], 'fire')
+use(a).post_wall(a.uid, 'Спасибо!', reply_to=wl2[0]['id'])
+wl3 = use(a).wall(a.uid)
+check(any(w_.get('reply_to') == wl2[0]['id'] for w_ in wl3), 'ответ на запись стены')
+check(wl3[-1]['reactions'].get('fire') == [b.uid] or any(w_['reactions'].get('fire') == [b.uid] for w_ in wl3), 'реакция 🔥 на стене')
+try:
+    use(x).react('wall', wl2[0]['id'], 'like')
+    check(False, 'посторонний не должен ставить реакции')
+except ps.SocialError:
+    check(True, 'посторонний не может ставить реакции на чужой стене')
+# реакции на сообщения пати
+pm = use(a).messages(pid=party['id'])
+use(b).react('msg', pm[0]['id'], 'gg')
+check(use(a).reactions('msg', [pm[0]['id']]).get(pm[0]['id'], {}).get('gg') == [b.uid], 'реакция GG на сообщение в пати')
+# оценки карт
+mk = 'test:' + tag
+use(a).review(mk, 5, 'Лучшая карта!')
+use(b).review(mk, 4)
+use(b).review(mk, 3, 'передумал')
+rt = use(x).ratings([mk, 'mi:123'])
+check(rt.get(mk) == (4.0, 2), 'средняя оценка 4.0 из двух (повторная оценка заменяет): %s' % rt)
+rv = use(x).reviews(mk)
+check(len(rv) == 2 and any(r_['text'] == 'Лучшая карта!' for r_ in rv), 'отзывы видят все игроки')
+# хранилище: картинка в чат и мир в облаке
+from PIL import Image
+url = use(a).upload_image(Image.new('RGB', (1600, 900), (40, 120, 60)))
+import urllib.request
+data = urllib.request.urlopen(url, timeout=30).read()
+check(data[:2] == b'\xff\xd8' and Image.open(__import__('io').BytesIO(data)).size == (1280, 720), 'картинка в чат: загружена и уменьшена до 1280')
+z = __import__('io').BytesIO()
+import zipfile
+with zipfile.ZipFile(z, 'w') as zf:
+    zf.writestr('world/level.dat', b'test')
+use(a).upload('worlds', 'party/%s/%s' % (party['id'], ps.world_key('Мир')), z.getvalue(), 'application/zip')
+files = use(b).list_files('worlds', 'party/%s/' % party['id'])
+check(any(ps.world_title(f_['name']) == 'Мир' for f_ in files), 'мир в облаке пати виден другому участнику')
+dst = os.path.join(tmp, 'w.zip')
+use(b).download_file('worlds', 'party/%s/%s' % (party['id'], ps.world_key('Мир')), dst)
+check(open(dst, 'rb').read() == z.getvalue(), 'участник скачал мир пати')
+try:
+    use(x).download_file('worlds', 'party/%s/%s' % (party['id'], ps.world_key('Мир')), dst + '2')
+    check(False, 'посторонний не должен скачать мир')
+except Exception:
+    check(True, 'посторонний не может скачать мир пати')
+use(a).delete_file('worlds', 'party/%s/%s' % (party['id'], ps.world_key('Мир')))
 use(b).leave(party)
 check(not use(b).parties()[0], 'Б вышел из пати')
 use(a).leave(party)

@@ -3,6 +3,8 @@
 import os, sys, importlib.machinery, importlib.util, tkinter as tk, traceback
 from PIL import ImageGrab
 sys.stdout.reconfigure(encoding='utf-8')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import winshot
 OUT = os.path.join(os.environ.get('TEMP', '.'), 'minecraft-packs-shots')
 os.makedirs(OUT, exist_ok=True)
 LIB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'library')
@@ -29,14 +31,11 @@ def click(root, text, nth=0):
 
 
 def grab(w, name):
-    w.attributes('-topmost', True)
-    w.update()
-    x, y = w.winfo_rootx(), w.winfo_rooty()
-    ImageGrab.grab(bbox=(x, y, x + w.winfo_width(), y + w.winfo_height())).save(os.path.join(OUT, name + '.png'))
+    winshot.shot(w, os.path.join(OUT, name + '.png'))
 
 
 def patched(self, *a):
-    self.geometry('1080x760+30+30')
+    self.geometry('1080x760+2200+30')
     h = self._hooks
     steps = []
 

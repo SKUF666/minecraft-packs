@@ -206,3 +206,23 @@ for i in range(12):
     out.paste(cell, (0, 0), mask)
     out.resize((64, 64), Image.LANCZOS).save(os.path.join(OUT, 'achievements', 'ach_%02d.png' % (i + 1)))
 print('достижения готовы')
+
+
+# --- рамки аватара (2026-10-04): 6 колец, свечение срезается, центр вычищается под аватар ---
+sh = Image.open(os.path.join(RAW, '39_frames.png')).convert('RGBA')
+cw, ch = sh.width // 3, sh.height // 2
+os.makedirs(os.path.join(OUT, 'frames'), exist_ok=True)
+for i in range(6):
+    cell = sh.crop(((i % 3) * cw, (i // 3) * ch, (i % 3 + 1) * cw, (i // 3 + 1) * ch))
+    cell = cell.crop(cell.getchannel('A').point(lambda v: 255 if v > 200 else 0).getbbox())
+    side = max(cell.size)
+    sq = Image.new('RGBA', (side, side), (0, 0, 0, 0))
+    sq.paste(cell, ((side - cell.width) // 2, (side - cell.height) // 2), cell)
+    sq = sq.resize((256, 256), Image.LANCZOS)
+    a = sq.getchannel('A').point(lambda v: 0 if v < 170 else 255)
+    hole = Image.new('L', (256, 256), 255)
+    ImageDraw.Draw(hole).ellipse((128 - 84, 128 - 84, 128 + 84, 128 + 84), fill=0)
+    from PIL import ImageChops
+    sq.putalpha(ImageChops.multiply(a, hole))
+    sq.resize((128, 128), Image.LANCZOS).save(os.path.join(OUT, 'frames', 'frame_%02d.png' % (i + 1)))
+print('рамки готовы')
