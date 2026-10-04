@@ -141,6 +141,35 @@ except ps.SocialError:
     check(True, 'посторонний не может писать на стену')
 use(a).delete_post(wl[0]['id'])
 check([w['body'] for w in use(a).wall(a.uid)] == ['Моя первая запись'], 'хозяин удалил чужую запись со своей стены')
+# прогресс: уровень, достижения, фон, скин
+check(ps.level_of(0)[0] == 1 and ps.level_of(100)[0] == 2 and ps.level_of(4500)[0] == 10, 'уровни: 0->1, 100->2, 4500->10')
+st = {'minutes': 650, 'maps': ['OneBlock', 'SkyBlock'], 'maps_n': 2, 'packs': 1, 'friends': 1, 'parties': 1, 'hosted': 1, 'night': True}
+names = [x[1] for x in ps.earned(st)]
+check({'Первые шаги', 'Сборщик', 'Лидер', 'Хозяин вечеринки', 'Полуночник', 'Марафонец'} <= set(names) and 'Звезда' not in names,
+      'достижения по статистике: ' + ', '.join(names))
+m = ps.merge_stats({'minutes': 10, 'maps': ['A']}, {'minutes': 30, 'maps': ['B', 'A'], 'night': True})
+check(m['minutes'] == 30 and m['maps'] == ['A', 'B'] and m['night'], 'статистика с двух компьютеров сливается')
+use(a).update_profile(stats=st, banner='builder', color='#9b59d0', skin='Notch')
+pa = use(b).profile(a.uid)
+check(pa['stats']['minutes'] == 650 and pa['banner'] == 'builder' and pa['skin'] == 'Notch' and pa['color'] == '#9b59d0',
+      'друг видит статистику, фон, цвет и скин')
+# лобби пати: карта и «готов»
+use(a).set_lobby(party['id'], {'map': 'oneblock', 'title': 'OneBlock', 'version': '26.1.2', 'pack': None})
+check(use(b).party(party['id'])['lobby']['title'] == 'OneBlock', 'Б видит карту пати')
+use(b).set_ready(party['id'], True)
+rd = {m['id']: m['ready'] for m in use(a).members(party['id'])}
+check(rd.get(b.uid) is True and rd.get(a.uid) is False, 'хозяин видит: Б готов, сам ещё нет')
+try:
+    use(x).rest('PATCH', 'party_members', {'party_id': 'eq.' + party['id'], 'user_id': 'eq.' + a.uid}, {'ready': True})
+    check(not {m['id']: m['ready'] for m in use(a).members(party['id'])}.get(a.uid), 'посторонний не отметил «готов» за другого')
+except ps.SocialError:
+    check(True, 'посторонний не может отметить «готов» за другого')
+try:
+    use(b).rest('PATCH', 'party_members', {'party_id': 'eq.' + party['id'], 'user_id': 'eq.' + b.uid},
+                {'party_id': '00000000-0000-0000-0000-000000000000'})
+    check(False, 'перенести себя в другую пати нельзя')
+except ps.SocialError:
+    check(True, 'перенести себя в другую пати без приглашения нельзя')
 use(b).leave(party)
 check(not use(b).parties()[0], 'Б вышел из пати')
 use(a).leave(party)

@@ -89,14 +89,23 @@ def patched(self, *a):
     def profiles():
         g = ps.Social()
         g.update_profile(avatar='preset:1', mood='Ищу команду на вечер', about='Играю в OneBlock и RPG Pack.',
-                         favorites=['OneBlock', 'RPG Pack', 'Business Battle'])
+                         favorites=['OneBlock', 'RPG Pack', 'Business Battle'], banner='skins', color='#3d9be9',
+                         skin='Notch', stats={'minutes': 420, 'maps': ['OneBlock', 'Business Battle', 'PILLARS 2'],
+                                              'maps_n': 6, 'packs': 1, 'friends': 1, 'parties': 1, 'night': True})
+        mine, _ = g.parties()
+        if mine:
+            g.set_lobby(mine[0]['id'], {'map': 'oneblock', 'title': 'OneBlock', 'version': '26.1.2',
+                                        'pack': 'Удобства и шейдеры (21)'})
+            as_other(lambda: h.set_ready(mine[0]['id'], True))
         as_other(lambda: (h.update_profile(avatar='preset:11', presence='dnd', mood='Строю замок',
                                             favorites=['SkyBlock']), h.post_wall(h.uid, 'Мой замок почти готов!')))
         as_other(lambda: h.post_wall(g.uid, 'Привет! Сыграем сегодня?'))
         print('обновить2:', click('Обновить'))
     at(500, profiles)
     at(5000, lambda: (grab(self, 'prof_head'), print('профиль:', click(self_name()))))
-    at(4000, lambda: grab([w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1], 'prof_mine'))
+    at(5000, lambda: grab([w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1], 'prof_mine'))
+    at(300, lambda: [w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1]._cv.yview_moveto(0.3))
+    at(1500, lambda: grab([w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1], 'prof_mine2'))
     at(300, lambda: [w.destroy() for w in self.winfo_children() if isinstance(w, tk.Toplevel)])
     at(500, lambda: print('друг:', click('Друг Б', True)))
     at(4000, lambda: grab([w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1], 'prof_friend'))

@@ -187,3 +187,22 @@ for i, n in enumerate(['ic_bell', 'ic_mail', 'ic_crown', 'ic_signal', 'ic_lock',
     sq.resize((18, 18), Image.LANCZOS).save(os.path.join(OUT, n + '.png'))
     sq.resize((48, 48), Image.LANCZOS).save(os.path.join(OUT, n + '_48.png'))
 print('значки аккаунта готовы')
+
+
+# --- достижения (2026-10-04): 12 медалей из листа 4x3, круглая маска убирает свечение ---
+from PIL import ImageDraw
+sh = Image.open(os.path.join(RAW, '38_achievements.png')).convert('RGBA')
+cw, ch = sh.width // 4, sh.height // 3
+os.makedirs(os.path.join(OUT, 'achievements'), exist_ok=True)
+for i in range(12):
+    cell = sh.crop(((i % 4) * cw, (i // 4) * ch, (i % 4 + 1) * cw, (i // 4 + 1) * ch))
+    cell = cell.crop(cell.getchannel('A').point(lambda v: 255 if v > 200 else 0).getbbox())
+    side = min(cell.size)
+    l, t = (cell.width - side) // 2, (cell.height - side) // 2
+    cell = cell.crop((l, t, l + side, t + side)).resize((256, 256), Image.LANCZOS)
+    mask = Image.new('L', (256, 256), 0)
+    ImageDraw.Draw(mask).ellipse((2, 2, 253, 253), fill=255)
+    out = Image.new('RGBA', (256, 256), (0, 0, 0, 0))
+    out.paste(cell, (0, 0), mask)
+    out.resize((64, 64), Image.LANCZOS).save(os.path.join(OUT, 'achievements', 'ach_%02d.png' % (i + 1)))
+print('достижения готовы')
