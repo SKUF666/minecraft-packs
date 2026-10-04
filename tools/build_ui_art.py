@@ -76,7 +76,7 @@ fr = Image.open(os.path.join(RAW, '13_friends.png')).convert('RGB')
 fr = fr.resize((1400, int(fr.height * 1400 / fr.width)), Image.LANCZOS)
 fr.crop((0, 385, 1400, 385 + 200)).save(os.path.join(OUT, 'friends_wide.png'))
 rounded(Image.open(os.path.join(RAW, '14_offline.png')), 110, 16).save(os.path.join(OUT, 'offline.png'))
-icon = Image.open(os.path.join(RAW, '10_appicon.png')).convert('RGBA')
+icon = Image.open(os.path.join(RAW, '20_portal_icon.png')).convert('RGBA')  # Portalis
 bb = icon.getchannel('A').point(lambda a: 255 if a > 20 else 0).getbbox()
 icon = icon.crop(bb)
 side = int(max(icon.size) * 1.04)

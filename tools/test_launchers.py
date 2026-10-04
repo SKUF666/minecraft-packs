@@ -24,9 +24,9 @@ json.dump({'profiles': {'mine': {'name': 'Мой', 'type': 'custom', 'lastVersio
 ps.chosen_launcher = lambda: 'official'
 ok, hint = ps.select_version('1.20.1', 'Побег от маньяка', lambda *a: None)
 d = json.load(open(os.path.join(ps.MC, 'launcher_profiles.json'), encoding='utf-8'))
-check(ok and d['profiles']['kuboteka']['lastVersionId'] == '1.20.1', 'профиль Куботеки с версией 1.20.1')
+check(ok and d['profiles']['portalis']['lastVersionId'] == '1.20.1', 'профиль Portalis с версией 1.20.1')
 check('mine' in d['profiles'], 'свой профиль пользователя сохранился')
-check(d['profiles']['kuboteka']['icon'].startswith('data:image/png;base64,'), 'у профиля значок Куботеки')
+check(d['profiles']['portalis']['icon'].startswith('data:image/png;base64,'), 'у профиля значок Portalis')
 ok, hint = ps.select_version('Forge 1.20.1', 'RPG Pack', lambda *a: None)
 check('Forge' in hint and 'установщик' in hint, 'подсказка поставить Forge, если его версии нет')
 

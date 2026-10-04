@@ -1,4 +1,4 @@
-"""Собирает «Куботека.exe» из PackSwitcher.pyw и кладёт в библиотеку (старое имя exe убирает)."""
+"""Собирает «Portalis.exe» из PackSwitcher.pyw и кладёт в библиотеку (старое имя exe убирает)."""
 import os, sys, shutil, subprocess, time
 from PIL import Image
 sys.stdout.reconfigure(encoding='utf-8')
@@ -15,11 +15,11 @@ open(os.path.join(B, 'version.txt'), 'w', encoding='utf-8').write('''VSVersionIn
   ffi=FixedFileInfo(filevers=%s, prodvers=%s, mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
   kids=[StringFileInfo([StringTable('041904B0', [
     StringStruct('CompanyName', 'SKUF666'),
-    StringStruct('FileDescription', 'Куботека: карты, сборки и серверы Minecraft'),
+    StringStruct('FileDescription', 'Portalis: карты, сборки и серверы Minecraft'),
     StringStruct('FileVersion', '%s'),
     StringStruct('InternalName', 'Kuboteka'),
-    StringStruct('OriginalFilename', 'Куботека.exe'),
-    StringStruct('ProductName', 'Куботека'),
+    StringStruct('OriginalFilename', 'Portalis.exe'),
+    StringStruct('ProductName', 'Portalis'),
     StringStruct('ProductVersion', '%s')])]),
   VarFileInfo([VarStruct('Translation', [1049, 1200])])])
 ''' % (ver, ver, '.'.join(v), '.'.join(v)))
@@ -30,8 +30,8 @@ if r.returncode:
     print(r.stdout[-2000:], r.stderr[-3000:])
     sys.exit(1)
 src = os.path.join(B, 'dist', 'PackSwitcher.exe')
-dst = os.path.join(LIB, 'Куботека.exe')
-for old in ('Выбор карты и сборки.exe',):
+dst = os.path.join(LIB, 'Portalis.exe')
+for old in ('Выбор карты и сборки.exe', 'Куботека.exe'):
     try:
         os.remove(os.path.join(LIB, old))
     except OSError:

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""Куботека: карты, сборки и серверы Minecraft.
+"""Portalis: карты, сборки и серверы Minecraft.
 
-Окно: двойной клик по «Куботека.exe» (или .bat, если установлен Python).
+Окно: двойной клик по «Portalis.exe» (или .bat, если установлен Python).
 Командная строка (результат пишется в switcher_cli.log рядом с программой):
   --list                         список сборок
   --maps                         список карт
@@ -503,7 +503,7 @@ def save_current_as(name, version_dir, tl_version, description=""):
     return dst
 
 
-LIBRARY_NOTE = ("Рядом с программой нет папок со сборками и картами. Похоже, она запущена прямо из архива или скопирована отдельно. Распакуй архив целиком и запусти «Куботека.exe» из распакованной папки.")
+LIBRARY_NOTE = ("Рядом с программой нет папок со сборками и картами. Похоже, она запущена прямо из архива или скопирована отдельно. Распакуй архив целиком и запусти «Portalis.exe» из распакованной папки.")
 
 
 def library_found():
@@ -568,7 +568,7 @@ def install_map(m, pack=None, fresh=False, packs=None, log=print):
         src = os.path.join(m["path"], "world")
         if not os.path.isfile(os.path.join(src, "level.dat")):
             raise RuntimeError("В папке карты нет мира (world\\level.dat). Скачай карту заново.")
-        tmp = os.path.join(SAVES, ".kuboteka-tmp-" + m["save"])
+        tmp = os.path.join(SAVES, ".portalis-tmp-" + m["save"])
         if os.path.isdir(lp(tmp)):
             shutil.rmtree(lp(tmp), ignore_errors=True)
         n = copy_long(src, tmp)
@@ -1015,7 +1015,7 @@ def join_friend(text, packs=None, log=print):
     if pack_name:
         pack = next((p for p in packs if p["name"] == pack_name), None)
         if not pack:
-            raise RuntimeError("У друга сборка «%s», а у тебя её нет. Обнови Куботеку: кнопка «Проверить обновления»." % pack_name)
+            raise RuntimeError("У друга сборка «%s», а у тебя её нет. Обнови Portalis: кнопка «Проверить обновления»." % pack_name)
         cur = current() or {}
         if cur.get("name") != pack_name or get_tlauncher_version() != pack.get("tl_version"):
             ok = switch(pack, packs, True, log)
@@ -1198,7 +1198,7 @@ def _profiles_files():
 
 
 def set_launcher_profile(version, title):
-    """Профиль «Куботека» в launcher_profiles.json (официальный лаунчер, SKLauncher): самый свежий lastUsed,
+    """Профиль «Portalis» в launcher_profiles.json (официальный лаунчер, SKLauncher): самый свежий lastUsed,
     поэтому он первый в списке. Возвращает True, если файл профилей нашёлся."""
     files = _profiles_files() or [os.path.join(MC, "launcher_profiles.json")]
     now = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
@@ -1217,8 +1217,8 @@ def set_launcher_profile(version, title):
         if os.path.isfile(path) and not os.path.exists(path + ".switcher.bak"):
             shutil.copy2(path, path + ".switcher.bak")
         prof = data.setdefault("profiles", {})
-        old = prof.get("kuboteka", {})
-        prof["kuboteka"] = {"name": "%s: %s" % (APP_NAME, title)[:60], "type": "custom",
+        old = prof.pop("kuboteka", None) or prof.get("portalis", {})  # «kuboteka» - профиль прежнего имени
+        prof["portalis"] = {"name": "%s: %s" % (APP_NAME, title)[:60], "type": "custom",
                             "created": old.get("created", now), "lastUsed": now, "icon": icon, "lastVersionId": version}
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
@@ -1534,12 +1534,12 @@ def map_matches(m, players="all", version="all"):
 
 # ---------- ярлыки ----------
 
-APP_NAME = "Куботека"
+APP_NAME = "Portalis"
 APP_TITLE = APP_NAME
 EXE_NAME = APP_NAME + ".exe"
-# Так программа называлась до 2026.10.05: старые файлы и ярлыки переименовываются при запуске.
-OLD_EXE_NAMES = ("Выбор карты и сборки.exe",)
-OLD_APP_TITLES = ("Minecraft - карты и сборки",)
+# Прежние имена программы (до 04.10.2026 и «Portalis»): старые файлы и ярлыки переименовываются при запуске.
+OLD_EXE_NAMES = ("Выбор карты и сборки.exe", "Куботека.exe")
+OLD_APP_TITLES = ("Minecraft - карты и сборки", "Куботека")
 
 
 def _shell_folder(name, default):
@@ -1569,7 +1569,7 @@ def app_target():
 
 
 def migrate_old_name(argv):
-    """Запущен старый «Выбор карты и сборки.exe»: копируем себя в «Куботека.exe» и перезапускаемся под новым именем."""
+    """Запущен exe со старым именем: копируем себя в «Portalis.exe» и перезапускаемся под новым именем."""
     if not getattr(sys, "frozen", False) or os.path.basename(sys.executable) not in OLD_EXE_NAMES:
         return False
     new = os.path.join(ROOT, EXE_NAME)
@@ -2635,7 +2635,7 @@ def gui():
     scv.pack()
     scv.create_image(0, 0, image=sp_img, anchor="nw")
     for dx, dy, color in ((2, 2, "#000000"), (0, 0, "#ffffff")):
-        scv.create_text(SW // 2 + dx, SH - 92 + dy, text="КУБОТЕКА", font=(FONT, 30, "bold"), fill=color)
+        scv.create_text(SW // 2 + dx, SH - 92 + dy, text="PORTALIS", font=(FONT, 30, "bold"), fill=color)
     scv.create_text(SW // 2 + 1, SH - 56 + 1, text="карты  ·  сборки  ·  серверы Minecraft", font=(FONT, 13), fill="#000000")
     scv.create_text(SW // 2, SH - 56, text="карты  ·  сборки  ·  серверы Minecraft", font=(FONT, 13), fill="#d7deea")
     scv.create_rectangle(SW // 2 - 120, SH - 26, SW // 2 + 120, SH - 22, fill="#2a2d35", width=0)
@@ -2669,7 +2669,7 @@ def gui():
         head.create_line(0, y, 4000, y, fill=px(banner, 0, y) if BW else BG)
     banner_id = head.create_image(0, 0, image=banner, anchor="ne")
     for dx, dy, color in ((2, 2, "#000000"), (0, 0, "#ffffff")):
-        head.create_text(108 + dx, 54 + dy, text="КУБОТЕКА", font=(FONT, 26, "bold"), fill=color, anchor="w")
+        head.create_text(108 + dx, 54 + dy, text="PORTALIS", font=(FONT, 26, "bold"), fill=color, anchor="w")
     head.create_text(111, 91, text="карты  ·  сборки  ·  серверы Minecraft", font=(FONT, 12), fill="#000000", anchor="w")
     head.create_text(110, 90, text="карты  ·  сборки  ·  серверы Minecraft", font=(FONT, 12), fill="#d7deea", anchor="w")
     head.create_image(22, HEAD_H // 2 - 4, image=art("appicon_72.png", 1, 1), anchor="w")
@@ -4055,7 +4055,7 @@ def gui():
     # --- вкладка «Лаунчеры» ---
     def build_launchers():
         launchers = load_launchers()
-        section("Лаунчеры", 0, "чем запускать Minecraft: Куботека умеет работать с каждым из них")
+        section("Лаунчеры", 0, "чем запускать Minecraft: Portalis умеет работать с каждым из них")
         if not launchers:
             empty_note(1, LIBRARY_NOTE if not library_found() else "Нет файла Лаунчеры\\launchers.json.")
             return
@@ -4079,10 +4079,10 @@ def gui():
         info.grid(row=1, column=0, columnspan=2, sticky="we", padx=(0, 14), pady=(0, 14))
         tk.Label(info, text="Мой лаунчер: %s" % launcher_title(mine), font=(FONT, 12, "bold"), fg=TEXT, bg=PANEL,
                  anchor="w").pack(fill="x")
-        how = {"tl": "Куботека ставит карты и моды в папку игры и сама выбирает в нём версию.",
-               "legacy": "Куботека ставит карты и моды в его папку игры и сама выбирает версию, если лаунчер закрыт.",
-               "profiles": "Куботека ставит карты и моды в папку игры и создаёт в нём профиль «Куботека» с нужной версией.",
-               "mrpack": "Куботека собирает пакет (сборка, мир карты, серверы) и передаёт его лаунчеру: "
+        how = {"tl": "Portalis ставит карты и моды в папку игры и сам выбирает в нём версию.",
+               "legacy": "Portalis ставит карты и моды в его папку игры и сам выбирает версию, если лаунчер закрыт.",
+               "profiles": "Portalis ставит карты и моды в папку игры и создаёт в нём профиль «Portalis» с нужной версией.",
+               "mrpack": "Portalis собирает пакет (сборка, мир карты, серверы) и передаёт его лаунчеру: "
                          "он сам создаст экземпляр с нужной версией."}.get(mode, "")
         tk.Label(info, text=how + ("" if state.get("installed_launchers") is not None else "   Ищу установленные лаунчеры..."),
                  font=(FONT, 10), fg=MUTED, bg=PANEL, anchor="w", justify="left", wraplength=900).pack(fill="x", pady=(4, 0))
@@ -4136,7 +4136,7 @@ def gui():
             for p in x["cons"]:
                 tk.Label(c, text="−  " + p, font=(FONT, 10), fg="#e0a45a", bg=CARD, anchor="w", justify="left",
                          wraplength=400).pack(fill="x", pady=(1, 0))
-            tk.Label(c, text="С Куботекой: " + x["compat_text"], font=(FONT, 9, "bold"), fg="#c3c7d1", bg=CARD,
+            tk.Label(c, text="С Portalis: " + x["compat_text"], font=(FONT, 9, "bold"), fg="#c3c7d1", bg=CARD,
                      anchor="w", justify="left", wraplength=400).pack(fill="x", pady=(8, 2))
             where = installed.get(x["id"])
             if where and os.path.isabs(where):
@@ -4160,7 +4160,7 @@ def gui():
                     state["installed_launchers"] = None
                     if path:
                         os.startfile(path)
-                        toast("Запускаю установщик %s. После установки вернись в Куботеку: лаунчер появится "
+                        toast("Запускаю установщик %s. После установки вернись в Portalis: лаунчер появится "
                               "в списке сам." % x["name"], "ok", ms=9000)
                 last = {"t": 0}
 
@@ -4183,7 +4183,7 @@ def gui():
                 if f:
                     s = load_settings(); s.setdefault("launcher_paths", {})[x["id"]] = os.path.normpath(f); save_settings(s)
                     state["installed_launchers"] = None
-                    toast("Запомнила путь к %s." % x["name"])
+                    toast("Путь к %s сохранён." % x["name"])
                     show("launchers", animated=False)
             direct = (x.get("download") or {}).get("kind") in ("url", "github", "modrinth")
             if x["id"] in installed:
