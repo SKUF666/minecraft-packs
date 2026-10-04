@@ -1,9 +1,9 @@
 """Картинки ChatGPT (raw/) -> «Оформление» в библиотеке."""
 import os, sys
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageDraw
 HERE = os.path.dirname(os.path.abspath(__file__))
 RAW = os.path.join(os.path.dirname(HERE), 'art-src')
-OUT = os.path.join(os.environ['USERPROFILE'], 'Desktop', 'Minecraft Packs', 'Оформление')
+OUT = os.path.join(os.environ['LOCALAPPDATA'], 'Portalis', 'Оформление')
 os.makedirs(OUT, exist_ok=True)
 BG = (0x15, 0x16, 0x1a)
 Y0 = int(sys.argv[1]) if len(sys.argv) > 1 else 330

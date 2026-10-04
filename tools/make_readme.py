@@ -1,7 +1,7 @@
 import json, glob, os, sys
 sys.stdout.reconfigure(encoding='utf-8')
 HERE = os.path.dirname(os.path.abspath(__file__))
-LIB = os.path.join(os.environ['USERPROFILE'], 'Desktop', 'Minecraft Packs')
+LIB = os.path.join(os.environ['LOCALAPPDATA'], 'Portalis')
 os.chdir(LIB)
 t = open(os.path.join(HERE, 'readme_tpl.txt'), encoding='utf-8').read()
 order = {'26.1.2': 0, '1.21.10': 1, '1.21.8': 2, '1.21.1': 3}

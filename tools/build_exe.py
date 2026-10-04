@@ -2,7 +2,7 @@
 import os, sys, shutil, subprocess, time
 from PIL import Image
 sys.stdout.reconfigure(encoding='utf-8')
-LIB = os.path.join(os.environ['USERPROFILE'], 'Desktop', 'Minecraft Packs')
+LIB = os.path.join(os.environ['LOCALAPPDATA'], 'Portalis')
 B = os.path.join(os.environ.get('TEMP', '.'), 'minecraft-packs-build')
 os.makedirs(B, exist_ok=True)
 shutil.copy2(os.path.join(LIB, 'PackSwitcher.pyw'), os.path.join(B, 'PackSwitcher.pyw'))

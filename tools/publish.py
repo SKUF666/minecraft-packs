@@ -1,4 +1,4 @@
-"""Выпуск новой версии Portalis (библиотека «Minecraft Packs» на рабочем столе) в релиз GitHub (тег library).
+"""Выпуск новой версии Portalis (библиотека в папке %LOCALAPPDATA%/Portalis) в релиз GitHub (тег library).
 
     python tools/publish.py [--dry] [--note "текст для «Что нового»"] [--lib "путь к библиотеке"]
 
@@ -154,7 +154,7 @@ def host_name(url):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--lib', default=os.path.join(os.environ['USERPROFILE'], 'Desktop', 'Minecraft Packs'))
+    ap.add_argument('--lib', default=os.path.join(os.environ['LOCALAPPDATA'], 'Portalis'))
     ap.add_argument('--dry', action='store_true', help='всё посчитать и собрать, но не загружать')
     ap.add_argument('--note', action='append', default=[], help='строка в «Что нового»')
     ap.add_argument('--version', help='номер версии (по умолчанию дата)')
@@ -393,8 +393,15 @@ def main():
     mpath = os.path.join(out, 'manifest.json')
     json.dump(manifest, open(mpath, 'w', encoding='utf-8'), ensure_ascii=False, indent=1)
     core_files = json.load(open(os.path.join(out, items['core']['list']), encoding='utf-8'))['files']
+    # Главное: программа одним файлом (Portalis.exe и Portalis.zip с ним одним). Каталог она скачает сама.
+    exe_asset = os.path.join(out, ps.EXE_NAME)
+    shutil.copy2(os.path.join(lib, ps.EXE_NAME), exe_asset)
     starter = os.path.join(out, STARTER)
     with zipfile.ZipFile(starter, 'w') as z:
+        z.write(exe_asset, ps.EXE_NAME, compress_type=zipfile.ZIP_DEFLATED)
+    # Для старых ссылок - прежний вид: папка с программой и каталогом.
+    starter_folder = os.path.join(out, 'folder-starter.zip')
+    with zipfile.ZipFile(starter_folder, 'w') as z:
         for f in [x['p'] for x in core_files] + [ps.EXE_NAME]:
             comp = zipfile.ZIP_STORED if f.lower().endswith(STORED) else zipfile.ZIP_DEFLATED
             z.write(ps.lp(os.path.join(lib, f)), 'Portalis/' + f, compress_type=comp)
@@ -419,20 +426,21 @@ def main():
         print('Загружаю %d/%d %s (%.1f МБ)' % (i, len(to_upload), os.path.basename(p), os.path.getsize(p) / 1048576),
               flush=True)
         upload(p)
+    upload(exe_asset)
     upload(starter)
     for name_old in STARTERS_OLD:
         starter_old = os.path.join(out, name_old)
-        shutil.copy2(starter, starter_old)
+        shutil.copy2(starter_folder, starter_old)
         upload(starter_old)
     upload(mpath)
-    used = {i['list'] for i in mitems} | {i['own'] for i in mitems if i['own']} | {STARTER, 'manifest.json'} | set(STARTERS_OLD) \
+    used = {i['list'] for i in mitems} | {i['own'] for i in mitems if i['own']} | {STARTER, ps.EXE_NAME, 'manifest.json'} | set(STARTERS_OLD) \
         | {b['asset'] for b in blocks if b.get('asset')}
     for name in assets:
         if name not in used:
             gh('release', 'delete-asset', TAG, name, '--repo', REPO, '--yes', check=False)
             print('Удалён из релиза:', name)
     gh('release', 'edit', TAG, '--repo', REPO, '--title', 'Portalis %s' % version, '--latest',
-       '--notes', 'Скачай Portalis.zip, распакуй и запусти «Portalis.exe». Карты и моды '
+       '--notes', 'Скачай Portalis.exe (или Portalis.zip) и запусти: установка не нужна, каталог и карты программа скачает сама. Карты и моды '
                   'программа скачивает с сайтов авторов, когда их выбираешь.\n\nЧто нового:\n' +
                   '\n'.join('- ' + c for c in changes))
     shutil.copy2(mpath, os.path.join(lib, 'manifest.json'))

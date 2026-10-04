@@ -38,7 +38,23 @@ except ImportError:
 import urllib.parse
 import urllib.error
 
-ROOT = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+# APP_DIR - где лежит сама программа. ROOT - где её данные: каталог, скачанные карты и моды, настройки.
+# Если рядом с программой лежит библиотека (папка «Карты» или manifest.json) - работаем в ней, как раньше.
+# Иначе программа - один файл (например, на рабочем столе), а данные в %LOCALAPPDATA%\Portalis.
+APP_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+
+
+def _pick_root():
+    if os.environ.get("PORTALIS_DATA"):
+        return os.environ["PORTALIS_DATA"]
+    if any(os.path.exists(os.path.join(APP_DIR, n)) for n in ("manifest.json", "Карты", "Лаунчеры")):
+        return APP_DIR
+    return os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "Portalis")
+
+
+ROOT = _pick_root()
+SINGLE_FILE = os.path.abspath(ROOT) != os.path.abspath(APP_DIR)
+os.makedirs(ROOT, exist_ok=True)
 MC = os.path.join(os.environ["APPDATA"], ".minecraft")
 MODS = os.path.join(MC, "mods")
 SAVES = os.path.join(MC, "saves")
@@ -503,7 +519,8 @@ def save_current_as(name, version_dir, tl_version, description=""):
     return dst
 
 
-LIBRARY_NOTE = ("Рядом с программой нет папок со сборками и картами. Похоже, она запущена прямо из архива или скопирована отдельно. Распакуй архив целиком и запусти «Portalis.exe» из распакованной папки.")
+LIBRARY_NOTE = ("Каталог карт и сборок ещё не загружен. Для первого запуска нужен интернет: Portalis сам скачает "
+                "каталог с GitHub (около 3 МБ). Проверь подключение и нажми «Проверить обновления» внизу.")
 
 
 def library_found():
@@ -1554,7 +1571,17 @@ def shortcut_paths():
     home = os.environ.get("USERPROFILE", "")
     desk = _shell_folder("Desktop", os.path.join(home, "Desktop"))
     start = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs")
-    return [os.path.join(desk, APP_TITLE + ".lnk"), os.path.join(start, APP_TITLE + ".lnk")]
+    paths = [os.path.join(start, APP_TITLE + ".lnk")]
+    if os.path.normcase(os.path.abspath(APP_DIR)) != os.path.normcase(os.path.abspath(desk)):
+        paths.insert(0, os.path.join(desk, APP_TITLE + ".lnk"))
+    return paths
+
+
+def exe_path():
+    """Файл программы, который обновлять и на который делать ярлыки."""
+    if getattr(sys, "frozen", False):
+        return sys.executable
+    return os.path.join(APP_DIR, EXE_NAME)
 
 
 def app_target():
@@ -1572,7 +1599,7 @@ def migrate_old_name(argv):
     """Запущен exe со старым именем: копируем себя в «Portalis.exe» и перезапускаемся под новым именем."""
     if not getattr(sys, "frozen", False) or os.path.basename(sys.executable) not in OLD_EXE_NAMES:
         return False
-    new = os.path.join(ROOT, EXE_NAME)
+    new = os.path.join(APP_DIR, EXE_NAME)
     try:
         if not (os.path.isfile(new) and os.path.getsize(new) == os.path.getsize(sys.executable)):
             shutil.copy2(sys.executable, new)
@@ -1588,7 +1615,7 @@ def tidy_old_name():
         for _ in range(20):
             left = 0
             for n in OLD_EXE_NAMES:
-                p = os.path.join(ROOT, n)
+                p = os.path.join(APP_DIR, n)
                 if os.path.exists(p) and os.path.abspath(p) != os.path.abspath(sys.executable):
                     try:
                         os.remove(p)
@@ -1627,7 +1654,7 @@ def shortcuts_exist():
 def create_shortcuts():
     """Ярлык на рабочем столе и в меню «Пуск». Возвращает список созданных путей."""
     target, args = app_target()
-    icon = os.path.join(ROOT, EXE_NAME) if os.path.isfile(os.path.join(ROOT, EXE_NAME)) else target
+    icon = exe_path() if os.path.isfile(exe_path()) else target
     made = []
     for path in shortcut_paths():
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1875,7 +1902,10 @@ def _plan_items(man, items, root, log):
         want = {f["p"] for f in lst}
         for f in lst:
             try:
-                ok = os.path.isfile(lp(os.path.join(root, f["p"]))) and cache.sha1(f["p"]) == f["s"]
+                if f["p"] == EXE_NAME and os.path.abspath(root) == os.path.abspath(ROOT):
+                    ok = os.path.isfile(exe_path()) and _sha1_file(exe_path()) == f["s"]
+                else:
+                    ok = os.path.isfile(lp(os.path.join(root, f["p"]))) and cache.sha1(f["p"]) == f["s"]
             except OSError:
                 ok = False
             if not ok:
@@ -2302,7 +2332,7 @@ def _apply_plan(man, plan, root=ROOT, log=print, progress=None, cancel=None, ask
             trash = os.path.join(root, "_Старое после обновления " + stamp)
             os.replace(old_dir, trash)
     for f in app_files:
-        target = os.path.join(root, EXE_NAME)
+        target = exe_path() if os.path.abspath(root) == os.path.abspath(ROOT) else os.path.join(root, EXE_NAME)
         running = getattr(sys, "frozen", False) and os.path.abspath(sys.executable) == os.path.abspath(target)
         if os.path.exists(target + ".old"):
             try:
@@ -2349,10 +2379,10 @@ def remove_item(item, root=ROOT, log=print):
 
 def cleanup_after_update():
     """Хвосты прошлого обновления: старый exe, временные файлы, старые версии после прерванной раскладки."""
-    for n in (EXE_NAME,) + OLD_EXE_NAMES:
+    for p in [exe_path() + ".old"] + [os.path.join(APP_DIR, n + ".old") for n in OLD_EXE_NAMES]:
         try:
-            if os.path.exists(os.path.join(ROOT, n + ".old")):
-                os.remove(os.path.join(ROOT, n + ".old"))
+            if os.path.exists(p):
+                os.remove(p)
         except OSError:
             pass
     try:
@@ -2920,6 +2950,8 @@ def gui():
     small_button(foot_btns, "Папка игры", lambda: os.makedirs(MC, exist_ok=True) or os.startfile(MC), bg=PANEL, icon="ic_folder.png").pack(side="right", padx=4, pady=8)
     shortcut_btn = small_button(foot_btns, "", make_shortcuts, bg=PANEL)
     shortcut_btn.pack(side="right", padx=4, pady=8)
+    small_button(foot_btns, "Папка Portalis", lambda: os.startfile(ROOT), bg=PANEL, icon="ic_backup.png").pack(
+        side="right", padx=4, pady=8)
     small_button(foot_btns, "Проверить обновления", lambda: check_updates(manual=True), bg=PANEL, icon="tab_update.png").pack(
         side="right", padx=4, pady=8)
 
@@ -4306,7 +4338,7 @@ def gui():
                 toast("У тебя последняя версия: %s." % remote.get("version"), "ok")
         with_remote(got, quiet=not manual)
 
-    def open_update(remote, items=None, then=None, title=None):
+    def open_update(remote, items=None, then=None, title=None, auto=False):
         """Окно загрузки: обновление (items=None) или скачивание карт и сборок items."""
         if state["busy"]:
             toast("Подожди, программа сейчас занята.", "warn")
@@ -4455,7 +4487,7 @@ def gui():
                     apply_plan(remote, plan, log=lambda m: None)
                 set_bar(1.0)
                 upd_bar.pack_forget()
-                if items and then:
+                if (items or auto) and then:
                     t.destroy()
                     then()
                     return
@@ -4472,8 +4504,8 @@ def gui():
                 " и ещё %d" % (len(rm) - 8) if len(rm) > 8 else "")) if rm else "", fg="#e0a45a")
             label = ("Скачать  (%s)" if items else "Обновить  (%s)") % fmt_mb(plan["size"])
             buttons(("big", label, lambda: start(plan)), ("small", "Позже", close))
-            if items:
-                start(plan)  # человек уже нажал «Играть» или «Включить»: сразу качаем
+            if items or auto:
+                start(plan)  # человек уже нажал «Играть» или «Включить» (или это первый запуск): сразу качаем
 
         def start(plan):
             if state["busy"]:
@@ -4538,13 +4570,13 @@ def gui():
                     msg.configure(text="Готово! Программа тоже обновилась: перезапусти её.", fg=ACCENT_HI)
 
                     def restart():
-                        subprocess.Popen([os.path.join(ROOT, EXE_NAME)], cwd=ROOT)
+                        subprocess.Popen([exe_path()], cwd=APP_DIR)
                         win.destroy()
                     buttons(("big", "Перезапустить программу", restart))
                     return
-                if items and then:
+                if (items or auto) and then:
                     t.destroy()
-                    toast("Скачано: %s." % ", ".join(names), "ok")
+                    toast("Скачано: %s." % ", ".join(names) if names else "Каталог загружен: выбирай карту или сборку.", "ok")
                     show(state["tab"], animated=False)
                     then()
                     return
@@ -4619,9 +4651,12 @@ def gui():
         animate("splash_out", 220, lambda k: splash.attributes("-alpha", 1 - k), done=gone)
 
     def after_start():
-        if not library_found():
-            messagebox.showwarning("Не вижу файлов", LIBRARY_NOTE + "\n\nСейчас программа запущена из:\n" + ROOT)
-        win.after(1500, check_updates)
+        if not library_found() or not load_local_manifest().get("items"):
+            # Первый запуск (программа - один файл): каталог с GitHub, без лишних вопросов.
+            with_remote(lambda r: open_update(r, None, lambda: show(state["tab"], animated=False),
+                                              "Добро пожаловать в Portalis! Загружаю каталог", auto=True))
+        else:
+            win.after(1500, check_updates)
         if getattr(sys, "frozen", False) and not shortcuts_exist() and not settings.get("shortcut_offered"):
             s = load_settings()
             s["shortcut_offered"] = True

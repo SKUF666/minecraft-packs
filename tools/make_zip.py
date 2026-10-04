@@ -1,7 +1,7 @@
 import os, zipfile, time, sys
 sys.stdout.reconfigure(encoding='utf-8')
-root = os.path.join(os.environ['USERPROFILE'], 'Desktop', 'Minecraft Packs')
-out = os.path.join(os.path.dirname(root), 'Portalis (для друга).zip')
+root = os.path.join(os.environ['LOCALAPPDATA'], 'Portalis')
+out = os.path.join(os.environ['USERPROFILE'], 'Desktop', 'Portalis (для друга).zip')
 LP = lambda p: '\\\\?\\' + os.path.abspath(p)
 if os.path.exists(out):
     os.remove(out)

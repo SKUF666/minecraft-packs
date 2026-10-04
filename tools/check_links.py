@@ -8,7 +8,6 @@
 import argparse
 import importlib.machinery
 import importlib.util
-import json
 import os
 import sys
 import urllib.request
@@ -44,7 +43,7 @@ def probe(ps, url, referer='', size=None):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--lib', default=os.path.join(os.environ['USERPROFILE'], 'Desktop', 'Minecraft Packs'))
+    ap.add_argument('--lib', default=os.path.join(os.environ['LOCALAPPDATA'], 'Portalis'))
     a = ap.parse_args()
     ps = load_ps(a.lib)
     bad = 0

@@ -4,7 +4,7 @@ from PIL import ImageGrab
 sys.stdout.reconfigure(encoding='utf-8')
 OUT = os.path.join(os.environ.get('TEMP', '.'), 'minecraft-packs-shots')
 os.makedirs(OUT, exist_ok=True)
-LIB = os.environ.get('LIB') or os.path.join(os.environ['USERPROFILE'], 'Desktop', 'Minecraft Packs')
+LIB = os.environ.get('LIB') or os.path.join(os.environ['LOCALAPPDATA'], 'Portalis')
 W, H = (int(sys.argv[1]), int(sys.argv[2])) if len(sys.argv) > 2 else (1080, 760)
 TAG = sys.argv[3] if len(sys.argv) > 3 else ''
 ONLY = os.environ.get('ONLY', '')
