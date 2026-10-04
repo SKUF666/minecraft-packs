@@ -1,7 +1,7 @@
 -- Portalis, шаг 6: вход через Google.
 -- Выполнить ОДИН раз, когда включаешь Google: Authentication -> Providers -> Google (Client ID и Secret из
 -- Google Cloud), Authentication -> URL Configuration -> Redirect URLs: http://127.0.0.1:53682/**
--- Потом в library/social.json добавить "google": true и выпустить версию.
+-- Кнопка «Войти через Google» в Portalis появится сама, как только провайдер включён.
 --
 -- У игрока из Google нет логина: делаем его из почты (латиница/цифры/_), а если занят - с цифрами.
 -- Регистрация по логину и паролю работает как раньше.

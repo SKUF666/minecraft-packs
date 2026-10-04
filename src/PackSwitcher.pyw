@@ -37,7 +37,7 @@ import traceback
 import calendar
 import gzip
 import uuid
-from PIL import Image as PILImage, ImageTk, ImageDraw, ImageFont  # значки Modrinth (webp), превью скинов, кнопки
+from PIL import Image as PILImage, ImageTk, ImageDraw, ImageFont, ImageFilter  # значки Modrinth (webp), превью скинов, кнопки
 try:
     import winreg
 except ImportError:
@@ -740,6 +740,19 @@ class Social:
         self.cfg = social_cfg()
         self.session = (load_settings().get("social") or {}) if self.cfg else {}
         self.lock = threading.Lock()
+        self._providers = None
+        if self.cfg and not self.logged_in():  # узнать заранее, включён ли вход через Google
+            threading.Thread(target=self.providers, daemon=True).start()
+
+    def providers(self):
+        """Какие входы включены в Supabase (Google и др.): {"google": True, ...}. Публичные настройки."""
+        if self._providers is None:
+            try:
+                j = _http_json("GET", self.cfg["url"] + "/auth/v1/settings", {"apikey": self.cfg["key"]})
+                self._providers = (j or {}).get("external") or {}
+            except Exception:
+                return {}
+        return self._providers
 
     # --- вход ---
     def ready(self):
@@ -788,7 +801,8 @@ class Social:
         return j
 
     def google_ready(self):
-        return bool(self.ready() and self.cfg.get("google"))
+        """Кнопка «Войти через Google» появляется сама, как только Google включён в Supabase."""
+        return bool(self.ready() and (self.cfg.get("google") or (self._providers or {}).get("google")))
 
     def sign_in_google(self, timeout=300):
         """Вход через Google: браузер -> Supabase -> обратно на 127.0.0.1. Нужен включённый провайдер Google
@@ -5456,6 +5470,80 @@ def render_button(text, px, bold, fg, fill, icon=None, padx=14, pady=7, radius=8
     return im.resize((w, h + sh), PILImage.LANCZOS)
 
 
+def dark_titlebar(w):
+    """Заголовок окна Windows в цвет темы (Windows 11; на Windows 10 - просто тёмный)."""
+    try:
+        w.update_idletasks()
+        user32, dwm = ctypes.windll.user32, ctypes.windll.dwmapi
+        user32.GetParent.restype = ctypes.wintypes.HWND
+        hwnd = user32.GetParent(w.winfo_id()) or w.winfo_id()
+
+        def put(attr, val):
+            v = ctypes.c_int(val)
+            dwm.DwmSetWindowAttribute(ctypes.wintypes.HWND(hwnd), attr, ctypes.byref(v), 4)
+
+        def ref(c):
+            r, g, b, _a = _hex(c)
+            return r | (g << 8) | (b << 16)
+        put(20, 1)  # тёмный режим рамки
+        put(35, ref(BG))  # цвет заголовка
+        put(36, ref(TEXT))  # цвет текста
+        put(34, ref(LINE))  # рамка
+    except Exception:
+        pass
+
+
+def header_pil(w, h, icon, title, sub=""):
+    """Шапка отдельного окна: скруглённая плашка с градиентом, свечением, значком и заголовком."""
+    S = 2
+    W, H = w * S, h * S
+    im = PILImage.new("RGBA", (W, H), (0, 0, 0, 0))
+    base = PILImage.new("RGBA", (W, H), _hex(CARD))
+    gd = ImageDraw.Draw(base)
+    for x in range(0, W, 4):
+        gd.rectangle((x, 0, x + 3, H), fill=_hex(_mixc(CARD_HI, BG, x / float(W))))
+    glow = PILImage.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(glow).ellipse((-H, -H // 2, H * 2, H * 3 // 2), fill=_hex(ACCENT, 90))
+    base.alpha_composite(glow.filter(ImageFilter.GaussianBlur(H // 3)))
+    line = ImageDraw.Draw(base)
+    line.line((0, 1, W, 1), fill=(255, 255, 255, 22), width=S)
+    mask = PILImage.new("L", (W, H), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, W - 1, H - 1), 14 * S, fill=255)
+    im.paste(base, (0, 0), mask)
+    ImageDraw.Draw(im).rounded_rectangle((0, 0, W - 1, H - 1), 14 * S, outline=_hex(_mixc(LINE, "#ffffff", 0.08)), width=S)
+    x = 18 * S
+    ic = None
+    if isinstance(icon, str):
+        try:
+            ic = PILImage.open(os.path.join(ART, icon)).convert("RGBA")
+        except Exception:
+            ic = None
+    elif icon is not None:
+        ic = icon.convert("RGBA")
+    if ic is not None:
+        side = min(H - 24 * S, 56 * S)
+        ic = ic.resize((side * ic.width // max(1, ic.height), side), PILImage.LANCZOS)
+        sh = PILImage.new("RGBA", (ic.width + 20 * S, ic.height + 20 * S), (0, 0, 0, 0))
+        sh.paste((0, 0, 0, 120), (10 * S, 12 * S), ic.getchannel("A"))
+        im.alpha_composite(sh.filter(ImageFilter.GaussianBlur(5 * S)), (x - 10 * S, (H - ic.height) // 2 - 10 * S))
+        im.alpha_composite(ic, (x, (H - ic.height) // 2))
+        x += ic.width + 16 * S
+    d = ImageDraw.Draw(im)
+    ty = H // 2 - (11 * S if sub else 0)
+    for txt, px, bold, col, yy in ((title, 21, True, TEXT, ty), (sub, 12, False, "#a7adba", H // 2 + 14 * S)):
+        if not txt:
+            continue
+        xx = x
+        for sym, run in _text_runs(txt):
+            f = ui_font(px * S, bold, sym)
+            if sym == "emoji":
+                d.text((xx, yy), run, font=f, anchor="lm", embedded_color=True)
+            else:
+                d.text((xx, yy), run, font=f, fill=_hex(col), anchor="lm")
+            xx += f.getlength(run)
+    return im.resize((w, h), PILImage.LANCZOS)
+
+
 BG = "#15161a"
 PANEL = "#1d1f24"
 CARD = "#24262d"
@@ -5477,6 +5565,7 @@ TAB_ORDER = ["maps", "packs", "builder", "skins", "versions", "servers", "friend
 def gui():
     import tkinter as tk
     from tkinter import messagebox, simpledialog, filedialog, colorchooser
+    _tk_messagebox, _tk_simpledialog = messagebox, simpledialog
 
     cleanup_after_update()
     tidy_old_name()
@@ -5487,11 +5576,241 @@ def gui():
     win.geometry("1080x760")
     win.minsize(1000, 660)
     win.configure(bg=BG)
-    try:
-        win.iconphoto(True, tk.PhotoImage(file=os.path.join(ROOT, "icon.png")))
-    except Exception:
-        pass
+    for ip_ in (os.path.join(ROOT, "icon.png"), os.path.join(APP_DIR, "icon.png"), os.path.join(ART, "icon.png")):
+        try:
+            win.iconphoto(True, tk.PhotoImage(file=ip_))
+            break
+        except Exception:
+            continue
+    win.bind("<Map>", lambda e: e.widget is win and dark_titlebar(win), add="+")
     images = []
+
+    def new_window(parent=None, esc=True):
+        """Отдельное окно в стиле Portalis: тёмная рамка Windows в цвет темы, значок, Esc закрывает."""
+        t = tk.Toplevel(parent or win)
+        t.configure(bg=BG)
+        dark_titlebar(t)
+        t.bind("<Map>", lambda e: e.widget is t and dark_titlebar(t), add="+")
+        if esc:
+            t.bind("<Escape>", lambda e: t.destroy() if not isinstance(t.focus_get(), tk.Entry) else None)
+        return t
+
+    def window_header(parent, icon, title, sub="", h=84):
+        """Шапка окна (перерисовывается под ширину). .set(title, sub) - поменять текст."""
+        cv = tk.Canvas(parent, height=h, bg=parent.cget("bg"), highlightthickness=0, bd=0)
+        st = {"title": title, "sub": sub, "w": 0, "ph": None}
+
+        def draw(e=None):
+            w = cv.winfo_width()
+            if w < 60 or (e is not None and w == st["w"]):
+                return
+            st["w"] = w
+            st["ph"] = ImageTk.PhotoImage(header_pil(w, h, icon, st["title"], st["sub"]))
+            cv.delete("all")
+            cv.create_image(0, 0, image=st["ph"], anchor="nw")
+        cv.bind("<Configure>", draw)
+
+        def set_(title_=None, sub_=None):
+            if title_ is not None:
+                st["title"] = title_
+            if sub_ is not None:
+                st["sub"] = sub_
+            st["w"] = 0
+            draw()
+        cv.set = set_
+        return cv
+
+    class RoundBar(tk.Canvas):
+        """Полоса прогресса со скруглёнными концами; create_rectangle/coords работают как у Canvas."""
+
+        def __init__(self, parent, height=10, width=None, track=None):
+            kw = {"width": width} if width else {}
+            super().__init__(parent, height=height, bg=parent.cget("bg"), highlightthickness=0, bd=0, **kw)
+            self._h = height
+            self._pills = {}
+            self._track = super().create_polygon(0, 0, 0, 0, smooth=True, fill=track or _mixc(LINE, BG, 0.25), width=0)
+            self.bind("<Configure>", lambda e: self._pill(self._track, 0, 0, e.width, self._h))
+
+        def _pts(self, x0, y0, x1, y1):
+            r = (y1 - y0) / 2.0
+            if x1 - x0 < 2 * r:
+                x1 = x0 + 2 * r if x1 > x0 else x0
+            return [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1, x1 - r, y1, x0 + r, y1, x0, y1,
+                    x0, y1 - r, x0, y0 + r, x0, y0]
+
+        def _pill(self, item, x0, y0, x1, y1):
+            if x1 <= x0:
+                super().coords(item, 0, 0, 0, 0)
+                self.itemconfigure(item, state="hidden")
+                return
+            self.itemconfigure(item, state="normal")
+            super().coords(item, *self._pts(x0, y0, x1, y1))
+
+        def create_rectangle(self, x0, y0, x1, y1, fill=None, width=0, **kw):
+            item = super().create_polygon(0, 0, 0, 0, smooth=True, fill=fill, width=0)
+            self._pills[item] = True
+            self._pill(item, x0, y0, x1, y1)
+            return item
+
+        def coords(self, item, *xy):
+            if item in self._pills and len(xy) == 4:
+                return self._pill(item, *xy)
+            return super().coords(item, *xy)
+
+    class DarkScrollbar(tk.Canvas):
+        """Тонкая полоса прокрутки в цвет темы: ползунок-капсула, перетаскивание, щелчок по дорожке - на страницу."""
+
+        def __init__(self, parent, command=None, width=10):
+            super().__init__(parent, width=width + 4, bg=parent.cget("bg"), highlightthickness=0, bd=0)
+            self.command, self._bw, self._lo, self._hi, self._hover, self._drag = command, width, 0.0, 1.0, False, None
+            self._thumb = self.create_polygon(0, 0, 0, 0, smooth=True, fill=LINE, width=0)
+            self.bind("<Configure>", lambda e: self._draw())
+            self.bind("<Enter>", lambda e=None: (setattr(self, "_hover", True), self._draw()))
+            self.bind("<Leave>", lambda e=None: (setattr(self, "_hover", False), self._draw()))
+            self.bind("<ButtonPress-1>", self._press)
+            self.bind("<B1-Motion>", self._motion)
+            self.bind("<ButtonRelease-1>", lambda e=None: setattr(self, "_drag", None))
+
+        def set(self, lo, hi):
+            self._lo, self._hi = float(lo), float(hi)
+            self._draw()
+
+        def _draw(self):
+            h = self.winfo_height()
+            if self._hi - self._lo >= 0.999 or h < 10:
+                self.itemconfigure(self._thumb, state="hidden")
+                return
+            y0, y1 = 2 + (h - 4) * self._lo, 2 + (h - 4) * self._hi
+            if y1 - y0 < 28:
+                y1 = y0 + 28
+            w = self._bw if (self._hover or self._drag) else self._bw - 3
+            x0 = (self.winfo_width() - w) / 2.0
+            r = w / 2.0
+            self.itemconfigure(self._thumb, state="normal",
+                               fill=_mixc(LINE, "#ffffff", 0.22 if (self._hover or self._drag) else 0.08))
+            self.coords(self._thumb, x0 + r, y0, x0 + w - r, y0, x0 + w, y0, x0 + w, y0 + r, x0 + w, y1 - r, x0 + w, y1,
+                        x0 + w - r, y1, x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0)
+
+        def _press(self, e):
+            h = max(1, self.winfo_height())
+            f = e.y / float(h)
+            if self._lo <= f <= self._hi:
+                self._drag = (e.y, self._lo)
+            elif self.command:
+                self.command("scroll", -1 if f < self._lo else 1, "pages")
+            self._draw()
+
+        def _motion(self, e):
+            if self._drag and self.command:
+                y, lo = self._drag
+                self.command("moveto", lo + (e.y - y) / float(max(1, self.winfo_height())))
+
+    def themed_dialog(title, text, kind="info", buttons=(("ОК", True),), parent=None, entry=None):
+        """Своё окно вместо серого системного: значок, текст, кнопки Portalis. Первая кнопка - главная (Enter),
+        последняя - отмена (Esc и крестик). entry - начальный текст поля ввода (тогда возвращается текст)."""
+        par = parent if parent is not None and parent.winfo_exists() else win
+        t = tk.Toplevel(par.winfo_toplevel())
+        t.withdraw()
+        t.title(title)
+        t.configure(bg=BG)
+        t.resizable(False, False)
+        t.transient(par.winfo_toplevel())
+        t.bind("<Map>", lambda ev: ev.widget is t and dark_titlebar(t), add="+")
+        res = {"v": buttons[-1][1] if entry is None else None}
+        fr = tk.Frame(t, bg=BG, padx=24, pady=20)
+        fr.pack(fill="both", expand=True)
+        top = tk.Frame(fr, bg=BG)
+        top.pack(fill="x")
+        mark = {"question": ("?", ACCENT), "warn": ("!", "#d39b2a"), "error": ("✕", "#d0473f"), "info": ("i", BLUE)}[kind]
+        ic = PILImage.new("RGBA", (132, 132), (0, 0, 0, 0))
+        dd = ImageDraw.Draw(ic)
+        dd.ellipse((6, 6, 126, 126), fill=_hex(_mixc(mark[1], BG, 0.55)))
+        dd.ellipse((14, 14, 118, 118), fill=_hex(mark[1]))
+        f_ = ui_font(70, True, mark[0] == "✕")
+        dd.text((66, 64), mark[0], font=f_, fill=(255, 255, 255, 255), anchor="mm")
+        icl = tk.Label(top, image=pil_photo(ic.resize((44, 44), PILImage.LANCZOS), images), bg=BG)
+        icl.pack(side="left", anchor="n")
+        tx = tk.Frame(top, bg=BG, padx=16)
+        tx.pack(side="left", fill="both", expand=True)
+        tk.Label(tx, text=title, font=(FONT, 14, "bold"), fg=TEXT, bg=BG, anchor="w", justify="left",
+                 wraplength=440).pack(fill="x")
+        tk.Label(tx, text=text, font=(FONT, 10), fg="#c9cdd6", bg=BG, anchor="w", justify="left",
+                 wraplength=440).pack(fill="x", pady=(6, 0))
+        e = None
+        if entry is not None:
+            e = tk.Entry(tx, font=(FONT, 11), bg=CARD_HI, fg=TEXT, insertbackground=TEXT, relief="flat",
+                         highlightthickness=1, highlightbackground=LINE, highlightcolor=ACCENT)
+            e.pack(fill="x", pady=(10, 0), ipady=5)
+            e.insert(0, entry or "")
+            e.select_range(0, "end")
+        row = tk.Frame(fr, bg=BG)
+        row.pack(fill="x", pady=(18, 0))
+
+        def done(v):
+            res["v"] = (e.get() if v is True else None) if e is not None else v
+            t.destroy()
+        for i, (label, val) in enumerate(reversed(buttons)):
+            first = i == len(buttons) - 1
+            (big_button(row, label, lambda v=val: done(v)) if first else
+             small_button(row, label, lambda v=val: done(v), bg=BG)).pack(side="right", padx=(8, 0))
+        t.bind("<Return>", lambda ev: done(buttons[0][1]))
+        t.bind("<Escape>", lambda ev: done(buttons[-1][1] if e is None else None))
+        t.protocol("WM_DELETE_WINDOW", lambda: done(buttons[-1][1] if e is None else None))
+        t.update_idletasks()
+        W, H = max(460, t.winfo_reqwidth()), t.winfo_reqheight()
+        tp = par.winfo_toplevel()
+        t.geometry("%dx%d+%d+%d" % (W, H, tp.winfo_rootx() + max(0, (tp.winfo_width() - W) // 2),
+                                    tp.winfo_rooty() + max(0, (tp.winfo_height() - H) // 3)))
+        t.deiconify()
+        fade_in_window(t, 10, 160)
+        try:
+            t.grab_set()
+        except tk.TclError:
+            pass
+        (e or t).focus_force()
+        t.wait_window()
+        return res["v"]
+
+    class _Dialogs:
+        """messagebox и simpledialog в стиле Portalis (если тест подменил функции tkinter - зовём подмену)."""
+
+        @staticmethod
+        def _patched(mod, name):
+            f = getattr(mod, name, None)
+            return f if f is not None and getattr(f, "__module__", "") not in ("tkinter.messagebox", "tkinter.simpledialog") \
+                else None
+
+        def _ask(self, name, kind, buttons, title, message, **kw):
+            f = self._patched(_tk_messagebox, name)
+            if f:
+                return f(title, message, **kw)
+            return themed_dialog(title, message, kind, buttons, kw.get("parent"))
+
+        def askyesno(self, title, message="", **kw):
+            return self._ask("askyesno", "question", (("Да", True), ("Нет", False)), title, message, **kw)
+
+        def askokcancel(self, title, message="", **kw):
+            return self._ask("askokcancel", "question", (("ОК", True), ("Отмена", False)), title, message, **kw)
+
+        def askyesnocancel(self, title, message="", **kw):
+            return self._ask("askyesnocancel", "question", (("Да", True), ("Нет", False), ("Отмена", None)), title,
+                             message, **kw)
+
+        def showinfo(self, title, message="", **kw):
+            return self._ask("showinfo", "info", (("ОК", "ok"),), title, message, **kw)
+
+        def showwarning(self, title, message="", **kw):
+            return self._ask("showwarning", "warn", (("ОК", "ok"),), title, message, **kw)
+
+        def showerror(self, title, message="", **kw):
+            return self._ask("showerror", "error", (("ОК", "ok"),), title, message, **kw)
+
+        def askstring(self, title, prompt, initialvalue="", parent=None, **kw):
+            f = self._patched(_tk_simpledialog, "askstring")
+            if f:
+                return f(title, prompt, initialvalue=initialvalue, parent=parent, **kw)
+            return themed_dialog(title, prompt, "question", (("ОК", True), ("Отмена", None)), parent, initialvalue or "")
+    messagebox = simpledialog = _Dialogs()
     keep = []
     state = {"tab": "maps", "busy": False}
     settings = load_settings()
@@ -5718,7 +6037,7 @@ def gui():
     body = tk.Frame(win, bg=BG)
     body.pack(fill="both", expand=True, padx=(24, 8), pady=12)
     canvas = tk.Canvas(body, bg=BG, highlightthickness=0, bd=0)
-    sb = tk.Scrollbar(body, orient="vertical", command=canvas.yview)
+    sb = DarkScrollbar(body, command=canvas.yview)
 
     def on_yscroll(a, b):
         sb.set(a, b)
@@ -6326,7 +6645,7 @@ def gui():
         elif auto_var.get() and ok:
             opened = open_launcher()
 
-        t = tk.Toplevel(win)
+        t = new_window()
         t.title("Готово")
         t.configure(bg=BG)
         t.transient(win)
@@ -6418,7 +6737,7 @@ def gui():
     # --- вкладка «Карты» ---
     # --- окна с подробным описанием ---
     def detail_window(title, width=800, height=700):
-        t = tk.Toplevel(win)
+        t = new_window()
         t.title(title)
         t.configure(bg=BG)
         x, y = win.winfo_rootx() + 60, win.winfo_rooty() + 40
@@ -6430,7 +6749,7 @@ def gui():
         except Exception:
             pass
         cv = tk.Canvas(t, bg=BG, highlightthickness=0, bd=0)
-        sb = tk.Scrollbar(t, orient="vertical", command=cv.yview)
+        sb = DarkScrollbar(t, command=cv.yview)
         cv.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         cv.pack(side="left", fill="both", expand=True)
@@ -6990,7 +7309,7 @@ def gui():
 
     def shots_viewer(page, idx=0):
         """Скриншот крупно, стрелки листают."""
-        v = tk.Toplevel(win)
+        v = new_window()
         v.title("Скриншоты")
         v.configure(bg="#0b0c10")
         v.transient(win)
@@ -8283,7 +8602,7 @@ def gui():
         selection = list(cb["sel"].values())
         if not selection:
             return
-        t = tk.Toplevel(win)
+        t = new_window()
         t.title("Сборка «%s»" % name)
         t.configure(bg=BG)
         t.transient(win)
@@ -8291,15 +8610,13 @@ def gui():
         t.geometry("%dx%d+%d+%d" % (W, H, win.winfo_rootx() + (win.winfo_width() - W) // 2, win.winfo_rooty() + 40))
         fr = tk.Frame(t, bg=BG, padx=24, pady=20)
         fr.pack(fill="both", expand=True)
-        hd = tk.Frame(fr, bg=BG)
-        hd.pack(fill="x")
-        tk.Label(hd, image=art("tab_builder_48.png", 1, 1), bg=BG).pack(side="left")
-        tk.Label(hd, text="  «%s»  ·  %s %s" % (name, LOADER_TITLES[cb["loader"]], cb["gv"]), font=(FONT, 16, "bold"),
-                 fg=TEXT, bg=BG).pack(side="left")
+        window_header(fr, "tab_builder_64.png" if os.path.isfile(os.path.join(ART, "tab_builder_64.png"))
+                      else "tab_builder_48.png", "«%s»" % name, "%s %s  ·  %s" % (
+                          LOADER_TITLES[cb["loader"]], cb["gv"], "выбрано %d" % len(selection))).pack(fill="x")
         msg = tk.Label(fr, text="Подбираю версии и зависимости...", font=(FONT, 10, "bold"), fg=GOLD, bg=BG, anchor="w",
                        justify="left", wraplength=W - 60)
         msg.pack(fill="x", pady=(12, 6))
-        bar = tk.Canvas(fr, height=10, bg=LINE, highlightthickness=0, bd=0)
+        bar = RoundBar(fr, 10)
         bar.pack(fill="x")
         fill = bar.create_rectangle(0, 0, 0, 10, fill=ACCENT, width=0)
         lst = tk.Text(fr, bg=PANEL, fg="#c3c7d1", font=(FONT, 10), relief="flat", wrap="word", height=18,
@@ -8645,7 +8962,7 @@ def gui():
     def version_dialog(gv, loader, lv=None, assets=True):
         """Окно скачивания версии: что будет скачано, сколько, прогресс, итог."""
         title = "Minecraft %s%s" % (gv, "" if loader == "vanilla" else " + " + dict(VERSION_LOADERS)[loader])
-        t = tk.Toplevel(win)
+        t = new_window()
         t.title(title)
         t.configure(bg=BG)
         t.transient(win)
@@ -8653,14 +8970,12 @@ def gui():
         t.geometry("%dx%d+%d+%d" % (W, H, win.winfo_rootx() + (win.winfo_width() - W) // 2, win.winfo_rooty() + 70))
         fr = tk.Frame(t, bg=BG, padx=24, pady=20)
         fr.pack(fill="both", expand=True)
-        hd = tk.Frame(fr, bg=BG)
-        hd.pack(fill="x")
-        tk.Label(hd, image=art("tab_versions_48.png", 48, 48), bg=BG).pack(side="left")
-        tk.Label(hd, text="  " + title, font=(FONT, 16, "bold"), fg=TEXT, bg=BG).pack(side="left")
+        window_header(fr, "tab_versions_48.png", title, "клиент, библиотеки, звуки и Java - прямо в папку игры").pack(
+            fill="x")
         msg = tk.Label(fr, text="Проверяю, что уже есть в папке игры...", font=(FONT, 10, "bold"), fg=GOLD, bg=BG,
                        anchor="w", justify="left", wraplength=W - 60)
         msg.pack(fill="x", pady=(12, 6))
-        bar = tk.Canvas(fr, height=10, bg=LINE, highlightthickness=0, bd=0)
+        bar = RoundBar(fr, 10)
         bar.pack(fill="x")
         fill = bar.create_rectangle(0, 0, 0, 10, fill=ACCENT, width=0)
         lst = tk.Text(fr, bg=PANEL, fg="#c3c7d1", font=(FONT, 10), relief="flat", wrap="word", height=11,
@@ -8833,9 +9148,8 @@ def gui():
         soc_bg(lambda: c.me(), lambda r: r and (soc_data().update(me=r), refresh_account(), open_profile(r)))
 
     def login_window():
-        t = tk.Toplevel(win)
+        t = new_window()
         t.title("Аккаунт Portalis")
-        t.configure(bg=BG)
         t.transient(win)
         t.geometry("720x260+%d+%d" % (win.winfo_rootx() + win.winfo_width() - 760, win.winfo_rooty() + 110))
         fr = tk.Frame(t, bg=BG, padx=16, pady=16)
@@ -9013,7 +9327,7 @@ def gui():
         row = tk.Frame(body, bg=BG)
         row.pack(fill="x", pady=(10, 0))
         tk.Label(row, text=" Ур. %d " % lv, font=(FONT, 12, "bold"), bg=color, fg="white", padx=6, pady=2).pack(side="left")
-        bar = tk.Canvas(row, width=260, height=12, bg=LINE, highlightthickness=0, bd=0)
+        bar = RoundBar(row, 12, 260)
         bar.pack(side="left", padx=10)
         bar.create_rectangle(0, 0, int(260 * cur / max(1, need)), 12, fill=color, width=0)
         tk.Label(row, text="%d / %d опыта до %d уровня" % (cur, need, lv + 1), font=(FONT, 9), fg=MUTED, bg=BG).pack(side="left")
@@ -10303,15 +10617,19 @@ def gui():
     def soc_dm(p):
         """Личная переписка с другом в отдельном окне."""
         c = soc()
-        t = tk.Toplevel(win)
+        t = new_window()
         state.setdefault("dm_open", set()).add(p["id"])
         t.bind("<Destroy>", lambda e: e.widget is t and state.get("dm_open", set()).discard(p["id"]))
         t.title("Чат: %s" % p.get("nick"))
         t.configure(bg=BG)
         t.transient(win)
         t.geometry("460x520+%d+%d" % (win.winfo_rootx() + 300, win.winfo_rooty() + 80))
-        tk.Label(t, text="  %s  (%s)" % (p.get("nick"), p.get("login")), font=(FONT, 13, "bold"), fg=TEXT, bg=BG,
-                 anchor="w").pack(fill="x", pady=(12, 6))
+        try:
+            av_ = avatar_pil(p.get("avatar"), 64, p.get("login", ""), None, p.get("frame"))
+        except Exception:
+            av_ = None
+        window_header(t, av_, p.get("nick", "друг"), "@%s  ·  личная переписка" % p.get("login", ""), 76).pack(
+            fill="x", padx=12, pady=(12, 8))
         tx = tk.Text(t, bg=PANEL, fg="#c3c7d1", font=(FONT, 10), relief="flat", wrap="word", highlightthickness=0,
                      padx=10, pady=8)
         tx.pack(fill="both", expand=True, padx=12)
@@ -10895,7 +11213,7 @@ def gui():
 
     def wear_dialog(skin_path, cape_path=None, title=""):
         """Как надеть скин: без интернета у себя в игре или для всех - через сайт своего аккаунта."""
-        t = tk.Toplevel(win)
+        t = new_window()
         t.title("Надеть скин")
         t.configure(bg=BG)
         t.transient(win)
@@ -10974,14 +11292,14 @@ def gui():
         fade_in_window(t)
 
     def cape_maker():
-        t = tk.Toplevel(win)
+        t = new_window()
         t.title("Мастер плащей")
         t.configure(bg=BG)
         t.transient(win)
         fr = tk.Frame(t, bg=BG, padx=24, pady=20)
         fr.pack(fill="both", expand=True)
         st = {"c1": "#b03a2e", "c2": "#f4d03f", "pattern": "полосы"}
-        tk.Label(fr, text="Мастер плащей", font=(FONT, 17, "bold"), fg=TEXT, bg=BG, anchor="w").pack(fill="x")
+        window_header(fr, "ic_cape_48.png", "Мастер плащей", "два цвета и узор - плащ сохранится в «Мои плащи»").pack(fill="x")
         body_ = tk.Frame(fr, bg=BG)
         body_.pack(fill="x", pady=(10, 0))
         prev = tk.Label(body_, bg=PANEL, padx=20, pady=14)
@@ -11377,7 +11695,7 @@ def gui():
         if state.get("upd_win") is not None and state["upd_win"].winfo_exists():
             state["upd_win"].destroy()
         local = load_local_manifest()
-        t = tk.Toplevel(win)
+        t = new_window()
         state["upd_win"] = t
         t.title(title or "Обновление библиотеки")
         t.configure(bg=BG)
@@ -11414,7 +11732,7 @@ def gui():
         msg = tk.Label(fr, text="Сверяю файлы...", font=(FONT, 10, "bold"), fg=GOLD, bg=BG, anchor="w",
                        justify="left", wraplength=W - 80)
         msg.pack(fill="x", pady=(16, 6))
-        bar = tk.Canvas(fr, height=12, bg=LINE, highlightthickness=0, bd=0)
+        bar = RoundBar(fr, 12)
         bar.pack(fill="x")
         fill = bar.create_rectangle(0, 0, 0, 12, fill=ACCENT, width=0)
         shine = bar.create_rectangle(-60, 0, -20, 12, fill=ACCENT_HI, width=0)
@@ -11626,7 +11944,9 @@ def gui():
     win._hooks = {"finish": finish, "open_update": open_update, "toast": toast, "show": show, "body": canvas,
                   "version_dialog": version_dialog, "open_map": open_map, "find_maps": find_maps,
                   "open_profile": open_profile, "party_server_window": party_server_window,
-                  "cloud_window": cloud_window, "open_pack": open_pack, "builder_set": builder_set}
+                  "cloud_window": cloud_window, "open_pack": open_pack, "builder_set": builder_set,
+                  "builder_build": builder_build, "builder_state": builder_state, "cape_maker": cape_maker,
+                  "soc_dm": soc_dm, "messagebox": messagebox, "open_server": open_server}
     # Окно открывается там же и таким же, каким его закрыли; горячие клавиши.
     g = settings.get("geometry", "")
     mg = re.match(r"^(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$", g)
