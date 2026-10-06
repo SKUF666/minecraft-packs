@@ -29,7 +29,7 @@ def patched(self, *a):
                     im.save(os.path.join(OUT, 'startup_white_%02d.png' % n))
         except tk.TclError:
             pass
-        if time.perf_counter() - t0 < 3.5:
+        if time.perf_counter() - t0 < 6.0:
             self.after(40, lambda: shot(n + 1))
         else:
             self.destroy()

@@ -5356,7 +5356,52 @@ THEMES = {  # тёмные темы: фон, панели, карточки, л�
                    ACCENT="#e8833a", ACCENT_HI="#f39a55"),
     "amethyst": dict(title="Аметист", BG="#15111c", PANEL="#1d1727", CARD="#251d32", CARD_HI="#2f253e", LINE="#3b2f4e",
                      ACCENT="#9b59d0", ACCENT_HI="#b073e3"),
+    "nether": dict(title="Незер", BG="#170d0c", PANEL="#211311", CARD="#2a1815", CARD_HI="#3a201c", LINE="#4d2a24",
+                   ACCENT="#d9532a", ACCENT_HI="#f06d3f"),
+    "end": dict(title="Энд", BG="#0e0c17", PANEL="#16132a", CARD="#1d1934", CARD_HI="#29244a", LINE="#3a335f",
+                ACCENT="#9c6ad8", ACCENT_HI="#b688ea"),
+    "heaven": dict(title="Рай", BG="#171c2a", PANEL="#1f2638", CARD="#262f45", CARD_HI="#313c57", LINE="#43516f",
+                   ACCENT="#c9962c", ACCENT_HI="#ddac43"),
+    "ocean": dict(title="Океан", BG="#0a171c", PANEL="#0f232b", CARD="#132b35", CARD_HI="#1a3a47", LINE="#24505f",
+                  ACCENT="#21a39a", ACCENT_HI="#33bdb2"),
 }
+
+# Оформление: рамки окон, картинка шапки и цвета. frames - набор рамок в Оформление/frames_ui (None - без рамок).
+STYLES = {
+    "forest": dict(title="Лес", desc="мшистый камень и лианы", theme="obsidian", frames="forest", banner="banner.png"),
+    "nether": dict(title="Ад", desc="незерит, лава и багровые лозы", theme="nether", frames="nether",
+                   banner="banner_nether.png"),
+    "end": dict(title="Энд", desc="пурпур, хорус и звёзды пустоты", theme="end", frames="end", banner="banner_end.png"),
+    "heaven": dict(title="Рай", desc="белый кварц, золото и облака", theme="heaven", frames="heaven",
+                   banner="banner_heaven.png"),
+    "ocean": dict(title="Океан", desc="призмарин, ламинария и кораллы", theme="ocean", frames="ocean",
+                  banner="banner_ocean.png"),
+    "plain": dict(title="Без рамок", desc="простые скруглённые панели", theme=None, frames=None, banner="banner.png"),
+}
+STYLE = "forest"
+
+
+def apply_style(name):
+    global STYLE
+    STYLE = name if name in STYLES else "forest"
+
+
+def style_banner():
+    f = STYLES[STYLE]["banner"]
+    return f if os.path.isfile(os.path.join(ART, f)) else "banner.png"
+
+
+def style_frame(kind, variant=0, style=None):
+    """Имя рамки текущего оформления: kind = panel / card; у карточек бывает несколько вариантов (card, card2...)."""
+    fr = STYLES[style or STYLE]["frames"]
+    if not fr:
+        return None
+    base = "" if fr == "forest" else fr + "_"
+    names = [base + kind] + [base + kind + str(i) for i in range(2, 5)]
+    have = [n for n in names if os.path.isfile(os.path.join(ART, "frames_ui", n + ".png"))]
+    if not have:
+        return None
+    return have[variant % len(have)]
 
 
 def apply_theme(name):
@@ -5620,7 +5665,7 @@ def frame_src(name):
     return _FRAMES[name]
 
 
-def frame_pil(name, w, h, fill, pbg, inner=None):
+def frame_pil(name, w, h, fill, pbg, inner=None, variant=0):
     """Окно из нарисованной рамки (ChatGPT) любого размера: углы как есть, края повторяются, середина - ровный
     цвет fill (или картинка inner того же размера). Снаружи рамки - цвет фона pbg."""
     src, m = frame_src(name)
@@ -5639,6 +5684,12 @@ def frame_pil(name, w, h, fill, pbg, inner=None):
     top, bot = src.crop((c, 0, W - c, c)), src.crop((c, H - c, W - c, H))
     lef, rig = src.crop((0, c, c, H - c)), src.crop((W - c, c, W, H - c))
     seg = max(1, top.width)
+    if variant:  # узор по краям начинается с другого места - соседние рамки не одинаковые
+        off = (variant * 53) % seg
+        top = _roll_x(top, off)
+        bot = _roll_x(bot, (off * 3) % seg)
+        lef = _roll_y(lef, (variant * 41) % max(1, lef.height))
+        rig = _roll_y(rig, (variant * 67) % max(1, rig.height))
     x = c
     while x < w - c:
         wd = min(seg, w - c - x)
@@ -5656,7 +5707,27 @@ def frame_pil(name, w, h, fill, pbg, inner=None):
     fr.paste(src.crop((W - c, 0, W, c)), (w - c, 0))
     fr.paste(src.crop((0, H - c, c, H)), (0, h - c))
     fr.paste(src.crop((W - c, H - c, W, H)), (w - c, h - c))
+    if variant % 2:
+        fr = fr.transpose(PILImage.FLIP_LEFT_RIGHT)
     out.alpha_composite(fr)
+    return out
+
+
+def _roll_x(im, off):
+    if not off:
+        return im
+    out = PILImage.new("RGBA", im.size)
+    out.paste(im.crop((off, 0, im.width, im.height)), (0, 0))
+    out.paste(im.crop((0, 0, off, im.height)), (im.width - off, 0))
+    return out
+
+
+def _roll_y(im, off):
+    if not off:
+        return im
+    out = PILImage.new("RGBA", im.size)
+    out.paste(im.crop((0, off, im.width, im.height)), (0, 0))
+    out.paste(im.crop((0, 0, im.width, off)), (0, im.height - off))
     return out
 
 
@@ -5686,11 +5757,14 @@ def hero_pil(name, w, h, pbg, r=14, vines=True, seed=3, frame="panel"):
         a = int(175 * (1 - x / float(sw)) ** 1.8)
         sd.rectangle((x, 0, x + 1, h), fill=_hex(BG, a))
     im.alpha_composite(shade)
+    frame = style_frame(frame) if frame else None
     if frame:
         try:
             return frame_pil(frame, w, h, BG, pbg, inner=im)
         except Exception:
             pass
+    elif STYLES[STYLE]["frames"] is None:
+        vines = False
     if vines:
         im.alpha_composite(vines_layer(w, h, seed, 22, 22, 16, long=True))
     out = PILImage.new("RGBA", (w, h), _hex(pbg))
@@ -5926,7 +6000,8 @@ def header_pil(w, h, icon, title, sub=""):
     try:  # в каменной рамке, как панели
         bg_ = PILImage.new("RGBA", (w, h), _hex(CARD))
         bg_.alpha_composite(im)
-        return frame_pil("panel", w, h, CARD, BG, inner=bg_)
+        fname = style_frame("panel")
+        return frame_pil(fname, w, h, CARD, BG, inner=bg_) if fname else im
     except Exception:
         return im
 
@@ -5960,6 +6035,7 @@ def gui():
 
     cleanup_after_update()
     tidy_old_name()
+    apply_style(load_settings().get("style"))
     apply_theme(load_settings().get("theme"))
     win = tk.Tk()
     win.withdraw()
@@ -6112,8 +6188,13 @@ def gui():
         except tk.TclError:
             pass
         _isl_seed[0] += 1
+        variant = _isl_seed[0] % 7
         if vines and frame is None:
             frame = "panel"
+        if frame:  # рамка текущего оформления (у карточек - разные варианты); «без рамок» - простые скруглённые
+            frame = style_frame(frame, variant)
+            if frame is None:
+                vines = False
         if frame:  # нарисованная рамка: отступы - не меньше толщины камня
             try:
                 ins = frame_src(frame)[1]["inset"]
@@ -6156,7 +6237,7 @@ def gui():
             st["key"] = key
             ph = _isl_cache.get(key)
             if ph is None and frame:
-                im_ = frame_pil(frame, w, h, fill, pbg)
+                im_ = frame_pil(frame, w, h, fill, pbg, variant=variant)
                 if st["hover"] or st["border"]:
                     ins = frame_src(frame)[1]["inset"]
                     ImageDraw.Draw(im_).rectangle((ins, ins, w - ins - 1, h - ins - 1), outline=_hex(b), width=2)
@@ -6171,8 +6252,15 @@ def gui():
             lb.lower()
 
         def sched(e=None):
-            if st["job"] is None and fr.winfo_exists():
-                st["job"] = fr.after(25, draw)
+            """Перерисовка, когда размеры устоялись (при раскладке окна они меняются несколько раз подряд)."""
+            if not fr.winfo_exists():
+                return
+            if st["job"] is not None:
+                try:
+                    fr.after_cancel(st["job"])
+                except tk.TclError:
+                    pass
+            st["job"] = fr.after(70 if st["key"] is None else 40, draw)
         fr.bind("<Configure>", sched, add="+")
 
         def set_(**kw):
@@ -6519,7 +6607,7 @@ def gui():
             return
         hs["w"] = w
         try:
-            hs["pil"] = cover_pil("banner.png", w, HEAD_H, 1.0, 0.5)
+            hs["pil"] = cover_pil(style_banner(), w, HEAD_H, 1.0, 0.5)
         except Exception:
             hs["pil"] = PILImage.new("RGBA", (w, HEAD_H), _hex(BG))
         hs["ph"] = ImageTk.PhotoImage(hs["pil"])
@@ -6944,19 +7032,6 @@ def gui():
     shortcut_btn.pack(side="right", padx=4, pady=8)
     small_button(foot_btns, "Папка Portalis", lambda: os.startfile(ROOT), bg=PANEL, icon="ic_backup.png").pack(
         side="right", padx=4, pady=8)
-    def theme_menu():
-        menu = tk.Menu(win, tearoff=0, bg=CARD_HI, fg=TEXT, activebackground=ACCENT, activeforeground="white",
-                       font=(FONT, 10), bd=0)
-        cur = load_settings().get("theme") or "obsidian"
-        for key, th in THEMES.items():
-            sw = PILImage.new("RGB", (42, 16), th["BG"])
-            ImageDraw.Draw(sw).rectangle((12, 0, 27, 15), fill=th["CARD_HI"])
-            ImageDraw.Draw(sw).rectangle((28, 0, 41, 15), fill=th["ACCENT"])
-            ph = pil_photo(sw, keep)
-            menu.add_command(label="  %s%s  " % (th["title"], "  ✓" if key == cur else ""), image=ph, compound="left",
-                             command=lambda key=key: set_theme(key))
-        menu.tk_popup(theme_btn.winfo_rootx(), theme_btn.winfo_rooty() - 6 * 34)
-
     def set_theme(key):
         st_ = load_settings()
         if st_.get("theme", "obsidian") == key:
@@ -6975,7 +7050,66 @@ def gui():
             messagebox.showwarning("Перезапуск", "Не получилось перезапустить: %s. Закрой и открой Portalis сам." % e)
             return
         on_close()
-    theme_btn = small_button(foot_btns, "Тема", theme_menu, bg=PANEL, icon="ic_palette.png")
+    def style_preview(key, w=300, h=104):
+        """Образец оформления: его шапка в его рамке, цвета его темы."""
+        st_ = STYLES[key]
+        th = THEMES.get(st_["theme"] or load_settings().get("theme") or "obsidian") or THEMES["obsidian"]
+        ban = st_["banner"] if os.path.isfile(os.path.join(ART, st_["banner"])) else "banner.png"
+        im = cover_pil(ban, w, h, 0.85, 0.5)
+        fname = style_frame("panel", 0, key)
+        if fname:
+            return frame_pil(fname, w, h, th["CARD"], BG, inner=im)
+        out = PILImage.new("RGBA", (w, h), _hex(BG))
+        out.paste(im, (0, 0), round_mask(w, h, 12))
+        return out
+
+    def choose_style(key):
+        st_ = load_settings()
+        if st_.get("style", "forest") == key and (not STYLES[key]["theme"] or st_.get("theme") == STYLES[key]["theme"]):
+            return
+        st_["style"] = key
+        if STYLES[key]["theme"]:
+            st_["theme"] = STYLES[key]["theme"]
+        save_settings(st_)
+        if messagebox.askyesno("Оформление", "Оформление «%s» применится после перезапуска Portalis. Перезапустить "
+                                             "сейчас?" % STYLES[key]["title"]):
+            restart_app()
+        else:
+            toast("Оформление «%s» включится при следующем запуске." % STYLES[key]["title"], "info")
+
+    def style_window():
+        """Окно оформления: наборы (рамки, шапка, цвета) и отдельно цвета."""
+        t, body_ = detail_window("Оформление Portalis", 760, 720)
+        cur = load_settings().get("style", "forest")
+        dsection(body_, "Оформление")
+        dpara(body_, "Рамки окон и карточек, картинка шапки и цвета - набором. «Без рамок» - простые скруглённые панели.")
+        grid_ = tk.Frame(body_, bg=BG)
+        grid_.pack(fill="x", pady=(6, 0))
+        for i, (key, st_) in enumerate(STYLES.items()):
+            cell = tk.Frame(grid_, bg=CARD, padx=12, pady=10, cursor="hand2")
+            cell.grid(row=i // 2, column=i % 2, padx=(0, 12), pady=(0, 12), sticky="nsew")
+            island(cell, vines=False, radius=12, border=ACCENT if key == cur else None, hover=True)
+            pv = tk.Label(cell, bg=CARD, cursor="hand2")
+            pv.pack()
+            try:
+                pv.configure(image=pil_photo(style_preview(key), t._imgs))
+            except Exception:
+                pass
+            tk.Label(cell, text=st_["title"] + ("   ✓ сейчас" if key == cur else ""), font=(FONT, 12, "bold"),
+                     fg=ACCENT_HI if key == cur else TEXT, bg=CARD, anchor="w").pack(fill="x", pady=(8, 0))
+            tk.Label(cell, text=st_["desc"], font=(FONT, 9), fg=MUTED, bg=CARD, anchor="w").pack(fill="x")
+            clickable(cell, lambda key=key: (t.destroy(), choose_style(key)))
+        grid_.columnconfigure(0, weight=1)
+        grid_.columnconfigure(1, weight=1)
+        dsection(body_, "Только цвета")
+        cr = tk.Frame(body_, bg=BG)
+        cr.pack(fill="x")
+        cur_t = load_settings().get("theme") or "obsidian"
+        for i, (key, th) in enumerate(THEMES.items()):
+            chip(cr, th["title"], key == cur_t, lambda key=key: (t.destroy(), set_theme(key))).grid(
+                row=i // 5, column=i % 5, padx=(0, 6), pady=(0, 6), sticky="w")
+        auto_wrap(body_)
+    theme_btn = small_button(foot_btns, "Оформление", lambda: style_window(), bg=PANEL, icon="ic_palette.png")
     theme_btn.pack(side="right", padx=4, pady=8)
     small_button(foot_btns, "Проверить обновления", lambda: check_updates(manual=True), bg=PANEL, icon="tab_update.png").pack(
         side="right", padx=4, pady=8)
@@ -7018,6 +7152,93 @@ def gui():
         c.grid(row=row, column=col, sticky="nsew", padx=(0, 14), pady=(0, 14))
         return island(c, hover=True, frame="card")
 
+    popup_st = {"w": None}
+
+    def close_popup(e=None):
+        t_ = popup_st.get("w")
+        if t_ is not None and t_.winfo_exists():
+            if e is not None:
+                try:
+                    if str(e.widget.winfo_toplevel()) == str(t_):
+                        return
+                except Exception:
+                    pass
+            t_.destroy()
+        popup_st["w"] = None
+    win.bind_all("<Button-1>", close_popup, add="+")
+
+    def version_groups(ids):
+        """Версии по группам: 26.x, 1.21, 1.20... (новые сверху)."""
+        groups = {}
+        for v in ids:
+            parts = v.split(".")
+            key = (parts[0] + ".x") if parts[0] != "1" else ".".join(parts[:2])
+            groups.setdefault(key, []).append((v, v))
+        return list(groups.items())
+
+    def pick_popup(anchor, groups, current, on_pick, title="Выбери", width=560, list_mode=False):
+        """Красивое окошко выбора поверх программы: группы сверху, варианты «таблетками» (или строками списка).
+        groups: [(название группы, [(значение, подпись), ...]), ...]. Esc или щелчок мимо - закрыть."""
+        close_popup()
+        t = tk.Toplevel(win)
+        t.overrideredirect(True)
+        t.configure(bg=BG)
+        popup_st["w"] = t
+        fr = tk.Frame(t, bg=CARD, padx=26, pady=22)
+        fr.pack(fill="both", expand=True)
+        island(fr, frame="card")
+        hd = tk.Frame(fr, bg=CARD)
+        hd.pack(fill="x")
+        tk.Label(hd, text=title, font=(FONT, 13, "bold"), fg=TEXT, bg=CARD).pack(side="left")
+        small_button(hd, "✕", close_popup, bg=CARD).pack(side="right")
+        sel = {"g": next((i for i, (_g, items) in enumerate(groups) if any(v == current for v, _l in items)), 0)}
+        gbox = tk.Frame(fr, bg=CARD)
+        gbox.pack(fill="x", pady=(10, 0))
+        body = tk.Frame(fr, bg=CARD)
+        body.pack(fill="both", expand=True, pady=(10, 0))
+
+        def pick(v):
+            close_popup()
+            on_pick(v)
+
+        def draw():
+            for w_ in gbox.winfo_children() + body.winfo_children():
+                w_.destroy()
+            if len(groups) > 1:
+                cols = 7
+                for i, (g, _items) in enumerate(groups):
+                    chip(gbox, g, i == sel["g"], lambda i=i: (sel.update(g=i), draw())).grid(
+                        row=i // cols, column=i % cols, padx=(0, 5), pady=(0, 5), sticky="w")
+            items = groups[sel["g"]][1] if groups else []
+            if list_mode:
+                for v, lab in items[:40]:
+                    b = PButton(body, ("✓  " if v == current else "") + lab, lambda v=v: pick(v),
+                                "primary" if v == current else "ghost", color=ACCENT if v == current else None,
+                                size=10, bold=v == current)
+                    b.pack(fill="x", pady=(0, 4), anchor="w")
+            else:
+                cols = 5
+                for i, (v, lab) in enumerate(items[:60]):
+                    PButton(body, lab, lambda v=v: pick(v), "primary" if v == current else "ghost",
+                            color=ACCENT if v == current else None, size=10, bold=True).grid(
+                        row=i // cols, column=i % cols, padx=(0, 6), pady=(0, 6), sticky="we")
+            t.update_idletasks()
+            W = max(width, t.winfo_reqwidth())
+            H = t.winfo_reqheight()
+            x = min(anchor.winfo_rootx(), t.winfo_screenwidth() - W - 10)
+            y = anchor.winfo_rooty() + anchor.winfo_height() + 6
+            if y + H > t.winfo_screenheight() - 40:
+                y = max(10, anchor.winfo_rooty() - H - 6)
+            t.geometry("%dx%d+%d+%d" % (W, H, x, y))
+        draw()
+        t.bind("<Escape>", close_popup)
+        t.focus_force()
+        try:
+            t.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        return t
+
     def dropdown(parent, var, choices, bg=CARD, caption="Сборка", raw=False):
         """Выпадающий список в стиле окна: подпись со стрелкой и тёмное меню. raw - пункты как есть."""
         def short(name):
@@ -7037,8 +7258,12 @@ def gui():
         for ch in choices:
             menu.add_command(label="  " + short(ch) + "  ",
                              command=lambda ch=ch: (var.set(ch), disp.set(short(ch) + "   ▾")))
-        b.bind("<Button-1>", lambda e: menu.tk_popup(b.winfo_rootx(), b.winfo_rooty() + b.winfo_height()))
-        hold.bind("<Button-1>", lambda e: menu.tk_popup(b.winfo_rootx(), b.winfo_rooty() + b.winfo_height()))
+        def open_pick(e=None):
+            pick_popup(hold, [("", [(ch, short(ch)) for ch in choices])], var.get(),
+                       lambda ch: (var.set(ch), disp.set(short(ch) + "   ▾")), caption or "Выбери", 420, True)
+            return "break"
+        b.bind("<Button-1>", open_pick)
+        hold.bind("<Button-1>", open_pick)
         b.bind("<Enter>", lambda e: hold._isl(border=ACCENT))
         b.bind("<Leave>", lambda e: hold._isl(border=None))
         return box
@@ -8989,7 +9214,8 @@ def gui():
                        font=(FONT, 10), bd=0)
         for v in cb["versions"]:
             menu.add_command(label="  " + v + "  ", command=lambda v=v: builder_set(gv=v))
-        gb.bind("<Button-1>", lambda e: menu.tk_popup(gb.winfo_rootx(), gb.winfo_rooty() + gb.winfo_height()))
+        gb.bind("<Button-1>", lambda e: (pick_popup(gb, version_groups(cb["versions"]), cb["gv"], lambda v: builder_set(gv=v),
+                                                    "Версия игры"), "break")[1])
         tk.Label(r1, text="Загрузчик:", font=(FONT, 10, "bold"), fg=TEXT, bg=PANEL).pack(side="left", padx=(0, 8))
         chip_row(r1, [(k, v) for k, v in LOADER_TITLES.items()], cb["loader"], lambda v: builder_set(loader=v), PANEL)
         tk.Label(r1, text="   Что ищем:", font=(FONT, 10, "bold"), fg=TEXT, bg=PANEL).pack(side="left", padx=(0, 8))
@@ -9438,38 +9664,17 @@ def gui():
         return vv
 
     def version_menu(anchor_w, on_pick):
-        """Все версии Mojang: релизы по линейкам (1.21, 1.20, ...) и свежие снапшоты."""
+        """Все версии Mojang в красивом окошке: релизы по линейкам (26.x, 1.21, 1.20...) и свежие снапшоты."""
         vv = versions_state()
-        menu = tk.Menu(win, tearoff=0, bg=CARD_HI, fg=TEXT, activebackground=ACCENT, activeforeground="white",
-                       font=(FONT, 10), bd=0)
         if not vv["list"]:
-            menu.add_command(label="  Список версий ещё загружается...  ", state="disabled")
-        else:
-            groups = {}
-            for v in vv["list"]:
-                if v["type"] != "release":
-                    continue
-                parts = v["id"].split(".")
-                key = ".".join(parts[:2]) if parts[0] == "1" else parts[0]
-                groups.setdefault(key, []).append(v["id"])
-            for key, ids in groups.items():
-                if len(ids) == 1:
-                    menu.add_command(label="  %s  " % ids[0], command=lambda v=ids[0]: on_pick(v))
-                    continue
-                sub = tk.Menu(menu, tearoff=0, bg=CARD_HI, fg=TEXT, activebackground=ACCENT, activeforeground="white",
-                              font=(FONT, 10), bd=0)
-                for i in ids:
-                    sub.add_command(label="  %s  " % i, command=lambda v=i: on_pick(v))
-                menu.add_cascade(label="  %s.x  " % key if key.count(".") or key.isdigit() else key, menu=sub)
-            snaps = [v["id"] for v in vv["list"] if v["type"] == "snapshot"][:12]
-            if snaps:
-                sub = tk.Menu(menu, tearoff=0, bg=CARD_HI, fg=TEXT, activebackground=ACCENT, activeforeground="white",
-                              font=(FONT, 10), bd=0)
-                for i in snaps:
-                    sub.add_command(label="  %s  " % i, command=lambda v=i: on_pick(v))
-                menu.add_separator()
-                menu.add_cascade(label="  Снапшоты (тестовые)  ", menu=sub)
-        menu.tk_popup(anchor_w.winfo_rootx(), anchor_w.winfo_rooty() + anchor_w.winfo_height())
+            toast("Список версий ещё загружается - нажми через пару секунд.", "info")
+            return
+        groups = version_groups([v["id"] for v in vv["list"] if v["type"] == "release"])
+        snaps = [v["id"] for v in vv["list"] if v["type"] == "snapshot"][:15]
+        if snaps:
+            groups.append(("Снапшоты", [(i, i) for i in snaps]))
+        pick_popup(anchor_w, groups, vv["gv"], on_pick, "Версия Minecraft")
+        return "break"
 
     def build_versions():
         vv = versions_state()
@@ -9490,7 +9695,7 @@ def gui():
         def pick_gv(v):
             vv["gv"] = v
             show("versions", animated=False)
-        gb.bind("<Button-1>", lambda e: version_menu(gb, pick_gv))
+        gb.bind("<Button-1>", lambda e: version_menu(gb, pick_gv))  # окошко выбора версии
         tk.Label(r1, text="все версии — по нажатию", font=(FONT, 9), fg=MUTED, bg=PANEL).pack(side="left")
         r2 = tk.Frame(opt, bg=PANEL)
         r2.pack(fill="x", pady=(10, 0))
@@ -10177,6 +10382,15 @@ def gui():
                 lb.bind("<Button-1>", lambda e, k=k: (sel.update(frame=k), mark_f()))
             fcells[k] = lb
         mark_f()
+        dsection(body, "Оформление Portalis")
+        sr_ = tk.Frame(body, bg=BG)
+        sr_.pack(fill="x")
+        cur_s = load_settings().get("style", "forest")
+        for key_, st_ in STYLES.items():
+            chip(sr_, st_["title"], key_ == cur_s, lambda key_=key_: choose_style(key_)).pack(side="left", padx=(0, 5))
+        small_button(sr_, "С картинками...", style_window, bg=BG, icon="ic_palette.png").pack(side="left", padx=(8, 0))
+        tk.Label(body, text="Рамки окон и карточек, шапка и цвета программы (на этом компьютере).", font=(FONT, 9),
+                 fg=MUTED, bg=BG, anchor="w").pack(fill="x", pady=(4, 0))
         cr_ = tk.Frame(body, bg=BG)
         cr_.pack(fill="x", pady=(10, 0))
         tk.Label(cr_, text="Цвет уровня:", font=(FONT, 10, "bold"), fg=TEXT, bg=BG).pack(side="left", padx=(0, 8))
@@ -12701,7 +12915,8 @@ def gui():
                   "cloud_window": cloud_window, "open_pack": open_pack, "builder_set": builder_set,
                   "builder_build": builder_build, "builder_state": builder_state, "cape_maker": cape_maker,
                   "soc_dm": soc_dm, "messagebox": messagebox, "open_server": open_server,
-                  "open_my_profile": open_my_profile, "state": state}
+                  "open_my_profile": open_my_profile, "state": state,
+                  "style_window": style_window, "version_menu": version_menu}
     # Окно открывается там же и таким же, каким его закрыли; горячие клавиши.
     g = settings.get("geometry", "")
     mg = re.match(r"^(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$", g)

@@ -11,6 +11,9 @@ ps = importlib.util.module_from_spec(importlib.util.spec_from_loader('ps', L)); 
 ps.fetch_remote_manifest = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('offline test'))
 ps.set_game_dir(os.path.join(tempfile.mkdtemp(prefix='portalis-look-'), '.minecraft'))
 store = {}
+if os.environ.get('LOOK_STYLE'):
+    store['style'] = os.environ['LOOK_STYLE']
+    store['theme'] = ps.STYLES[store['style']]['theme'] or 'obsidian'
 ps.load_settings = lambda: dict(store)
 ps.save_settings = lambda d: (store.clear(), store.update(d))
 orig = tk.Tk.mainloop
@@ -26,10 +29,30 @@ def patched(self, *a):
         steps.append((ms, fn))
 
     def shot(name):
-        winshot.shot(self, os.path.join(OUT, 'look_' + name + '.png'))
+        winshot.shot(self, os.path.join(OUT, 'look_' + os.environ.get('LOOK_STYLE', '') + name + '.png'))
     for tab in ('maps', 'packs', 'builder', 'friend', 'versions'):
         at(1800 if tab == 'maps' else 300, lambda tab=tab: hk['show'](tab, animated=False))
         at(2500 if tab == 'builder' else 1200, lambda tab=tab: shot(tab))
+    def walk(w):
+        yield w
+        for c in w.winfo_children():
+            yield from walk(c)
+
+    def tops():
+        return [w for w in self.winfo_children() if isinstance(w, tk.Toplevel)]
+    at(300, lambda: hk['show']('builder', animated=False))
+
+    def open_ver():
+        for x in walk(self):
+            if isinstance(x, tk.Label) and str(x.cget('text')).endswith('▾') and x.winfo_ismapped():
+                x.event_generate('<Button-1>')
+                return print('версии: открыто')
+    at(1500, open_ver)
+    at(1200, lambda: winshot.shot(tops()[-1], os.path.join(OUT, 'look_verpick.png')))
+    at(300, lambda: [w.destroy() for w in tops()])
+    at(300, lambda: hk['style_window']())
+    at(2500, lambda: winshot.shot(tops()[-1], os.path.join(OUT, 'look_styles.png')))
+    at(300, lambda: [w.destroy() for w in tops()])
     at(300, lambda: (hk['state'].update(cape_open=True), hk['show']('skins', animated=False)))
     at(1500, lambda: hk['body'].yview_moveto(0.12))
     at(800, lambda: shot('cape'))
