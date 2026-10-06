@@ -53,7 +53,8 @@ def patched(self, *a):
                      print('найти:', click(self, 'Найти'))))
     at(7000, lambda: grab(self, 'flow_skins_found'))
     at(300, lambda: print('плащ:', click(self, 'Сделать плащ')))
-    at(1500, lambda: grab([w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1], 'flow_cape'))
+    at(1500, lambda: (grab(self, 'flow_cape'), print('мастерская:', any(str(x.cget('text')) == 'Мастерская плащей'
+                                                                       for x in walk(self) if isinstance(x, tk.Label)))))
     at(300, lambda: self.destroy())
 
     def run(i=0):

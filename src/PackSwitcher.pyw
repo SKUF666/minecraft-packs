@@ -5608,6 +5608,58 @@ def island_pil(w, h, fill, pbg, border, r=12, vines=False, seed=0, pad=(14, 14),
     return out
 
 
+_FRAMES = {}
+
+
+def frame_src(name):
+    if name not in _FRAMES:
+        d = os.path.join(ART, "frames_ui")
+        im = PILImage.open(os.path.join(d, name + ".png")).convert("RGBA")
+        with open(os.path.join(d, name + ".json"), encoding="utf-8") as fh:
+            _FRAMES[name] = (im, json.load(fh))
+    return _FRAMES[name]
+
+
+def frame_pil(name, w, h, fill, pbg, inner=None):
+    """Окно из нарисованной рамки (ChatGPT) любого размера: углы как есть, края повторяются, середина - ровный
+    цвет fill (или картинка inner того же размера). Снаружи рамки - цвет фона pbg."""
+    src, m = frame_src(name)
+    c, ins = m["corner"], m["inset"]
+    if min(w, h) < 2 * c + 6:  # маленькое окно - уменьшаем рамку целиком
+        k = max(0.35, (min(w, h) - 6) / float(2 * c))
+        src = src.resize((max(4, int(src.width * k)), max(4, int(src.height * k))), PILImage.LANCZOS)
+        c, ins = max(2, int(c * k)), max(2, int(ins * k))
+    W, H = src.size
+    out = PILImage.new("RGBA", (w, h), _hex(pbg))
+    if inner is not None:
+        out.paste(inner.convert("RGBA").crop((ins, ins, w - ins, h - ins)), (ins, ins))
+    else:
+        ImageDraw.Draw(out).rectangle((ins, ins, w - ins - 1, h - ins - 1), fill=_hex(fill))
+    fr = PILImage.new("RGBA", (w, h), (0, 0, 0, 0))
+    top, bot = src.crop((c, 0, W - c, c)), src.crop((c, H - c, W - c, H))
+    lef, rig = src.crop((0, c, c, H - c)), src.crop((W - c, c, W, H - c))
+    seg = max(1, top.width)
+    x = c
+    while x < w - c:
+        wd = min(seg, w - c - x)
+        fr.paste(top.crop((0, 0, wd, c)), (x, 0))
+        fr.paste(bot.crop((0, 0, wd, c)), (x, h - c))
+        x += wd
+    seg = max(1, lef.height)
+    y = c
+    while y < h - c:
+        hd = min(seg, h - c - y)
+        fr.paste(lef.crop((0, 0, c, hd)), (0, y))
+        fr.paste(rig.crop((0, 0, c, hd)), (w - c, y))
+        y += hd
+    fr.paste(src.crop((0, 0, c, c)), (0, 0))
+    fr.paste(src.crop((W - c, 0, W, c)), (w - c, 0))
+    fr.paste(src.crop((0, H - c, c, H)), (0, h - c))
+    fr.paste(src.crop((W - c, H - c, W, H)), (w - c, h - c))
+    out.alpha_composite(fr)
+    return out
+
+
 _ART_PIL = {}
 
 
@@ -5624,7 +5676,7 @@ def cover_pil(name, w, h, fx=1.0, fy=0.5):
     return im.crop((x0, y0, x0 + w, y0 + h))
 
 
-def hero_pil(name, w, h, pbg, r=14, vines=True, seed=3):
+def hero_pil(name, w, h, pbg, r=14, vines=True, seed=3, frame="panel"):
     """Широкая картинка раздела: заполняет ширину, слева затемнение под текст, скруглённые углы, лианы сверху."""
     im = cover_pil(name, w, h, 1.0, 0.45)
     shade = PILImage.new("RGBA", (w, h), (0, 0, 0, 0))
@@ -5634,6 +5686,11 @@ def hero_pil(name, w, h, pbg, r=14, vines=True, seed=3):
         a = int(175 * (1 - x / float(sw)) ** 1.8)
         sd.rectangle((x, 0, x + 1, h), fill=_hex(BG, a))
     im.alpha_composite(shade)
+    if frame:
+        try:
+            return frame_pil(frame, w, h, BG, pbg, inner=im)
+        except Exception:
+            pass
     if vines:
         im.alpha_composite(vines_layer(w, h, seed, 22, 22, 16, long=True))
     out = PILImage.new("RGBA", (w, h), _hex(pbg))
@@ -5865,7 +5922,13 @@ def header_pil(w, h, icon, title, sub=""):
             else:
                 d.text((xx, yy), run, font=f, fill=_hex(col), anchor="lm")
             xx += f.getlength(run)
-    return im.resize((w, h), PILImage.LANCZOS)
+    im = im.resize((w, h), PILImage.LANCZOS)
+    try:  # в каменной рамке, как панели
+        bg_ = PILImage.new("RGBA", (w, h), _hex(CARD))
+        bg_.alpha_composite(im)
+        return frame_pil("panel", w, h, CARD, BG, inner=bg_)
+    except Exception:
+        return im
 
 
 BG = "#15161a"
@@ -6036,7 +6099,7 @@ def gui():
     _isl_cache = {}
     _isl_seed = [0]
 
-    def island(fr, vines=True, hover=False, border=None, radius=12, fill=None, glow=False, flat=True):
+    def island(fr, vines=True, hover=False, border=None, radius=12, fill=None, glow=False, flat=True, frame=None):
         """Рамка-«островок»: скруглённые углы, мягкий градиент, обводка и лианы по верху; фон рисуется картинкой
         под содержимым (в отступах рамки). hover - обводка цвета акцента под мышью. fr._isl(border=...) - сменить."""
         try:
@@ -6049,6 +6112,14 @@ def gui():
         except tk.TclError:
             pass
         _isl_seed[0] += 1
+        if vines and frame is None:
+            frame = "panel"
+        if frame:  # нарисованная рамка: отступы - не меньше толщины камня
+            try:
+                ins = frame_src(frame)[1]["inset"]
+                fr.configure(padx=max(int(str(fr.cget("padx"))), ins + 8), pady=max(int(str(fr.cget("pady"))), ins + 6))
+            except Exception:
+                frame = None
         st = {"border": border, "hover": False, "key": None, "seed": _isl_seed[0] % 9, "job": None, "lb": None}
 
         def label():
@@ -6075,18 +6146,28 @@ def gui():
                 pad = (int(str(fr.cget("padx"))), int(str(fr.cget("pady"))))
             except (tk.TclError, ValueError):
                 pad = (12, 12)
-            key = (w, h, fill, pbg, b, radius, vines, st["seed"], pad, glow, flat)
             lb = label()
-            if key == st["key"]:
+            old = st["key"]
+            if old and old[2:] == (fill, pbg, b, radius, vines, st["seed"], pad, glow, flat, frame) and                     abs(old[0] - w) <= 2 and abs(old[1] - h) <= 2 and getattr(lb, "_ph", None) is not None:
+                return  # дрожание на 1-2 px (сетка делит ширину) - не перерисовываем
+            key = (w, h, fill, pbg, b, radius, vines, st["seed"], pad, glow, flat, frame)
+            if key == old:
                 return
             st["key"] = key
             ph = _isl_cache.get(key)
+            if ph is None and frame:
+                im_ = frame_pil(frame, w, h, fill, pbg)
+                if st["hover"] or st["border"]:
+                    ins = frame_src(frame)[1]["inset"]
+                    ImageDraw.Draw(im_).rectangle((ins, ins, w - ins - 1, h - ins - 1), outline=_hex(b), width=2)
+                ph = ImageTk.PhotoImage(im_)
             if ph is None:
                 ph = ImageTk.PhotoImage(island_pil(w, h, fill, pbg, b, radius, vines, st["seed"], pad, glow, flat))
                 if len(_isl_cache) > 600:
                     _isl_cache.clear()
                 _isl_cache[key] = ph
             lb.configure(image=ph)
+            lb._ph = ph  # показанная картинка живёт, даже если кэш очистится
             lb.lower()
 
         def sched(e=None):
@@ -6099,6 +6180,7 @@ def gui():
             st["key"] = None
             sched()
         fr._isl = set_
+        fr._isl_force = lambda: (st.update(key=None), sched())
         if hover:
             fr.bind("<Enter>", lambda e: set_(hover=True), add="+")
             fr.bind("<Leave>", lambda e: (not pointer_inside(fr)) and set_(hover=False), add="+")
@@ -6208,9 +6290,11 @@ def gui():
         t.transient(par.winfo_toplevel())
         t.bind("<Map>", lambda ev: ev.widget is t and dark_titlebar(t), add="+")
         res = {"v": buttons[-1][1] if entry is None else None}
-        fr = tk.Frame(t, bg=BG, padx=24, pady=20)
+        fr = tk.Frame(t, bg=CARD, padx=28, pady=24)
         fr.pack(fill="both", expand=True)
-        top = tk.Frame(fr, bg=BG)
+        t.configure(bg=BG)
+        island(fr, frame="card")
+        top = tk.Frame(fr, bg=CARD)
         top.pack(fill="x")
         mark = {"question": ("?", ACCENT), "warn": ("!", "#d39b2a"), "error": ("✕", "#d0473f"), "info": ("i", BLUE)}[kind]
         ic = PILImage.new("RGBA", (132, 132), (0, 0, 0, 0))
@@ -6219,13 +6303,13 @@ def gui():
         dd.ellipse((14, 14, 118, 118), fill=_hex(mark[1]))
         f_ = ui_font(70, True, mark[0] == "✕")
         dd.text((66, 64), mark[0], font=f_, fill=(255, 255, 255, 255), anchor="mm")
-        icl = tk.Label(top, image=pil_photo(ic.resize((44, 44), PILImage.LANCZOS), images), bg=BG)
+        icl = tk.Label(top, image=pil_photo(ic.resize((44, 44), PILImage.LANCZOS), images), bg=CARD)
         icl.pack(side="left", anchor="n")
-        tx = tk.Frame(top, bg=BG, padx=16)
+        tx = tk.Frame(top, bg=CARD, padx=16)
         tx.pack(side="left", fill="both", expand=True)
-        tk.Label(tx, text=title, font=(FONT, 14, "bold"), fg=TEXT, bg=BG, anchor="w", justify="left",
+        tk.Label(tx, text=title, font=(FONT, 14, "bold"), fg=TEXT, bg=CARD, anchor="w", justify="left",
                  wraplength=440).pack(fill="x")
-        tk.Label(tx, text=text, font=(FONT, 10), fg="#c9cdd6", bg=BG, anchor="w", justify="left",
+        tk.Label(tx, text=text, font=(FONT, 10), fg="#c9cdd6", bg=CARD, anchor="w", justify="left",
                  wraplength=440).pack(fill="x", pady=(6, 0))
         e = None
         if entry is not None:
@@ -6234,7 +6318,7 @@ def gui():
             e.pack(fill="x", pady=(10, 0), ipady=5)
             e.insert(0, entry or "")
             e.select_range(0, "end")
-        row = tk.Frame(fr, bg=BG)
+        row = tk.Frame(fr, bg=CARD)
         row.pack(fill="x", pady=(18, 0))
 
         def done(v):
@@ -6243,7 +6327,7 @@ def gui():
         for i, (label, val) in enumerate(reversed(buttons)):
             first = i == len(buttons) - 1
             (big_button(row, label, lambda v=val: done(v)) if first else
-             small_button(row, label, lambda v=val: done(v), bg=BG)).pack(side="right", padx=(8, 0))
+             small_button(row, label, lambda v=val: done(v), bg=CARD)).pack(side="right", padx=(8, 0))
         t.bind("<Return>", lambda ev: done(buttons[0][1]))
         t.bind("<Escape>", lambda ev: done(buttons[-1][1] if e is None else None))
         t.protocol("WM_DELETE_WINDOW", lambda: done(buttons[-1][1] if e is None else None))
@@ -6932,7 +7016,7 @@ def gui():
     def card(parent, col, row):
         c = tk.Frame(parent, bg=CARD, padx=16, pady=16)
         c.grid(row=row, column=col, sticky="nsew", padx=(0, 14), pady=(0, 14))
-        return island(c, vines=True, hover=True)
+        return island(c, hover=True, frame="card")
 
     def dropdown(parent, var, choices, bg=CARD, caption="Сборка", raw=False):
         """Выпадающий список в стиле окна: подпись со стрелкой и тёмное меню. raw - пункты как есть."""
@@ -6942,7 +7026,10 @@ def gui():
         box = tk.Frame(parent, bg=bg)
         if caption:
             tk.Label(box, text=caption, font=(FONT, 8), fg=MUTED, bg=bg).pack(anchor="w")
-        b = tk.Label(box, textvariable=disp, font=(FONT, 10), bg=CARD_HI, fg=TEXT, padx=10, pady=6,
+        hold = tk.Frame(box, bg=CARD_HI, padx=12, pady=3, cursor="hand2")
+        hold.pack(anchor="w")
+        island(hold, vines=False, radius=10)
+        b = tk.Label(hold, textvariable=disp, font=(FONT, 10), bg=CARD_HI, fg=TEXT, padx=0, pady=3,
                      anchor="w", width=25, cursor="hand2")
         b.pack(anchor="w")
         menu = tk.Menu(win, tearoff=0, bg=CARD_HI, fg=TEXT, activebackground=ACCENT, activeforeground="white",
@@ -6951,8 +7038,9 @@ def gui():
             menu.add_command(label="  " + short(ch) + "  ",
                              command=lambda ch=ch: (var.set(ch), disp.set(short(ch) + "   ▾")))
         b.bind("<Button-1>", lambda e: menu.tk_popup(b.winfo_rootx(), b.winfo_rooty() + b.winfo_height()))
-        b.bind("<Enter>", lambda e: b.configure(bg=LINE))
-        b.bind("<Leave>", lambda e: b.configure(bg=CARD_HI))
+        hold.bind("<Button-1>", lambda e: menu.tk_popup(b.winfo_rootx(), b.winfo_rooty() + b.winfo_height()))
+        b.bind("<Enter>", lambda e: hold._isl(border=ACCENT))
+        b.bind("<Leave>", lambda e: hold._isl(border=None))
         return box
 
     def option_menu(parent, var, choices):
@@ -8788,9 +8876,9 @@ def gui():
         hc.grid(row=row, column=0, columnspan=2, sticky="we", padx=(0, 14), pady=(0, 14))
         hid = hc.create_image(0, 0, anchor="nw")
         for dx, dy, color in ((2, 2, "#000000"), (0, 0, "white")):
-            hc.create_text(26 + dx, 50 + dy, text=title, font=(FONT, 19, "bold"), fill=color, anchor="w")
-        hc.create_text(27, 86, text=sub, font=(FONT, 10), fill="#000000", anchor="w", width=560)
-        hc.create_text(26, 85, text=sub, font=(FONT, 10), fill="#d7deea", anchor="w", width=560)
+            hc.create_text(42 + dx, 52 + dy, text=title, font=(FONT, 19, "bold"), fill=color, anchor="w")
+        hc.create_text(43, 88, text=sub, font=(FONT, 10), fill="#000000", anchor="w", width=560)
+        hc.create_text(42, 87, text=sub, font=(FONT, 10), fill="#d7deea", anchor="w", width=560)
         st = {"w": 0, "ph": None}
 
         def paint(e=None):
@@ -9140,9 +9228,12 @@ def gui():
         bar = RoundBar(fr, 10)
         bar.pack(fill="x")
         fill = bar.create_rectangle(0, 0, 0, 10, fill=ACCENT, width=0)
-        lst = tk.Text(fr, bg=PANEL, fg="#c3c7d1", font=(FONT, 10), relief="flat", wrap="word", height=18,
+        lst_h = tk.Frame(fr, bg=PANEL, padx=24, pady=22)
+        island(lst_h, frame="card")
+        lst = tk.Text(lst_h, bg=PANEL, fg="#c3c7d1", font=(FONT, 10), relief="flat", wrap="word", height=18,
                       highlightthickness=0, padx=12, pady=10)
-        lst.pack(fill="both", expand=True, pady=(12, 0))
+        lst_h.pack(fill="both", expand=True, pady=(12, 0))
+        lst.pack(fill="both", expand=True)
         for tag, col in (("h", TEXT), ("dep", "#9fd3a5"), ("bad", "#e0a45a"), ("muted", MUTED)):
             lst.tag_configure(tag, foreground=col)
         lst.tag_configure("h", font=(FONT, 11, "bold"))
@@ -9500,9 +9591,12 @@ def gui():
         bar = RoundBar(fr, 10)
         bar.pack(fill="x")
         fill = bar.create_rectangle(0, 0, 0, 10, fill=ACCENT, width=0)
-        lst = tk.Text(fr, bg=PANEL, fg="#c3c7d1", font=(FONT, 10), relief="flat", wrap="word", height=11,
+        lst_h = tk.Frame(fr, bg=PANEL, padx=24, pady=22)
+        island(lst_h, frame="card")
+        lst = tk.Text(lst_h, bg=PANEL, fg="#c3c7d1", font=(FONT, 10), relief="flat", wrap="word", height=11,
                       highlightthickness=0, padx=12, pady=10)
-        lst.pack(fill="both", expand=True, pady=(12, 0))
+        lst_h.pack(fill="both", expand=True, pady=(12, 0))
+        lst.pack(fill="both", expand=True)
         lst.tag_configure("h", foreground=TEXT, font=(FONT, 11, "bold"))
         lst.tag_configure("muted", foreground=MUTED)
         row = tk.Frame(fr, bg=BG)
@@ -12251,21 +12345,23 @@ def gui():
 
     # --- обновления ---
     def show_update_bar(remote):
+        """Плашка «Вышло обновление»: коротко и кнопка - описание и финальное «Обновить» в окне обновления."""
         for w in upd_bar.winfo_children():
             w.destroy()
         ubg = upd_bar["bg"]
-        tk.Label(upd_bar, image=art("tab_update.png", 1, 1), bg=ubg).pack(side="left", padx=(12, 6), pady=8)
-        tk.Label(upd_bar, text="Вышло обновление %s" % remote.get("version"), font=(FONT, 11, "bold"), fg="white",
-                 bg=ubg).pack(side="left")
-        ch = remote.get("changes") or []
-        if ch:
-            tk.Label(upd_bar, text="   " + ch[0] + ("  и ещё %d" % (len(ch) - 1) if len(ch) > 1 else ""),
-                     font=(FONT, 10), fg="#b9d9bd", bg=ubg).pack(side="left")
 
         def later():
             upd_bar.pack_forget()
+        # кнопки - первыми, чтобы текст их не вытеснил в узком окне
         small_button(upd_bar, "Позже", later, bg=ubg).pack(side="right", padx=(4, 12))
-        big_button(upd_bar, "Обновить", lambda: open_update(remote), icon="ic_download.png").pack(side="right", pady=6)
+        big_button(upd_bar, "Что нового", lambda: open_update(remote), icon="ic_download.png").pack(side="right", pady=6)
+        tk.Label(upd_bar, image=art("tab_update.png", 1, 1), bg=ubg).pack(side="left", padx=(12, 6), pady=8)
+        tk.Label(upd_bar, text="Вышло обновление %s" % remote.get("version"), font=(FONT, 11, "bold"), fg="white",
+                 bg=ubg).pack(side="left")
+        n = len(remote.get("changes") or [])
+        if n:
+            tk.Label(upd_bar, text="   %d %s - нажми «Что нового»" % (n, plural(n, "изменение", "изменения", "изменений")),
+                     font=(FONT, 10), fg="#b9d9bd", bg=ubg).pack(side="left")
         if not upd_bar.winfo_ismapped():
             upd_bar.pack(fill="x", padx=24, pady=(10, 0), before=body)
 
