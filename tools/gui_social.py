@@ -135,7 +135,7 @@ def patched(self, *a):
     at(1500, lambda: (grab(self, 'party_lobby'), print('пати:', [str(x.cget('text')) for x in walk(self) if isinstance(x, tk.Label)
                                                                and any(k in str(x.cget('text')) for k in ('Предлож', '▲', 'предложил', 'Строим', 'Hypixel', 'SkyBlock', 'Карта пати', 'Готовы', 'Все готовы'))])))
     at(300, lambda: (hk['body'].yview_moveto(0), None))
-    at(500, lambda: (grab(self, 'prof_head'), print('профиль:', click(self_name()))))
+    at(500, lambda: (grab(self, 'prof_head'), print('профиль:', hk['open_my_profile']() or True)))
     at(5000, lambda: grab([w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1], 'prof_mine'))
     at(300, lambda: [w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1]._cv.yview_moveto(0.3))
     at(1500, lambda: grab([w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1], 'prof_mine2'))
