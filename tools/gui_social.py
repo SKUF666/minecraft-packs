@@ -59,12 +59,13 @@ def patched(self, *a):
         return False
     at(1500, lambda: hk['show']('friend'))
     at(1500, lambda: grab(self, 'soc_login'))
-    at(300, lambda: print('регистрация:', click('Регистрация')))
+    at(300, lambda: (hk['login_window']('up'), print('регистрация: экран входа')))  # вход - только из шапки
+    at(1200, lambda: grab(self, 'soc_signup'))
 
     def fill():
         es = entries()
         vals = [tag + '_g', 'Тестер Г', pw]
-        for e, v in zip(es[:3], vals):
+        for e, v in zip(es[-3:], vals):  # поля экрана входа - последние (он поверх всего окна)
             e.delete(0, 'end'); e.insert(0, v)
         print('создать:', click('Создать аккаунт'))
     at(800, fill)
