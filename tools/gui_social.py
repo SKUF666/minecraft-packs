@@ -138,6 +138,9 @@ def patched(self, *a):
     at(300, lambda: (hk['body'].yview_moveto(0), None))
     at(500, lambda: (grab(self, 'prof_head'), print('профиль:', hk['open_my_profile']() or True)))
     at(5000, lambda: grab([w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1], 'prof_mine'))
+    for pg_ in ('wall', 'ach', 'friends', 'settings'):  # страницы профиля из меню слева
+        at(300, lambda pg_=pg_: [w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1]._go(pg_))
+        at(2500, lambda pg_=pg_: grab([w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1], 'prof_' + pg_))
     at(300, lambda: [w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1]._cv.yview_moveto(0.3))
     at(1500, lambda: grab([w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1], 'prof_mine2'))
     for k_, y_ in (('prof_mine3', 0.5), ('prof_mine4', 0.68), ('prof_mine5', 1.0)):
@@ -147,6 +150,11 @@ def patched(self, *a):
     at(500, lambda: print('друг:', click('Друг Б', True)))
     at(4000, lambda: grab([w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1], 'prof_friend'))
     at(300, lambda: [w.destroy() for w in self.winfo_children() if isinstance(w, tk.Toplevel)])
+    at(300, lambda: hk['party_create_window']())
+    at(1500, lambda: grab([w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1], 'party_new'))
+    at(300, lambda: [w.destroy() for w in self.winfo_children() if isinstance(w, tk.Toplevel)])
+    at(300, lambda: (hk['body'].yview_moveto(0.0), None))
+    at(1500, lambda: grab(self, 'soc_party_hero'))
     at(300, lambda: (hk['body'].yview_moveto(1.0), None))
     at(2500, lambda: (grab(self, 'soc_feed'), print('лента:', [str(x.cget('text')) for x in walk(self) if isinstance(x, tk.Label)
                                                              and 'достиг' in str(x.cget('text'))])))

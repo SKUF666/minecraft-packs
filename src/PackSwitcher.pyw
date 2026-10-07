@@ -1093,12 +1093,46 @@ class Social:
         mine.sort(key=lambda x: x.get("created_at", ""))
         return mine, [dict(i["parties"], invited_by=i["invited_by"]) for i in inv if i.get("parties")]
 
-    def create_party(self, name):
+    def create_party(self, name, public=False, plan=None, launcher=None, version=None, max_players=8):
+        """Новая пати. public - «кто угодно может войти»: видна в списке открытых пати (нужен шаг 7 на сервере)."""
         name = (name or "").strip()[:40] or "Моя пати"
-        r = self.rest("POST", "parties", body={"owner": self.uid, "name": name}, prefer="return=representation")
+        row = {"owner": self.uid, "name": name}
+        extra = {"is_public": bool(public), "plan": (plan or "").strip()[:80] or None,
+                 "launcher": (launcher or "")[:30] or None, "version": (version or "")[:20] or None,
+                 "max_players": max(2, min(20, int(max_players or 8)))}
+        try:
+            r = self.rest("POST", "parties", body=dict(row, **extra), prefer="return=representation")
+        except SocialError as e:
+            if e.code != 400 or public:  # на сервере ещё нет открытых пати - создаём обычную
+                raise
+            r = self.rest("POST", "parties", body=row, prefer="return=representation")
         pid = r[0]["id"]
         self.rest("POST", "party_members", body={"party_id": pid, "user_id": self.uid})
         return r[0]
+
+    def set_party_public(self, pid, public, plan=None, launcher=None, version=None, max_players=None):
+        f = {"is_public": bool(public)}
+        if plan is not None:
+            f["plan"] = plan.strip()[:80] or None
+        if launcher is not None:
+            f["launcher"] = launcher[:30] or None
+        if version is not None:
+            f["version"] = version[:20] or None
+        if max_players:
+            f["max_players"] = max(2, min(20, int(max_players)))
+        self.rest("PATCH", "parties", {"id": "eq." + pid}, f)
+
+    def public_parties(self):
+        """Открытые пати (хозяин в сети), или None - если на сервере ещё нет этой возможности."""
+        try:
+            return self.rest("POST", "rpc/public_parties", body={}) or []
+        except SocialError as e:
+            if e.code in (400, 404):
+                return None
+            raise
+
+    def join_public(self, pid):
+        self.rest("POST", "party_members", body={"party_id": pid, "user_id": self.uid})
 
     def invite(self, pid, uid):
         self.rest("POST", "party_invites", body={"party_id": pid, "user_id": uid, "invited_by": self.uid})
@@ -3722,6 +3756,20 @@ def exe_path():
     if getattr(sys, "frozen", False):
         return sys.executable
     return os.path.join(APP_DIR, EXE_NAME)
+
+
+def freeze_paint(widget, on):
+    """Windows: пока on, окно (со всеми вложенными) не рисуется - вкладка собирается невидимо, а потом
+    показывается одним кадром. Возвращает True, если получилось."""
+    try:
+        u = ctypes.windll.user32
+        hwnd = int(widget.winfo_id())
+        u.SendMessageW(hwnd, 0x000B, 0 if on else 1, 0)  # WM_SETREDRAW
+        if not on:  # RDW_ERASE | RDW_FRAME | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW
+            u.RedrawWindow(hwnd, None, None, 0x0004 | 0x0400 | 0x0001 | 0x0080 | 0x0100)
+        return True
+    except Exception:
+        return False
 
 
 def clean_env():
@@ -6663,7 +6711,7 @@ SYM_CHARS = set("▲▼▾▸✓✔✕✖★☆♛●○→←⟳♥")
 
 
 def _is_emoji(ch):
-    return ord(ch) >= 0x1F000 or ch in "❤⭐"
+    return ord(ch) >= 0x1F000 or ch in "❤⭐☺"
 
 
 def ui_font(px, bold=False, sym=False):
@@ -7452,6 +7500,21 @@ def gui():
 
     _isl_cache = {}
     _isl_seed = [0]
+    _isl_pending = {}  # островки, ждущие отрисовки: show() дорисовывает их сразу, до показа вкладки
+
+    def flush_islands():
+        for fr_, st_, draw_ in list(_isl_pending.values()):
+            if st_["job"] is not None:
+                try:
+                    fr_.after_cancel(st_["job"])
+                except tk.TclError:
+                    pass
+                st_["job"] = None
+            try:
+                draw_()
+            except tk.TclError:
+                pass
+        _isl_pending.clear()
 
     def island(fr, vines=True, hover=False, border=None, radius=12, fill=None, glow=False, flat=True, frame=None):
         """Рамка-«островок»: скруглённые углы, мягкий градиент, обводка и лианы по верху; фон рисуется картинкой
@@ -7495,6 +7558,7 @@ def gui():
 
         def draw():
             st["job"] = None
+            _isl_pending.pop(id(fr), None)
             if not fr.winfo_exists():
                 return
             w, h = fr.winfo_width(), fr.winfo_height()
@@ -7513,13 +7577,16 @@ def gui():
             if key == old:
                 return
             st["key"] = key
-            ph = _isl_cache.get(key)
+            ph = _isl_cache.get(key + (variant,) if frame else key)
             if ph is None and frame:
                 im_ = frame_pil(frame, w, h, fill, pbg, variant=variant)
                 if st["hover"] or st["border"]:
                     ins = frame_src(frame)[1]["inset"]
                     ImageDraw.Draw(im_).rectangle((ins, ins, w - ins - 1, h - ins - 1), outline=_hex(b), width=2)
                 ph = ImageTk.PhotoImage(im_)
+                if len(_isl_cache) > 600:
+                    _isl_cache.clear()
+                _isl_cache[key + (variant,)] = ph  # одинаковые карточки рисуются один раз
             if ph is None:
                 ph = ImageTk.PhotoImage(island_pil(w, h, fill, pbg, b, radius, vines, st["seed"], pad, glow, flat))
                 if len(_isl_cache) > 600:
@@ -7539,6 +7606,7 @@ def gui():
                 except tk.TclError:
                     pass
             st["job"] = fr.after(70 if st["key"] is None else 40, draw)
+            _isl_pending[id(fr)] = (fr, st, draw)
         fr.bind("<Configure>", sched, add="+")
 
         def set_(**kw):
@@ -11683,18 +11751,32 @@ def gui():
                          bg=PANEL).pack(pady=(8, 0))
         box.configure(width=W_)
 
-    def open_profile(p, fresh=False):
-        """Профиль игрока: шапка с аватаром и статусом, любимые игры, о себе, стена. Свой - с настройками.
-        Чужой профиль сначала берётся свежим с сервера (в списке друзей он мог устареть)."""
+    def open_profile(p, fresh=False, page=None):
+        """Профиль игрока на всё окно: шапка с аватаром и статусом, слева меню разделов (Обзор, Стена, Достижения,
+        у своего - Друзья и Настройки), справа выбранная страница. Чужой профиль сначала берётся свежим с сервера."""
         c = soc()
         if not fresh and p.get("id") and p.get("id") != c.uid:
-            soc_bg(lambda: c.profile(p["id"]), lambda r: open_profile(r or p, True))
+            soc_bg(lambda: c.profile(p["id"]), lambda r: open_profile(r or p, True, page))
             return
         mine = p.get("id") == c.uid
-        t, body = detail_window(p.get("nick", "Профиль"), 780, 800, full=True)
+        t = new_window()
+        t.title(p.get("nick", "Профиль"))
+        t.transient(win)
+        if win.state() == "zoomed":
+            t.geometry("%dx%d+%d+%d" % (win.winfo_width(), win.winfo_height(), win.winfo_rootx(), win.winfo_rooty()))
+            t.after(10, lambda: t.winfo_exists() and t.state("zoomed"))
+        else:
+            t.geometry(win.geometry())
+        t.minsize(860, 560)
+        try:
+            t.iconphoto(False, tk.PhotoImage(file=os.path.join(ROOT, "icon.png")))
+        except Exception:
+            pass
+        t._imgs = []
+        t.bind("<Escape>", lambda e: t.destroy() if not isinstance(t.focus_get(), tk.Entry) else None)
         # шапка: обложка во всю ширину окна (перерисовывается при смене размера)
-        hc = tk.Canvas(body, height=170, bg=BG, highlightthickness=0, bd=0)
-        hc.pack(fill="x")
+        hc = tk.Canvas(t, height=170, bg=BG, highlightthickness=0, bd=0)
+        hc.pack(fill="x", padx=24, pady=(16, 0))
         ban = {"w": 0, "id": None}
 
         def draw_banner(e=None):
@@ -11725,10 +11807,30 @@ def gui():
         hc.create_text(158, 140, text="@%s   %s" % (p.get("login", ""), st), font=(FONT, 10), fill=MUTED, anchor="w")
         if p.get("mood"):
             hc.create_text(158, 160, text="«%s»" % p["mood"], font=(FONT, 10, "italic"), fill=GOLD, anchor="w")
-        progress_block(t, body, p)
+        # ниже: меню разделов слева, страница справа (прокручивается только страница)
+        main = tk.Frame(t, bg=BG)
+        main.pack(fill="both", expand=True, padx=(24, 0), pady=(8, 0))
+        side = tk.Frame(main, bg=PANEL, padx=12, pady=14)
+        island(side, vines=False, radius=14)
+        side.pack(side="left", fill="y", pady=(0, 18))
+        cv = tk.Canvas(main, bg=BG, highlightthickness=0, bd=0)
+        sb = DarkScrollbar(main, command=cv.yview)
+        cv.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        cv.pack(side="left", fill="both", expand=True, padx=(18, 0))
+        body = tk.Frame(cv, bg=BG, padx=4, pady=6)
+        bid = cv.create_window((0, 0), window=body, anchor="nw")
+        body.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
+        cv.bind("<Configure>", lambda e: cv.itemconfigure(bid, width=e.width - 18))
+        t._cv = cv
+        pages = [("overview", "Обзор", "ic_bolt.png"), ("wall", "Стена", "ic_mail.png"),
+                 ("ach", "Достижения", "ic_crown.png")]
         if mine:
-            profile_editor(t, body, p)
-        else:
+            pages += [("friends", "Друзья", "ic_invite.png"), ("settings", "Настройки", "ic_settings.png")]
+        cur = {"page": page if page in [k for k, _l, _i in pages] else "overview"}
+
+        def page_overview():
+            progress_block(t, body, p, ("top",))
             if p.get("about"):
                 dsection(body, "О себе")
                 dpara(body, p["about"])
@@ -11739,16 +11841,100 @@ def gui():
                 fav.pack(fill="x")
                 for g in p["favorites"][:12]:
                     badge(fav, g, CARD_HI).pack(side="left", padx=(0, 6), pady=2)
-            row = dbuttons(body)
-            small_button(row, "Написать", lambda: soc_dm(p), bg=BG, icon="ic_mail.png").pack(side="left")
-            d_ = soc_data()
-            if d_.get("sel") and p.get("id") not in [m.get("id") for m in d_.get("members", [])]:
-                small_button(row, "Позвать в пати «%s»" % ((d_.get("party") or {}).get("name", "")[:16]),
-                             lambda: soc_bg(lambda: c.invite(d_["sel"], p["id"]),
-                                            lambda r: toast("Приглашение в пати отправлено.", "ok")),
-                             bg=BG, icon="ic_invite.png").pack(side="left", padx=6)
-        wall_view(t, body, p)
-        auto_wrap(body)
+            progress_block(t, body, p, ("maps", "skin"))
+
+        def page_friends():
+            dsection(body, "Друзья")
+            fl = [f for f in soc_data().get("friends") or []]
+            if not fl:
+                dpara(body, "Пока никого. Добавь друга по логину на вкладке «Друзья».", color=MUTED)
+            grid = tk.Frame(body, bg=BG)
+            grid.pack(fill="x")
+            for col_ in range(3):
+                grid.grid_columnconfigure(col_, weight=1, uniform="f")
+            for i, f in enumerate(fl[:60]):
+                fp, fs = f["profile"], f["state"]
+                cell = tk.Frame(grid, bg=CARD, padx=12, pady=10, cursor="hand2")
+                island(cell, vines=False, radius=12, hover=True)
+                cell.grid(row=i // 3, column=i % 3, sticky="we", padx=(0, 10), pady=(0, 10))
+                av = tk.Label(cell, bg=CARD)
+                av.pack(side="left")
+                want_pic("pfav:%s:%s:%d" % (fp.get("avatar"), status_color(fp), len(fp.get("avatar") or "")),
+                         lambda fp=fp: avatar_pil(fp.get("avatar"), 44, fp.get("login", ""), status_color(fp)), av, t._imgs)
+                tx = tk.Frame(cell, bg=CARD)
+                tx.pack(side="left", fill="x", expand=True, padx=(10, 0))
+                tk.Label(tx, text=fp.get("nick", "?"), font=(FONT, 11, "bold"), fg=TEXT, bg=CARD, anchor="w").pack(fill="x")
+                sub = status_text(fp) if fs == "friend" else ("хочет дружить" if fs == "incoming" else "ждёт ответа")
+                tk.Label(tx, text=sub, font=(FONT, 9), fg=ACCENT_HI if is_online(fp) and fs == "friend" else MUTED,
+                         bg=CARD, anchor="w").pack(fill="x")
+                if fs == "incoming":
+                    small_button(tx, "Принять", lambda u=fp["id"]: soc_bg(lambda: c.accept(u), lambda r: soc_refresh()),
+                                 bg=CARD, icon="ic_check.png").pack(anchor="w", pady=(4, 0))
+                elif fs == "friend":
+                    small_button(tx, "Написать", lambda fp=fp: soc_dm(fp), bg=CARD, icon="ic_mail.png").pack(
+                        anchor="w", pady=(4, 0))
+                for w_ in (cell, av):
+                    w_.bind("<Button-1>", lambda e, fp=fp: open_profile(fp))
+
+        def page_wall():
+            wall_view(t, body, p)
+
+        def page_ach():
+            progress_block(t, body, p, ("ach",))
+
+        def page_settings():
+            profile_editor(t, body, p)
+
+        def draw_side():
+            for w_ in side.winfo_children():
+                w_.destroy()
+            tk.Label(side, text="Профиль", font=(FONT, 9, "bold"), fg=MUTED, bg=PANEL, anchor="w").pack(fill="x",
+                                                                                                        pady=(0, 6))
+            for k, label, ic in pages:  # строки меню во всю ширину: выбранная - цветом акцента
+                on = k == cur["page"]
+                bg_ = ACCENT if on else PANEL
+                rw = tk.Frame(side, bg=bg_, padx=12, pady=9, cursor="hand2", width=190)
+                rw.pack(fill="x", pady=(0, 4))
+                il = tk.Label(rw, image=art(ic, 20, 20), bg=bg_, cursor="hand2")
+                il.pack(side="left")
+                tl = tk.Label(rw, text="  " + label, font=(FONT, 11, "bold" if on else "normal"), fg="white" if on else TEXT,
+                              bg=bg_, anchor="w", cursor="hand2", width=14)
+                tl.pack(side="left", fill="x", expand=True)
+                for w_ in (rw, il, tl):
+                    w_.bind("<Button-1>", lambda e, k=k: go(k))
+                    if not on:
+                        w_.bind("<Enter>", lambda e, ws=(rw, il, tl): [x.configure(bg=CARD_HI) for x in ws])
+                        w_.bind("<Leave>", lambda e, ws=(rw, il, tl): [x.configure(bg=PANEL) for x in ws])
+            if not mine:
+                tk.Frame(side, bg=LINE, height=1).pack(fill="x", pady=(10, 10))
+                small_button(side, "Написать", lambda: soc_dm(p), bg=PANEL, icon="ic_mail.png").pack(fill="x")
+                d_ = soc_data()
+                if d_.get("sel") and p.get("id") not in [m.get("id") for m in d_.get("members", [])]:
+                    small_button(side, "Позвать в пати", lambda: soc_bg(
+                        lambda: c.invite(d_["sel"], p["id"]), lambda r: toast("Приглашение в пати отправлено.", "ok")),
+                        bg=PANEL, icon="ic_invite.png").pack(fill="x", pady=(6, 0))
+
+        def go(k):
+            cur["page"] = k
+            draw_side()
+            frozen = t.winfo_viewable() and freeze_paint(cv, True)
+            try:
+                for w_ in body.winfo_children():
+                    w_.destroy()
+                wheel.pop(str(cv), None)
+                {"overview": page_overview, "wall": page_wall, "ach": page_ach, "friends": page_friends,
+                 "settings": page_settings}[k]()
+                auto_wrap(body)
+                t.update_idletasks()
+                flush_islands()
+                cv.configure(scrollregion=cv.bbox("all"))
+                cv.yview_moveto(0)
+            finally:
+                if frozen:
+                    freeze_paint(cv, False)
+        t._go = go
+        go(cur["page"])
+        fade_in_window(t)
 
     # --- прогресс игрока: статистика копится сама и уходит в профиль ---
     def my_stats():
@@ -11833,14 +12019,21 @@ def gui():
         else:
             state["stats_merged_once"] = True
 
-    def progress_block(t, body, p):
-        """Уровень и опыт, статистика, достижения, последние карты, скин."""
+    def progress_block(t, body, p, parts=("top", "ach", "maps", "skin")):
+        """Уровень и опыт, статистика (top), достижения и сезон (ach), последние карты (maps), скин (skin)."""
         s_ = p.get("stats") or {}
         if p.get("id") == soc().uid:
             s_ = merge_stats(s_, {k: v for k, v in my_stats().items() if k != "uid"})
         xp = stats_xp(s_)
         lv, cur, need = level_of(xp)
         color = p.get("color") or ACCENT
+        got = {a[0] for a in earned(s_)}
+        if "ach" in parts:
+            ach_block(t, body, p, s_, got)
+        if "maps" in parts or "skin" in parts:
+            tail_block(t, body, p, s_, parts)
+        if "top" not in parts:
+            return
         row = tk.Frame(body, bg=BG)
         row.pack(fill="x", pady=(10, 0))
         tk.Label(row, text=" Ур. %d " % lv, font=(FONT, 12, "bold"), bg=color, fg="white", padx=6, pady=2).pack(side="left")
@@ -11849,12 +12042,15 @@ def gui():
         bar.create_rectangle(0, 0, int(260 * cur / max(1, need)), 12, fill=color, width=0)
         tk.Label(row, text="%d / %d опыта до %d уровня" % (cur, need, lv + 1), font=(FONT, 9), fg=MUTED, bg=BG).pack(side="left")
         hours = int(s_.get("minutes", 0) or 0) / 60.0
-        parts = ["%s в игре" % ("%.1f ч" % hours if hours < 10 else "%d ч" % hours),
+        parts_ = ["%s в игре" % ("%.1f ч" % hours if hours < 10 else "%d ч" % hours),
                  "%d %s" % (s_.get("maps_n", 0), plural(s_.get("maps_n", 0), "карта", "карты", "карт")),
                  "%d %s" % (s_.get("packs", 0), plural(s_.get("packs", 0), "своя сборка", "своих сборки", "своих сборок")),
                  "%d %s" % (s_.get("friends", 0), plural(s_.get("friends", 0), "друг", "друга", "друзей"))]
-        tk.Label(body, text="   ·   ".join(parts), font=(FONT, 10), fg="#c3c7d1", bg=BG, anchor="w").pack(fill="x", pady=(8, 0))
-        got = {a[0] for a in earned(s_)}
+        tk.Label(body, text="   ·   ".join(parts_), font=(FONT, 10), fg="#c3c7d1", bg=BG, anchor="w").pack(fill="x", pady=(8, 0))
+        tk.Label(body, text="Достижений: %d из %d" % (len(got), len(ACHIEVEMENTS)), font=(FONT, 10), fg=GOLD, bg=BG,
+                 anchor="w").pack(fill="x", pady=(4, 0))
+
+    def ach_block(t, body, p, s_, got):
         dsection(body, "Достижения  %d из %d" % (len(got), len(ACHIEVEMENTS)))
         grid = tk.Frame(body, bg=BG)
         grid.pack(fill="x")
@@ -11898,13 +12094,15 @@ def gui():
                 sea["goal"], ".".join(reversed(sea["to"].split("-")[1:])), sea["prize"], min(done_, sea["goal"]), sea["goal"],
                 "  ✓" if done_ >= sea["goal"] else ""), font=(FONT, 10), fg=ACCENT_HI if done_ >= sea["goal"] else TEXT,
                 bg=BG, anchor="w").pack(side="left")
-        if s_.get("maps"):
+
+    def tail_block(t, body, p, s_, parts):
+        if s_.get("maps") and "maps" in parts:
             dsection(body, "Последние карты")
             mr = tk.Frame(body, bg=BG)
             mr.pack(fill="x")
             for m in s_["maps"][:8]:
                 badge(mr, m[:24], CARD_HI).pack(side="left", padx=(0, 6), pady=2)
-        if p.get("skin"):
+        if p.get("skin") and "skin" in parts:
             dsection(body, "Скин: %s" % p["skin"])
             ph = tk.PhotoImage(width=180, height=160)
             t._imgs.append(ph)
@@ -12134,7 +12332,7 @@ def gui():
                 toast("Профиль сохранён.", "ok")
                 state["soc_beat"] = 0  # сразу отметить новый статус
                 soc_bg(lambda: c.me(), lambda me: (soc_data().update(me=me), refresh_account(),
-                                                   t.winfo_exists() and t.destroy(), open_profile(me)))
+                                                   t.winfo_exists() and t.destroy(), open_profile(me, page="settings")))
             soc_bg(lambda: c.update_profile(**fields), done)
         big_button(row, "Сохранить профиль", save, icon="ic_check.png").pack(side="right")
 
@@ -12157,79 +12355,39 @@ def gui():
         small_button(row, "Сменить пароль", change_pw, bg=BG, icon="ic_lock.png").pack(side="left", padx=6)
 
     def wall_view(t, body, p):
-        """Стена: записи хозяина и друзей, новые сверху."""
+        """Стена: поле «напиши на стене» с аватаром, записи карточками (аватар, ник, время, текст, реакции),
+        ответы - со сдвигом и полоской цвета. Новые сверху."""
         c = soc()
         mine = p.get("id") == c.uid
-        dsection(body, "Стена")
-        box = tk.Frame(body, bg=BG)
-        box.pack(fill="x")
+        me_ = soc_data().get("me") or {}
+        hd = tk.Frame(body, bg=BG)
+        hd.pack(fill="x", pady=(4, 8))
+        tk.Label(hd, image=art("ic_mail.png", 22, 22), bg=BG).pack(side="left")
+        tk.Label(hd, text="  Стена", font=(FONT, 16, "bold"), fg=TEXT, bg=BG).pack(side="left")
+        cnt = tk.Label(hd, text="", font=(FONT, 10), fg=MUTED, bg=BG)
+        cnt.pack(side="left", padx=(10, 0))
+        # поле для записи
+        comp = tk.Frame(body, bg=CARD, padx=16, pady=14)
+        island(comp, vines=False, radius=14)
+        comp.pack(fill="x")
+        cav = tk.Label(comp, bg=CARD)
+        cav.pack(side="left", anchor="n")
+        want_pic("wme:%s:%d" % (me_.get("avatar"), len(me_.get("avatar") or "")),
+                 lambda: avatar_pil(me_.get("avatar"), 44, me_.get("login", ""), ACCENT), cav, t._imgs)
+        cr = tk.Frame(comp, bg=CARD)
+        cr.pack(side="left", fill="x", expand=True, padx=(12, 0))
+        rl = tk.Frame(cr, bg=CARD)
+        e = REntry(cr, font=(FONT, 11), bg=CARD_HI, fg=TEXT, insertbackground=TEXT, relief="flat",
+                   highlightthickness=1, highlightbackground=LINE, highlightcolor=ACCENT)
+        e.pack(fill="x", ipady=8)
+        tip = tk.Label(cr, text=("Напиши, что у тебя нового" if mine else "Напиши что-нибудь для %s" % p.get("nick", "игрока"))
+                       + " — Enter, чтобы опубликовать", font=(FONT, 9), fg=MUTED, bg=CARD, anchor="w")
+        tip.pack(fill="x", pady=(6, 0))
+        btn_row = tk.Frame(comp, bg=CARD)
+        btn_row.pack(side="right", anchor="n", padx=(12, 0))
         w = tk.Frame(body, bg=BG)
-        w.pack(fill="x", pady=(8, 0))
-        e = REntry(box, font=(FONT, 10), bg=CARD_HI, fg=TEXT, insertbackground=TEXT, relief="flat",
-                     highlightthickness=1, highlightbackground=LINE, highlightcolor=ACCENT)
-        e.pack(side="left", fill="x", expand=True, ipady=5)
-
-        def load():
-            for x in w.winfo_children():
-                x.destroy()
-            tk.Label(w, text="Загружаю...", font=(FONT, 9), fg=MUTED, bg=BG, anchor="w").pack(fill="x")
-
-            def done(rows):
-                if not w.winfo_exists():
-                    return
-                for x in w.winfo_children():
-                    x.destroy()
-                if not rows:
-                    tk.Label(w, text="На стене пока пусто." + ("" if mine else " Напиши что-нибудь!"),
-                             font=(FONT, 10), fg=MUTED, bg=BG, anchor="w").pack(fill="x")
-                ids = {r["id"] for r in rows}
-                kids = {}
-                for r in rows:
-                    if r.get("reply_to") in ids:
-                        kids.setdefault(r["reply_to"], []).insert(0, r)  # ответы - по порядку
-                order = []
-                for r in rows:
-                    if r.get("reply_to") not in ids:
-                        order.append((r, 0))
-                        order += [(k, 1) for k in kids.get(r["id"], [])]
-                for r, depth in order:
-                    ap = r["author_profile"]
-                    card_ = tk.Frame(w, bg=CARD if not depth else PANEL, padx=12, pady=8)
-                    card_.pack(fill="x", pady=(0, 6), padx=(46 if depth else 0, 0))
-                    av = tk.Label(card_, bg=CARD)
-                    av.pack(side="left", anchor="n")
-                    want_pic("wav:%s:%d" % (ap.get("avatar"), len(ap.get("avatar") or "")),
-                             lambda ap=ap: avatar_pil(ap.get("avatar"), 36, ap.get("login", "")), av, t._imgs)
-                    tx = tk.Frame(card_, bg=CARD)
-                    tx.pack(side="left", fill="x", expand=True, padx=(10, 0))
-                    tk.Label(tx, text="%s   %s" % (ap.get("nick", "игрок"), local_time(r["created_at"], "%d.%m %H:%M")),
-                             font=(FONT, 9, "bold"), fg=ACCENT_HI if r["author"] == c.uid else "#7fb2ff", bg=CARD,
-                             anchor="w").pack(fill="x")
-                    tk.Label(tx, text=r["body"], font=(FONT, 10), fg=TEXT, bg=CARD, anchor="w", justify="left",
-                             wraplength=520 if depth else 560).pack(fill="x")
-                    if depth:
-                        for x in (card_, tx) + tuple(tx.winfo_children()) + (av,):
-                            x.configure(bg=PANEL)
-                    rb = card_.cget("bg")
-                    rr = tk.Frame(tx, bg=rb)
-                    rr.pack(fill="x", pady=(4, 0))
-                    for emo, users in r.get("reactions", {}).items():
-                        on = c.uid in users
-                        chip(rr, "%s %d" % (REACT_EMOJI.get(emo, emo), len(users)), on,
-                             lambda i=r["id"], emo=emo, on=on: soc_bg(lambda: c.react("wall", i, emo, not on),
-                                                                      lambda x: load())).pack(side="left", padx=(0, 4))
-                    react_btn(rr, rb, r.get("reactions", {}), lambda emo, on, i=r["id"]: soc_bg(
-                        lambda: c.react("wall", i, emo, on), lambda x: load())).pack(side="left", padx=(0, 8))
-                    if not depth:
-                        small_button(rr, "Ответить", lambda r=r, ap=ap: set_reply(r["id"], ap.get("nick", "игрок")),
-                                     bg=rb, icon="ic_mail.png").pack(side="left")
-                    if r["author"] == c.uid or mine:
-                        small_button(card_, "✕", lambda i=r["id"]: soc_bg(lambda: c.delete_post(i), lambda x: load()),
-                                     bg=rb).pack(side="right", anchor="n")
-            soc_bg(lambda: c.wall(p["id"]), done)
-
+        w.pack(fill="x", pady=(14, 0))
         reply = {"id": None}
-        rl = tk.Frame(body, bg=BG)
 
         def set_reply(i, nick):
             reply["id"] = i
@@ -12238,10 +12396,86 @@ def gui():
             if i is None:
                 rl.pack_forget()
                 return
-            rl.pack(fill="x", before=box, pady=(0, 4))
-            tk.Label(rl, text="Ответ для %s" % nick, font=(FONT, 9, "bold"), fg=ACCENT_HI, bg=BG).pack(side="left")
-            small_button(rl, "Отмена", lambda: set_reply(None, ""), bg=BG).pack(side="left", padx=8)
+            rl.pack(fill="x", before=e, pady=(0, 6))
+            tk.Label(rl, text="↪  Ответ для %s" % nick, font=(FONT, 9, "bold"), fg=ACCENT_HI, bg=CARD).pack(side="left")
+            small_button(rl, "Отмена", lambda: set_reply(None, ""), bg=CARD).pack(side="left", padx=8)
             e.focus_set()
+
+        def post_card(r, depth):
+            ap = r["author_profile"]
+            bg_ = CARD if not depth else PANEL
+            outer = tk.Frame(w, bg=BG)
+            outer.pack(fill="x", pady=(0, 8), padx=(56 if depth else 0, 0))
+            if depth:  # ответ: тонкая полоска слева
+                tk.Frame(outer, bg=ACCENT, width=3).pack(side="left", fill="y", padx=(0, 8))
+            card_ = tk.Frame(outer, bg=bg_, padx=14, pady=12)
+            island(card_, vines=False, radius=12)
+            card_.pack(side="left", fill="x", expand=True)
+            av = tk.Label(card_, bg=bg_, cursor="hand2")
+            av.pack(side="left", anchor="n")
+            want_pic("wav:%s:%d:%d" % (ap.get("avatar"), len(ap.get("avatar") or ""), 34 if depth else 44),
+                     lambda ap=ap: avatar_pil(ap.get("avatar"), 34 if depth else 44, ap.get("login", ""),
+                                              status_color(ap) if ap.get("status") else None), av, t._imgs)
+            av.bind("<Button-1>", lambda e_, ap=ap: ap.get("id") and open_profile(ap))
+            tx = tk.Frame(card_, bg=bg_)
+            tx.pack(side="left", fill="x", expand=True, padx=(12, 0))
+            top_ = tk.Frame(tx, bg=bg_)
+            top_.pack(fill="x")
+            tk.Label(top_, text=ap.get("nick", "игрок"), font=(FONT, 11, "bold"),
+                     fg=ACCENT_HI if r["author"] == c.uid else "#8fc1ff", bg=bg_).pack(side="left")
+            if r["author"] == p.get("id"):
+                badge(top_, "хозяин", "#3b2f6b", "white").pack(side="left", padx=(6, 0))
+            tk.Label(top_, text=local_time(r["created_at"], "%d.%m в %H:%M"), font=(FONT, 9), fg=MUTED, bg=bg_).pack(
+                side="left", padx=(10, 0))
+            if r["author"] == c.uid or mine:
+                small_button(top_, "✕", lambda i=r["id"]: soc_bg(lambda: c.delete_post(i), lambda x: load()),
+                             bg=bg_).pack(side="right")
+            tk.Label(tx, text=r["body"], font=(FONT, 11), fg=TEXT, bg=bg_, anchor="w", justify="left",
+                     wraplength=640).pack(fill="x", pady=(4, 0))
+            rr = tk.Frame(tx, bg=bg_)
+            rr.pack(fill="x", pady=(8, 0))
+            for emo, users in r.get("reactions", {}).items():
+                on = c.uid in users
+                chip(rr, "%s %d" % (REACT_EMOJI.get(emo, emo), len(users)), on,
+                     lambda i=r["id"], emo=emo, on=on: soc_bg(lambda: c.react("wall", i, emo, not on),
+                                                              lambda x: load())).pack(side="left", padx=(0, 4))
+            react_btn(rr, bg_, r.get("reactions", {}), lambda emo, on, i=r["id"]: soc_bg(
+                lambda: c.react("wall", i, emo, on), lambda x: load())).pack(side="left", padx=(0, 8))
+            if not depth:
+                small_button(rr, "Ответить", lambda r=r, ap=ap: set_reply(r["id"], ap.get("nick", "игрок")),
+                             bg=bg_, icon="ic_mail.png").pack(side="left")
+
+        def load():
+            for x in w.winfo_children():
+                x.destroy()
+            tk.Label(w, text="Загружаю записи...", font=(FONT, 10), fg=MUTED, bg=BG, anchor="w").pack(fill="x")
+
+            def done(rows):
+                if not w.winfo_exists():
+                    return
+                for x in w.winfo_children():
+                    x.destroy()
+                cnt.configure(text="%d %s" % (len(rows), plural(len(rows), "запись", "записи", "записей")) if rows else "")
+                if not rows:
+                    em = tk.Frame(w, bg=CARD, padx=20, pady=22)
+                    island(em, vines=False, radius=14)
+                    em.pack(fill="x")
+                    tk.Label(em, image=art("ic_mail.png", 40, 40), bg=CARD).pack(side="left", padx=(0, 16))
+                    tk.Label(em, text=("На стене пока пусто. Расскажи друзьям, во что играешь!" if mine else
+                                       "На стене пока пусто — напиши первым!"), font=(FONT, 12), fg=TEXT, bg=CARD,
+                             anchor="w").pack(side="left")
+                ids = {r["id"] for r in rows}
+                kids = {}
+                for r in rows:
+                    if r.get("reply_to") in ids:
+                        kids.setdefault(r["reply_to"], []).insert(0, r)  # ответы - по порядку
+                for r in rows:
+                    if r.get("reply_to") not in ids:
+                        post_card(r, 0)
+                        for k in kids.get(r["id"], []):
+                            post_card(k, 1)
+                auto_wrap(w)
+            soc_bg(lambda: c.wall(p["id"]), done)
 
         def post(ev=None):
             text = e.get().strip()
@@ -12251,7 +12485,7 @@ def gui():
                 set_reply(None, "")
                 soc_bg(lambda: c.post_wall(p["id"], text, to), lambda r: load())
         e.bind("<Return>", post)
-        small_button(box, "Опубликовать", post, bg=BG, icon="ic_invite.png").pack(side="right", padx=(6, 0))
+        big_button(btn_row, "Опубликовать", post, icon="ic_invite.png").pack()
         load()
 
     def react_btn(parent, bg, reacts, on_pick):
@@ -12554,6 +12788,10 @@ def gui():
         def fetch():
             r = {"me": c.me(), "friends": c.friends(), "feed": c.feed()}
             r["parties"], r["invites"] = c.parties()
+            try:
+                r["public"] = c.public_parties()  # None - на сервере ещё нет открытых пати
+            except Exception:
+                r["public"] = d.get("public")
             sel = d.get("sel")
             if r["parties"] and sel not in [x["id"] for x in r["parties"]]:
                 sel = r["parties"][0]["id"]
@@ -12698,6 +12936,21 @@ def gui():
         small_button(head, "Выйти", logout, bg=PANEL).pack(side="right")
         small_button(head, "Сменить ник", rename, bg=PANEL).pack(side="right", padx=6)
         small_button(head, "Обновить", lambda: soc_refresh(), bg=PANEL).pack(side="right")
+        hero_ = tk.Frame(fr, bg=PANEL, padx=18, pady=14)
+        island(hero_)
+        hero_.pack(fill="x", pady=(10, 0))
+        tk.Label(hero_, image=art("ic_invite.png", 44, 44), bg=PANEL).pack(side="left")
+        ht = tk.Frame(hero_, bg=PANEL)
+        ht.pack(side="left", fill="x", expand=True, padx=(14, 0))
+        tk.Label(ht, text="Пати: играйте компанией", font=(FONT, 16, "bold"), fg=TEXT, bg=PANEL, anchor="w").pack(fill="x")
+        n_pub = len(d.get("public") or [])
+        tk.Label(ht, text="Пати - это общий чат, карта и приглашение в игру одной кнопкой. Позови друзей или открой "
+                          "пати для всех." + ("   Сейчас открытых пати: %d" % n_pub if n_pub else ""),
+                 font=(FONT, 10), fg=MUTED, bg=PANEL, anchor="w", justify="left", wraplength=640).pack(fill="x")
+        big_button(hero_, "Создать пати", party_create_window, icon="ic_add.png").pack(side="right")
+        if d.get("public"):
+            small_button(hero_, "Открытые пати", lambda: scroll_to_widget(state.get("pub_box")), bg=PANEL,
+                         icon="ic_server.png").pack(side="right", padx=8)
         cols = tk.Frame(fr, bg=BG)
         cols.pack(fill="x", pady=(10, 0))
         cols.grid_columnconfigure(0, weight=1, uniform="s")
@@ -12710,6 +12963,7 @@ def gui():
         right.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
         soc_friends(left)
         soc_party(right)
+        soc_public(fr)
         soc_feed(fr)
         auto_wrap(fr)
 
@@ -12813,18 +13067,191 @@ def gui():
                         bg=CARD).pack(side="right")
                 small_button(row, "Написать", lambda p=p: soc_dm(p), bg=CARD, icon="ic_mail.png").pack(side="right")
 
+    def scroll_to_widget(w_):
+        try:
+            canvas.update_idletasks()
+            y_ = w_.winfo_rooty() - inner.winfo_rooty()
+            total = max(1, inner.winfo_height())
+            canvas.yview_moveto(max(0.0, (y_ - 20) / float(total)))
+        except Exception:
+            pass
+
+    def party_create_window():
+        """Новая пати: название, во что играем, лаунчер, версия, сколько мест и «кто угодно может войти»."""
+        c, d = soc(), soc_data()
+        t = new_window()
+        t.title("Новая пати")
+        t.transient(win)
+        W, H = 640, 520
+        t.geometry("%dx%d+%d+%d" % (W, H, win.winfo_rootx() + (win.winfo_width() - W) // 2,
+                                    win.winfo_rooty() + max(20, (win.winfo_height() - H) // 2)))
+        fr = tk.Frame(t, bg=PANEL, padx=26, pady=20)
+        island(fr)
+        fr.pack(fill="both", expand=True, padx=14, pady=14)
+        tk.Label(fr, text="Новая пати", font=(FONT, 18, "bold"), fg=TEXT, bg=PANEL, anchor="w").pack(fill="x")
+        tk.Label(fr, text="Общий чат, карта пати и приглашение в игру одной кнопкой.", font=(FONT, 10), fg=MUTED,
+                 bg=PANEL, anchor="w").pack(fill="x", pady=(0, 10))
+        v = {"public": False, "version": None, "max": 4}
+
+        def field(label):
+            tk.Label(fr, text=label, font=(FONT, 10, "bold"), fg=MUTED, bg=PANEL, anchor="w").pack(fill="x", pady=(8, 3))
+            e_ = REntry(fr, font=(FONT, 11), bg=CARD_HI, fg=TEXT, insertbackground=TEXT, relief="flat",
+                        highlightthickness=1, highlightbackground=LINE, highlightcolor=ACCENT)
+            e_.pack(fill="x", ipady=5)
+            return e_
+        name_e = field("Название")
+        name_e.insert(0, "Играем вместе")
+        plan_e = field("Во что играем")
+        sug = tk.Frame(fr, bg=PANEL)
+        sug.pack(fill="x", pady=(5, 0))
+        ideas = [m["title"] for m in find_maps()[:3]] + ["Выживание", "Мини-игры"]
+        for idea in ideas:
+            chip(sug, idea, False, lambda idea=idea: (plan_e.delete(0, "end"), plan_e.insert(0, idea)), size=9).pack(
+                side="left", padx=(0, 4))
+        row = tk.Frame(fr, bg=PANEL)
+        row.pack(fill="x", pady=(12, 0))
+        lnames = [x["name"] for x in load_launchers()] or ["TLauncher"]
+        lvar = tk.StringVar(value=launcher_title(chosen_launcher()) if launcher_title(chosen_launcher()) in lnames
+                            else lnames[0])
+        dropdown(row, lvar, lnames, bg=PANEL, caption="Лаунчер", raw=True).pack(side="left", padx=(0, 14))
+        vb = tk.Frame(row, bg=PANEL)
+        vb.pack(side="left", padx=(0, 14))
+        tk.Label(vb, text="Версия", font=(FONT, 8), fg=MUTED, bg=PANEL).pack(anchor="w")
+        common = ["26.2", "26.1.2", "1.21.11", "1.21.8", "1.21.4", "1.21.1", "1.20.4", "1.20.1", "1.19.2", "1.18.2",
+                  "1.16.5", "1.12.2", "1.8.9"]
+        vbtn = chip(vb, "Любая   ▾", False, lambda: None)
+        vbtn.pack(anchor="w", pady=(2, 0))
+
+        def set_ver(x):
+            v["version"] = x
+            vbtn.configure(text="%s   ▾" % (x or "Любая"))
+        vbtn._cmd = lambda: win.after(10, lambda: pick_popup(vbtn, [("Любая", [(None, "Любая")])] + version_groups(common),
+                                                             v["version"], set_ver, "Версия игры", custom="Или впиши"))
+        mb = tk.Frame(row, bg=PANEL)
+        mb.pack(side="left")
+        tk.Label(mb, text="Мест", font=(FONT, 8), fg=MUTED, bg=PANEL).pack(anchor="w")
+        mbtn = chip(mb, "4 игрока   ▾", False, lambda: None)
+        mbtn.pack(anchor="w", pady=(2, 0))
+
+        def set_max(x):
+            v["max"] = x
+            mbtn.configure(text="%d %s   ▾" % (x, plural(x, "игрок", "игрока", "игроков")))
+        mbtn._cmd = lambda: win.after(10, lambda: pick_popup(mbtn, [("", [(n, str(n)) for n in range(2, 21)])], v["max"],
+                                                             set_max, "Сколько мест", 420))
+        pub = tk.Frame(fr, bg=CARD, padx=14, pady=12)
+        island(pub, vines=False, radius=12)
+        pub.pack(fill="x", pady=(16, 0))
+        pchip = chip(pub, "Сделать открытой", False, lambda: None, size=10)
+        pchip.pack(side="left")
+        tk.Label(pub, text="  пати появится в списке «Открытые пати»: войти и поиграть сможет любой", font=(FONT, 9),
+                 fg=MUTED, bg=CARD, anchor="w", justify="left", wraplength=300).pack(side="left", fill="x")
+
+        def flip_pub():
+            v["public"] = not v["public"]
+            pchip._o["on"] = v["public"]
+            pchip.configure(text="✓ Открытая: войти может кто угодно" if v["public"] else "Сделать открытой")
+        pchip._cmd = flip_pub
+        bt = tk.Frame(fr, bg=PANEL)
+        bt.pack(fill="x", side="bottom", pady=(14, 0))
+
+        def create():
+            n = name_e.get().strip() or "Играем вместе"
+            plan = plan_e.get().strip()
+            args = dict(public=v["public"], plan=plan, launcher=lvar.get(), version=v["version"] or "", max_players=v["max"])
+
+            def work():
+                try:
+                    return c.create_party(n, **args), True
+                except SocialError as e:
+                    if e.code == 400 and args["public"]:  # на сервере ещё нет открытых пати - делаем обычную
+                        return c.create_party(n), False
+                    raise
+
+            def done(res):
+                r, ok = res
+                if t.winfo_exists():
+                    t.destroy()
+                d.update(sel=r["id"])
+                stat_inc("parties")
+                feed_add("party", "собирает пати «%s»%s" % (n[:60], (": " + plan[:40]) if plan else ""))
+                toast("Пати «%s» создана%s" % (n, " и открыта для всех." if args["public"] and ok else
+                                               (". Открытые пати заработают после обновления сервера." if args["public"]
+                                                else ": зови друзей.")), "ok", ms=6000)
+                soc_refresh()
+            soc_bg(work, done)
+        big_button(bt, "Создать пати", create, icon="ic_check.png").pack(side="right")
+        small_button(bt, "Отмена", t.destroy, bg=PANEL).pack(side="right", padx=8)
+        name_e.focus_set()
+        fade_in_window(t)
+
+    def soc_public(fr):
+        """Открытые пати: во что собираются играть, через какой лаунчер, сколько людей; войти одной кнопкой."""
+        c, d = soc(), soc_data()
+        box = tk.Frame(fr, bg=CARD, padx=14, pady=12)
+        island(box)
+        box.pack(fill="x", pady=(10, 0))
+        state["pub_box"] = box
+        hd = tk.Frame(box, bg=CARD)
+        hd.pack(fill="x")
+        tk.Label(hd, image=art("ic_server.png", 20, 20), bg=CARD).pack(side="left")
+        tk.Label(hd, text="  Открытые пати", font=(FONT, 13, "bold"), fg=TEXT, bg=CARD).pack(side="left")
+        tk.Label(hd, text="   заходи к кому угодно и играй", font=(FONT, 9), fg=MUTED, bg=CARD).pack(side="left")
+        small_button(hd, "Обновить", lambda: soc_refresh(), bg=CARD).pack(side="right")
+        small_button(hd, "Открыть свою", party_create_window, bg=CARD, icon="ic_add.png").pack(side="right", padx=6)
+        pub = d.get("public")
+        if pub is None:
+            tk.Label(box, text="Список открытых пати скоро появится: его включают на сервере аккаунтов.",
+                     font=(FONT, 10), fg=MUTED, bg=CARD, anchor="w").pack(fill="x", pady=(8, 0))
+            return
+        mine_ids = {x["id"] for x in d.get("parties") or []}
+        if not pub:
+            tk.Label(box, text="Сейчас открытых пати нет. Создай свою и поставь галочку «Кто угодно может войти».",
+                     font=(FONT, 10), fg=MUTED, bg=CARD, anchor="w").pack(fill="x", pady=(8, 0))
+            return
+        for x in pub[:20]:
+            rw = tk.Frame(box, bg=PANEL, padx=12, pady=10)
+            island(rw, vines=False, radius=12)
+            rw.pack(fill="x", pady=(8, 0))
+            av = tk.Label(rw, bg=PANEL, cursor="hand2")
+            av.pack(side="left")
+            want_pic("pubav:%s:%d" % (x.get("owner_avatar"), len(x.get("owner_avatar") or "")),
+                     lambda x=x: avatar_pil(x.get("owner_avatar"), 40, x.get("owner_login", ""), "#4caf50"), av)
+            av.bind("<Button-1>", lambda e, x=x: open_profile({"id": x["owner"], "nick": x.get("owner_nick")}))
+            tx = tk.Frame(rw, bg=PANEL)
+            tx.pack(side="left", fill="x", expand=True, padx=(12, 0))
+            t1 = tk.Frame(tx, bg=PANEL)
+            t1.pack(fill="x")
+            tk.Label(t1, text=x.get("name", "Пати"), font=(FONT, 11, "bold"), fg=TEXT, bg=PANEL).pack(side="left")
+            tk.Label(t1, text="   собирает %s" % x.get("owner_nick", "игрок"), font=(FONT, 9), fg=MUTED, bg=PANEL).pack(
+                side="left")
+            tk.Label(tx, text="Играем: " + (x.get("plan") or "решим в чате"), font=(FONT, 10), fg=GOLD, bg=PANEL,
+                     anchor="w").pack(fill="x", pady=(2, 3))
+            bl = tk.Frame(tx, bg=PANEL)
+            bl.pack(fill="x")
+            n_, mx = int(x.get("members") or 0), int(x.get("max_players") or 8)
+            badge(bl, "%d / %d" % (n_, mx), ACCENT if n_ < mx else "#5a2b2b", "white").pack(side="left", padx=(0, 5))
+            if x.get("launcher"):
+                badge(bl, x["launcher"], CARD_HI).pack(side="left", padx=(0, 5))
+            if x.get("version"):
+                badge(bl, "Minecraft " + x["version"], BLUE, "white").pack(side="left", padx=(0, 5))
+            if x["id"] in mine_ids:
+                tk.Label(rw, text="ты в этой пати", font=(FONT, 9, "bold"), fg=ACCENT_HI, bg=PANEL).pack(side="right")
+            elif n_ >= mx:
+                tk.Label(rw, text="мест нет", font=(FONT, 9, "bold"), fg="#e05a5a", bg=PANEL).pack(side="right")
+            else:
+                big_button(rw, "Войти", lambda x=x: soc_bg(
+                    lambda: c.join_public(x["id"]),
+                    lambda r: (d.update(sel=x["id"], msgs=[], last=0), toast("Ты в пати «%s»: напиши в чат!" % x["name"],
+                                                                            "ok"), soc_refresh())),
+                           icon="ic_play.png").pack(side="right")
+
     def soc_party(box):
         c, d = soc(), soc_data()
         top = tk.Frame(box, bg=CARD)
         top.pack(fill="x")
         tk.Label(top, text="Пати", font=(FONT, 13, "bold"), fg=TEXT, bg=CARD).pack(side="left")
 
-        def new_party():
-            n = simpledialog.askstring("Новая пати", "Название пати:", initialvalue="Играем вместе", parent=win)
-            if n:
-                soc_bg(lambda: c.create_party(n), lambda r: (d.update(sel=r["id"]), stat_inc("parties"),
-                                                             feed_add("party", "собирает пати «%s»" % n[:60]), soc_refresh()))
-        small_button(top, "Новая пати", new_party, bg=CARD, icon="ic_add.png").pack(side="right")
+        small_button(top, "Новая пати", party_create_window, bg=CARD, icon="ic_add.png").pack(side="right")
         for inv in d["invites"]:
             row = tk.Frame(box, bg=PANEL, padx=8, pady=6)
             row.pack(fill="x", pady=(8, 0))
@@ -12846,8 +13273,22 @@ def gui():
             chip_row(pr, [(x["id"], x["name"][:16]) for x in d["parties"]], d["sel"],
                      lambda v: (d.update(sel=v, msgs=[], last=0), soc_refresh()), CARD)
         party = d.get("party") or {}
-        tk.Label(box, text="«%s»" % party.get("name", ""), font=(FONT, 10, "bold"), fg=TEXT, bg=CARD,
-                 anchor="w").pack(fill="x", pady=(6, 2))
+        pn = tk.Frame(box, bg=CARD)
+        pn.pack(fill="x", pady=(6, 2))
+        tk.Label(pn, text="«%s»" % party.get("name", ""), font=(FONT, 10, "bold"), fg=TEXT, bg=CARD).pack(side="left")
+        if "is_public" in party:  # открытая пати: видна всем в списке, вступить может любой
+            if party.get("owner") == c.uid:
+                chip(pn, ("✓ " if party.get("is_public") else "") + "Открыта для всех", bool(party.get("is_public")),
+                     lambda: soc_bg(lambda: c.set_party_public(party["id"], not party.get("is_public")),
+                                    lambda r: (toast("Пати открыта: её видят все в списке открытых пати." if not
+                                                     party.get("is_public") else "Пати теперь только для приглашённых.",
+                                                     "ok"), soc_refresh()))).pack(side="right")
+            elif party.get("is_public"):
+                badge(pn, "открытая", "#2f6b34", "white").pack(side="right")
+        if party.get("plan") or party.get("launcher"):
+            tk.Label(box, text="  ·  ".join(x for x in ("Играем: " + party["plan"] if party.get("plan") else "",
+                                                       party.get("launcher") or "", party.get("version") or "") if x),
+                     font=(FONT, 9), fg=GOLD, bg=CARD, anchor="w").pack(fill="x")
         mem = tk.Frame(box, bg=CARD)
         mem.pack(fill="x", pady=(0, 4))
         for m in d["members"][:8]:
@@ -14204,23 +14645,28 @@ def gui():
             move_tab_line(key)
         keep = state.pop("keep_scroll", False) and prev == key
         y = canvas.yview()[0] if keep else 0
-        clear()
-        {"maps": build_maps, "packs": build_packs, "servers": build_servers, "friend": build_friend,
-         "launchers": build_launchers, "builder": build_builder, "skins": build_skins,
-         "versions": build_versions}[key]()
-        if keep:
-            canvas.update_idletasks()
+        # Вкладка собирается целиком до первой отрисовки (вместе с рамками-островками) и показывается сразу:
+        # без «въезда» сбоку и без мигания кусками - раньше от этого дёргалось всё окно.
+        frozen = win.winfo_viewable() and freeze_paint(canvas, True)
+        try:
+            clear()
+            {"maps": build_maps, "packs": build_packs, "servers": build_servers, "friend": build_friend,
+             "launchers": build_launchers, "builder": build_builder, "skins": build_skins,
+             "versions": build_versions}[key]()
+            canvas.coords(inner_id, 0, 0)
+            auto_wrap(inner)
+            refresh_head()
+            refresh_foot()
+            try:
+                win.update_idletasks()
+                flush_islands()
+            except tk.TclError:
+                pass
             canvas.configure(scrollregion=canvas.bbox("all"))
             canvas.yview_moveto(y)
-        auto_wrap(inner)
-        refresh_head()
-        refresh_foot()
-        # Содержимое въезжает сбоку: вправо или влево, смотря куда переключились.
-        if animated and prev in TAB_ORDER and prev != key and win.winfo_viewable():
-            d = 70 if TAB_ORDER.index(key) > TAB_ORDER.index(prev) else -70
-            animate("slide", 260, lambda k: canvas.coords(inner_id, int(d * (1 - k)), 0))
-        else:
-            canvas.coords(inner_id, 0, 0)
+        finally:
+            if frozen:
+                freeze_paint(canvas, False)
 
     # --- обновления ---
     def show_update_bar(remote):
@@ -14584,7 +15030,7 @@ def gui():
                   "builder_build": builder_build, "builder_state": builder_state, "cape_maker": cape_maker,
                   "soc_dm": soc_dm, "messagebox": messagebox, "open_server": open_server,
                   "open_my_profile": open_my_profile, "state": state,
-                  "style_window": style_window, "version_menu": version_menu, "login_window": login_window,
+                  "style_window": style_window, "version_menu": version_menu, "login_window": login_window, "party_create_window": party_create_window,
                   "pick_popup": pick_popup}
     # Окно открывается там же и таким же, каким его закрыли; горячие клавиши.
     g = settings.get("geometry", "")
