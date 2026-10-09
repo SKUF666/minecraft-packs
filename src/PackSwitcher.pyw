@@ -5995,6 +5995,64 @@ def world_restore(zip_path, title, log=print):
     return dst
 
 
+# --- резервные копии миров: <uid>/bak/<мир>/<время>.zip, хранятся последние N ---
+BACKUP_EVERY = [(0, "После каждой игры"), (1, "Раз в час"), (6, "Раз в 6 часов"), (24, "Раз в день")]
+
+
+def backup_prefix(uid, world):
+    return "%s/bak/%s/" % (uid, world_key(world)[:-4])
+
+
+def backup_list(c, world):
+    """Копии мира в облаке, новые сверху: [{name, size, when}]."""
+    rows = [o for o in c.list_files("worlds", backup_prefix(c.uid, world)) if o.get("id") and o["name"].endswith(".zip")]
+    out = []
+    for o in rows:
+        try:
+            when = time.mktime(time.strptime(o["name"][:15], "%Y%m%d-%H%M%S"))
+        except ValueError:
+            when = 0
+        out.append({"name": o["name"], "size": (o.get("metadata") or {}).get("size", 0), "when": when})
+    out.sort(key=lambda x: -x["when"])
+    return out
+
+
+def backup_world(c, world, keep=5, log=print):
+    """Копия мира в облако (игра должна быть закрыта), лишние старые копии удаляются из облака."""
+    log("Упаковываю «%s»" % world)
+    data = world_zip(os.path.join(SAVES, world))
+    name = time.strftime("%Y%m%d-%H%M%S") + ".zip"
+    c.upload("worlds", backup_prefix(c.uid, world) + name, data, "application/zip")
+    for old in backup_list(c, world)[keep:]:
+        try:
+            c.delete_file("worlds", backup_prefix(c.uid, world) + old["name"])
+        except Exception:
+            pass
+    log("Копия «%s» в облаке (%s)" % (world, fmt_mb(len(data))))
+    return len(data)
+
+
+def world_rollback(zip_path, world, log=print):
+    """Откат мира к копии: нынешний мир не удаляется - он переименовывается в «<мир> (до отката ДД.ММ ЧЧ-ММ)»,
+    а копия встаёт на его место под тем же именем (так её находит игра и лаунчер)."""
+    cur = os.path.join(SAVES, world)
+    kept = None
+    if os.path.exists(cur):
+        kept = os.path.join(SAVES, "%s (до отката %s)" % (world, time.strftime("%d.%m %H-%M")))
+        i = 2
+        while os.path.exists(kept):
+            kept = os.path.join(SAVES, "%s (до отката %s, %d)" % (world, time.strftime("%d.%m %H-%M"), i))
+            i += 1
+        os.replace(cur, kept)
+    with zipfile.ZipFile(lp(zip_path)) as z:
+        for zi in z.infolist():
+            if ".." in zi.filename or zi.filename.startswith("/"):
+                continue
+            z.extract(zi, lp(cur))
+    log("Мир «%s» вернулся к копии%s" % (world, (". Прежний сохранён как «%s»" % os.path.basename(kept)) if kept else ""))
+    return kept
+
+
 def delete_user_pack(pack, log=print):
     """Своя сборка из конструктора - в Корзину (сборки из каталога так не удаляются)."""
     if not pack.get("user"):
@@ -7380,15 +7438,149 @@ def gui():
     win.bind("<Map>", lambda e: e.widget is win and dark_titlebar(win), add="+")
     images = []
 
-    def new_window(parent=None, esc=True):
-        """Отдельное окно в стиле Portalis: тёмная рамка Windows в цвет темы, значок, Esc закрывает."""
-        t = tk.Toplevel(parent or win)
-        t.configure(bg=BG)
-        dark_titlebar(t)
-        t.bind("<Map>", lambda e: e.widget is t and dark_titlebar(t), add="+")
-        if esc:
-            t.bind("<Escape>", lambda e: t.destroy() if not isinstance(t.focus_get(), tk.Entry) else None)
-        return t
+    class InPage(tk.Frame):
+        """«Окно» внутри окна программы - отдельных окон Windows Portalis больше не открывает.
+        kind="page": на всё окно, сверху полоса «← Назад» и заголовок (описания, профиль, облако...);
+        kind="dialog": карточка посреди окна, остальное окно недоступно, пока она открыта (вопросы, загрузка...);
+        kind="popup": панель у кнопки без заголовка (выпадающие списки).
+        Понимает вызовы обычного окна (title, geometry, protocol, transient...), поэтому код окон не меняется."""
+        stack = []
+
+        def __init__(self, kind="dialog", esc=True):
+            self._kind, self._esc, self._close_cb, self._title = kind, esc, None, ""
+            self._size = None
+            self._inpage = True
+            tk.Frame.__init__(self, win, bg=BG if kind != "popup" else CARD,
+                              highlightthickness=0 if kind == "page" else 1,
+                              highlightbackground=_mixc(LINE, "#ffffff", 0.12))
+            if kind != "popup":
+                bar = tk.Frame(self, bg=PANEL if kind == "page" else CARD_HI)
+                bar.pack(fill="x", side="top")
+                if kind == "page":
+                    small_button(bar, "←  Назад", self._request_close, bg=PANEL).pack(side="left", padx=(14, 10), pady=7)
+                self._tl = tk.Label(bar, text="", font=(FONT, 12 if kind == "page" else 10, "bold"), fg=TEXT,
+                                    bg=bar["bg"], anchor="w")
+                self._tl.pack(side="left", fill="x", expand=True, padx=(0 if kind == "page" else 14, 0),
+                              pady=(0 if kind == "page" else 6))
+                if kind != "page":
+                    x_ = tk.Label(bar, text="✕", font=(FONT, 11, "bold"), fg=MUTED, bg=bar["bg"], padx=12, cursor="hand2")
+                    x_.pack(side="right")
+                    x_.bind("<Button-1>", lambda e: self._request_close())
+                    x_.bind("<Enter>", lambda e: x_.configure(fg="white", bg="#5a2b2b"))
+                    x_.bind("<Leave>", lambda e, b_=bar["bg"]: x_.configure(fg=MUTED, bg=b_))
+            self._show()
+            InPage.stack.append(self)
+
+        def _show(self):
+            if self._kind == "page":
+                self.place(x=0, y=0, relwidth=1, relheight=1)
+            elif self._kind == "dialog":
+                w_, h_ = self._size or (560, 420)
+                ww, wh = max(400, win.winfo_width()), max(300, win.winfo_height())
+                w_, h_ = min(w_, ww - 40), min(h_, wh - 40)
+                self.place(relx=0.5, rely=0.5, anchor="center", width=w_, height=h_)
+            self.lift()
+
+        def _request_close(self):
+            if self._close_cb:
+                self._close_cb()
+            elif self.winfo_exists():
+                self.destroy()
+
+        def destroy(self):
+            if self in InPage.stack:
+                InPage.stack.remove(self)
+            try:
+                if self.grab_current() is not None and str(self.grab_current()).startswith(str(self)):
+                    self.grab_release()
+            except tk.TclError:
+                pass
+            tk.Frame.destroy(self)
+
+        # --- вызовы обычного окна ---
+        def title(self, t=None):
+            if t is None:
+                return self._title
+            self._title = t
+            if hasattr(self, "_tl"):
+                self._tl.configure(text=t)
+
+        wm_title = title
+
+        def geometry(self, spec=None):
+            if spec is None:
+                self.update_idletasks()
+                return "%dx%d+%d+%d" % (self.winfo_width(), self.winfo_height(), self.winfo_rootx(), self.winfo_rooty())
+            m = re.match(r"^(\d+)x(\d+)(?:([+-]-?\d+)([+-]-?\d+))?$", str(spec))
+            if not m:
+                return
+            w_, h_ = int(m.group(1)), int(m.group(2))
+            if self._kind == "popup":  # экранные координаты -> внутри окна, не вылезая за край
+                x_ = int(m.group(3) or 0) - win.winfo_rootx()
+                y_ = int(m.group(4) or 0) - win.winfo_rooty()
+                ww, wh = win.winfo_width(), win.winfo_height()
+                w_, h_ = min(w_, ww - 16), min(h_, wh - 16)
+                x_ = max(8, min(x_, ww - w_ - 8))
+                y_ = max(8, min(y_, wh - h_ - 8))
+                self.place(x=x_, y=y_, width=w_, height=h_)
+                self.lift()
+            elif self._kind == "dialog":
+                self._size = (w_, h_ + 34)  # + полоса заголовка
+                self._show()
+
+        wm_geometry = geometry
+
+        def protocol(self, name=None, func=None):
+            if name == "WM_DELETE_WINDOW" and func is not None:
+                self._close_cb = func
+
+        wm_protocol = protocol
+
+        def attributes(self, *a):
+            raise tk.TclError("in-window page")  # прозрачности нет - fade_in_window просто показывает
+
+        wm_attributes = attributes
+
+        def state(self, s=None):
+            return "normal"
+
+        def withdraw(self):
+            self.place_forget()
+
+        def deiconify(self):
+            self._show()
+
+        def focus_force(self):
+            self.focus_set()
+
+        def winfo_screenwidth(self):
+            return win.winfo_rootx() + win.winfo_width()
+
+        def winfo_screenheight(self):
+            return win.winfo_rooty() + win.winfo_height()
+
+        def _noop(self, *a, **k):
+            return None
+        transient = iconphoto = resizable = minsize = maxsize = overrideredirect = wm_transient = iconbitmap = _noop
+
+    def page_escape(e=None):
+        """Esc закрывает верхнее «окно» внутри программы (если ввод не в поле)."""
+        if not InPage.stack:
+            return
+        try:
+            if isinstance(win.focus_get(), tk.Entry) or isinstance(win.focus_get(), tk.Text):
+                return
+        except Exception:
+            pass
+        top_ = InPage.stack[-1]
+        if top_._esc and top_.winfo_exists():
+            top_._request_close()
+            return "break"
+    win.bind_all("<Escape>", page_escape, add="+")
+
+    def new_window(parent=None, esc=True, kind="dialog"):
+        """«Окно» Portalis - внутри окна программы (см. InPage)."""
+        return InPage(kind, esc)
 
     def window_header(parent, icon, title, sub="", h=84):
         """Шапка окна (перерисовывается под ширину). .set(title, sub) - поменять текст."""
@@ -7718,7 +7910,8 @@ def gui():
         """Своё окно вместо серого системного: значок, текст, кнопки Portalis. Первая кнопка - главная (Enter),
         последняя - отмена (Esc и крестик). entry - начальный текст поля ввода (тогда возвращается текст)."""
         par = parent if parent is not None and parent.winfo_exists() else win
-        t = tk.Toplevel(par.winfo_toplevel())
+        t = InPage("dialog")
+        t.title = lambda *a_: None  # заголовок уже крупно внутри карточки - в полосе только ✕
         t.withdraw()
         t.title(title)
         t.configure(bg=BG)
@@ -8070,11 +8263,20 @@ def gui():
     def on_wheel(e):
         """Плавная прокрутка колесом. Шаги идут своим циклом, а новые щелчки колеса только сдвигают цель,
         и между шагами окно успевает перерисоваться (иначе на Windows список «рвётся» на полосы)."""
+        cv = None
         try:
-            top = e.widget.winfo_toplevel()
+            w_ = e.widget if not isinstance(e.widget, str) else win.nametowidget(e.widget)
         except Exception:
             return
-        cv = getattr(top, "_cv", canvas)
+        while w_ is not None:  # ближайшая страница со своей прокруткой, иначе - главный список
+            if getattr(w_, "_cv", None) is not None:
+                cv = w_._cv
+                break
+            w_ = getattr(w_, "master", None)
+        if cv is None:
+            if InPage.stack and InPage.stack[-1]._kind == "page":
+                return  # под страницей главный список не крутим
+            cv = canvas
         try:
             region = cv.bbox("all")
             total = (region[3] - region[1]) if region else 0
@@ -8511,8 +8713,8 @@ def gui():
         if t_ is not None and t_.winfo_exists():
             if e is not None:
                 try:
-                    if str(e.widget.winfo_toplevel()) == str(t_):
-                        return
+                    if str(e.widget) == str(t_) or str(e.widget).startswith(str(t_) + "."):
+                        return  # щелчок внутри панели
                 except Exception:
                     pass
             t_.destroy()
@@ -8533,9 +8735,7 @@ def gui():
         groups: [(название группы, [(значение, подпись), ...]), ...]. Esc или щелчок мимо - закрыть.
         custom: подпись поля «вписать своё» (для версий игры: любая версия Minecraft, например 1.8.9)."""
         close_popup()
-        t = tk.Toplevel(win)
-        t.overrideredirect(True)
-        t.configure(bg=BG)
+        t = InPage("popup", esc=False)
         popup_st["w"] = t
         fr = tk.Frame(t, bg=CARD, padx=26, pady=22)
         fr.pack(fill="both", expand=True)
@@ -8978,8 +9178,8 @@ def gui():
     # --- вкладка «Карты» ---
     # --- окна с подробным описанием ---
     def detail_window(title, width=800, height=700, full=False):
-        """full - окно размером и на месте главного (а если главное развёрнуто - тоже развёрнутое)."""
-        t = new_window()
+        """Страница описания на всё окно программы (кнопка «← Назад»)."""
+        t = new_window(kind="page")
         t.title(title)
         t.configure(bg=BG)
         if full:
@@ -9543,7 +9743,7 @@ def gui():
 
     def shots_viewer(page, idx=0):
         """Скриншот крупно, стрелки листают."""
-        v = new_window()
+        v = new_window(kind="page")
         v.title("Скриншоты")
         v.configure(bg="#0b0c10")
         v.transient(win)
@@ -11761,7 +11961,7 @@ def gui():
             soc_bg(lambda: c.profile(p["id"]), lambda r: open_profile(r or p, True, page))
             return
         mine = p.get("id") == c.uid
-        t = new_window()
+        t = new_window(kind="page")
         t.title(p.get("nick", "Профиль"))
         t.transient(win)
         if win.state() == "zoomed":
@@ -13883,6 +14083,171 @@ def gui():
             return h
         soc_bg(work, lambda h: toast("Сервер готов - пати позвана: %s" % h["address"], "ok", ms=9000))
 
+    def backup_cfg():
+        b = load_settings().get("backup") or {}
+        b.setdefault("worlds", [])
+        b.setdefault("every", 0)
+        b.setdefault("keep", 5)
+        b.setdefault("last", {})
+        return b
+
+    def backup_save(b):
+        st_ = load_settings()
+        st_["backup"] = b
+        save_settings(st_)
+
+    def backup_tick(c, playing):
+        """Копии по расписанию: только когда игра закрыта и мир менялся после прошлой копии.
+        «После каждой игры» - когда игра только что закрылась."""
+        was = state.get("bk_was_playing", False)
+        state["bk_was_playing"] = playing
+        b = backup_cfg()
+        if playing or not b["worlds"] or state.get("bk_busy"):
+            return
+        due = []
+        for w in b["worlds"]:
+            p_ = os.path.join(SAVES, w)
+            if not os.path.isfile(os.path.join(p_, "level.dat")):
+                continue
+            last = b["last"].get(w, 0)
+            changed = os.path.getmtime(os.path.join(p_, "level.dat")) > last
+            if not changed:
+                continue
+            if (b["every"] == 0 and was) or (b["every"] and time.time() - last > b["every"] * 3600):
+                due.append(w)
+        if not due:
+            return
+        state["bk_busy"] = True
+
+        def work():
+            done_ = []
+            for w in due:
+                try:
+                    backup_world(c, w, b["keep"], log=lambda *a: None)
+                    done_.append(w)
+                except Exception:
+                    pass
+            return done_
+
+        def fin(done_):
+            state["bk_busy"] = False
+            b2 = backup_cfg()
+            for w in done_ or []:
+                b2["last"][w] = time.time()
+            backup_save(b2)
+            if done_:
+                toast("Резервная копия в облаке: %s" % ", ".join(done_[:3]), "ok", ms=4000)
+
+        def fail(fn):
+            try:
+                return fn()
+            finally:
+                state["bk_busy"] = False
+        soc_bg(lambda: fail(work), fin, err_toast=False)
+
+    def backup_section(t, body, worlds):
+        """Блок «Резервные копии» в облаке: какие миры, как часто, сколько хранить, версии и откат."""
+        c = soc()
+        b = backup_cfg()
+        dsection(body, "Резервные копии по расписанию")
+        dpara(body, "Отметь миры - Portalis сам отправит их копию в облако, когда игра закрыта. Хранятся последние "
+                    "копии; «Вернуть» откатывает мир, а нынешний не удаляется: он остаётся рядом с пометкой «до отката».")
+        opt = tk.Frame(body, bg=BG)
+        opt.pack(fill="x", pady=(4, 6))
+        ev = dict(BACKUP_EVERY)
+        filter_pick(opt, "Как часто", [("", BACKUP_EVERY)], b["every"],
+                    lambda v: (b.update(every=v), backup_save(b), redraw())).pack(side="left", padx=(0, 8))
+        filter_pick(opt, "Хранить", [("", [(3, "3 копии"), (5, "5 копий"), (10, "10 копий")])], b["keep"],
+                    lambda v: (b.update(keep=v), backup_save(b), redraw())).pack(side="left")
+        tk.Label(opt, text="   сейчас: %s, хранить %d" % (ev.get(b["every"], "?").lower(), b["keep"]), font=(FONT, 9),
+                 fg=MUTED, bg=BG).pack(side="left")
+        lst = tk.Frame(body, bg=BG)
+        lst.pack(fill="x")
+
+        def redraw():
+            for x in lst.winfo_children():
+                x.destroy()
+            if not worlds:
+                tk.Label(lst, text="В saves пока нет миров.", font=(FONT, 10), fg=MUTED, bg=BG, anchor="w").pack(fill="x")
+            for w in worlds[:20]:
+                on = w in b["worlds"]
+                rw = tk.Frame(lst, bg=CARD, padx=12, pady=8)
+                island(rw, vines=False, radius=10, border=ACCENT if on else None)
+                rw.pack(fill="x", pady=(0, 5))
+                top_ = tk.Frame(rw, bg=CARD)
+                top_.pack(fill="x")
+
+                def flip(w=w):
+                    if w in b["worlds"]:
+                        b["worlds"].remove(w)
+                    else:
+                        b["worlds"].append(w)
+                    backup_save(b)
+                    redraw()
+                chip(top_, ("✓ Копировать" if on else "Копировать"), on, flip).pack(side="left")
+                tk.Label(top_, text="  " + w, font=(FONT, 10, "bold"), fg=TEXT, bg=CARD).pack(side="left")
+                last = b["last"].get(w)
+                tk.Label(top_, text=("   последняя копия: " + time.strftime("%d.%m %H:%M", time.localtime(last))) if last
+                         else "   копий ещё нет", font=(FONT, 9), fg=MUTED, bg=CARD).pack(side="left")
+                vers = tk.Frame(rw, bg=CARD)
+
+                def now_(w=w):
+                    if game_running():
+                        toast("Сначала закрой игру: копия открытого мира может выйти неполной.", "warn")
+                        return
+                    run_task("Копия «%s» в облако" % w, lambda log: backup_world(c, w, b["keep"], log),
+                             lambda r, logs: r and (b["last"].__setitem__(w, time.time()), backup_save(b), redraw(),
+                                                    toast(logs[-1], "ok")))
+
+                def show_versions(w=w, vers=vers):
+                    if vers.winfo_ismapped():
+                        vers.pack_forget()
+                        return
+                    vers.pack(fill="x", pady=(8, 0))
+                    for x in vers.winfo_children():
+                        x.destroy()
+                    tk.Label(vers, text="Загружаю копии...", font=(FONT, 9), fg=MUTED, bg=CARD).pack(anchor="w")
+
+                    def got(rows):
+                        if not vers.winfo_exists():
+                            return
+                        for x in vers.winfo_children():
+                            x.destroy()
+                        if not rows:
+                            tk.Label(vers, text="В облаке копий этого мира нет.", font=(FONT, 9), fg=MUTED,
+                                     bg=CARD).pack(anchor="w")
+                        for v in rows:
+                            vr = tk.Frame(vers, bg=PANEL, padx=10, pady=5)
+                            vr.pack(fill="x", pady=(0, 3))
+                            tk.Label(vr, text=time.strftime("%d.%m.%Y  %H:%M", time.localtime(v["when"])) if v["when"]
+                                     else v["name"], font=(FONT, 10), fg=TEXT, bg=PANEL).pack(side="left")
+                            tk.Label(vr, text="   " + fmt_mb(v["size"]), font=(FONT, 9), fg=MUTED, bg=PANEL).pack(side="left")
+
+                            def back(v=v):
+                                if game_running():
+                                    toast("Сначала закрой игру.", "warn")
+                                    return
+                                if not messagebox.askyesno("Откат мира", "Вернуть «%s» к копии от %s?\nНынешний мир "
+                                                           "не удалится: он останется рядом с пометкой «до отката»." % (
+                                                               w, time.strftime("%d.%m %H:%M", time.localtime(v["when"]))),
+                                                           parent=t):
+                                    return
+
+                                def work(log):
+                                    dst = os.path.join(ROOT, "_update", "cloud", "bak_" + v["name"])
+                                    log("Скачиваю копию")
+                                    c.download_file("worlds", backup_prefix(c.uid, w) + v["name"], dst)
+                                    kept = world_rollback(dst, w, log)
+                                    os.remove(lp(dst))
+                                    return kept or True
+                                run_task("Откат «%s»" % w, work, lambda r, logs: r and toast(logs[-1], "ok", ms=9000))
+                            small_button(vr, "Вернуть эту копию", back, bg=PANEL, icon="ic_backup.png").pack(side="right")
+                    soc_bg(lambda: backup_list(c, w), got)
+                small_button(top_, "Копии ▾", show_versions, bg=CARD).pack(side="right")
+                small_button(top_, "Копия сейчас", now_, bg=CARD, icon="ic_backup.png").pack(side="right", padx=6)
+            auto_wrap(body)
+        redraw()
+
     def cloud_window():
         """Облако миров: свои копии и общие миры пати (до 50 МБ на мир)."""
         c, d = soc(), soc_data()
@@ -13891,12 +14256,14 @@ def gui():
                   ("Друзья", lambda: show("friend")), 8000)
             return
         t, body = detail_window("Облако миров", 800, 720)
-        dsection(body, "Отправить мир в облако")
+        dsection(body, "Облако миров")
         dpara(body, "Копия мира хранится на сервере Portalis: можно вернуть её на любом компьютере. «Миры пати» видят и "
                     "скачивают все участники пати - так удобно передать карту или общую постройку. До 50 МБ на мир.")
         worlds = sorted([w for w in _listdir(SAVES) if os.path.isfile(os.path.join(SAVES, w, "level.dat"))],
                         key=lambda w: -os.path.getmtime(os.path.join(SAVES, w)))
         party = d.get("party") or {}
+        backup_section(t, body, worlds)
+        dsection(body, "Отправить копию сейчас")
         f = tk.Frame(body, bg=BG)
         f.pack(fill="x", pady=(6, 0))
         wv = tk.StringVar(value=worlds[0] if worlds else "")
@@ -14066,6 +14433,10 @@ def gui():
                 soc_bg(lambda: c.set_status("playing" if playing else "online", detail), err_toast=False)
                 try:
                     stats_tick(c)
+                except Exception:
+                    pass
+                try:
+                    backup_tick(c, playing)
                 except Exception:
                     pass
             if state.get("tab") == "friend":

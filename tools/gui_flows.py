@@ -46,8 +46,8 @@ def patched(self, *a):
     at(6000, lambda: print('добавить 1:', click(self, 'Добавить', 0)))
     at(800, lambda: print('добавить 2:', click(self, 'Добавить', 0)))
     at(800, lambda: (grab(self, 'flow_builder_sel'), print('собрать:', click(self, 'Собрать сборку'))))
-    at(12000, lambda: grab([w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1], 'flow_builder_dialog'))
-    at(300, lambda: [w.destroy() for w in self.winfo_children() if isinstance(w, tk.Toplevel)])
+    at(12000, lambda: grab([w for w in self.winfo_children() if (isinstance(w, tk.Toplevel) or getattr(w, '_inpage', False))][-1], 'flow_builder_dialog'))
+    at(300, lambda: [w.destroy() for w in self.winfo_children() if (isinstance(w, tk.Toplevel) or getattr(w, '_inpage', False))])
     at(500, lambda: h['show']('skins'))
     at(800, lambda: ([e.delete(0, 'end') or e.insert(0, 'Notch') for e in walk(self) if isinstance(e, tk.Entry)][:1],
                      print('найти:', click(self, 'Найти'))))

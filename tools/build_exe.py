@@ -2,11 +2,14 @@
 import os, sys, shutil, subprocess, time
 from PIL import Image
 sys.stdout.reconfigure(encoding='utf-8')
-LIB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'library')
-B = os.path.join(os.environ.get('TEMP', '.'), 'minecraft-packs-build')
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CI = '--ci' in sys.argv  # сборка на GitHub Actions: из src/ и docs/icon.png в dist/ (для подписи SignPath)
+LIB = os.path.join(REPO, 'library')
+B = os.path.join(os.environ.get('RUNNER_TEMP') or os.environ.get('TEMP', '.'), 'minecraft-packs-build')
 os.makedirs(B, exist_ok=True)
-shutil.copy2(os.path.join(LIB, 'PackSwitcher.pyw'), os.path.join(B, 'PackSwitcher.pyw'))
-Image.open(os.path.join(LIB, 'icon.png')).save(os.path.join(B, 'app.ico'),
+shutil.copy2(os.path.join(REPO, 'src', 'PackSwitcher.pyw') if CI else os.path.join(LIB, 'PackSwitcher.pyw'),
+             os.path.join(B, 'PackSwitcher.pyw'))
+Image.open(os.path.join(REPO, 'docs', 'icon.png') if CI else os.path.join(LIB, 'icon.png')).save(os.path.join(B, 'app.ico'),
                                                sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
 # Сведения о файле (видны в «Свойствах» и в окне SmartScreen): название и версия по дате.
 v = time.strftime('%Y.%m.%d').split('.')
@@ -33,6 +36,11 @@ if r.returncode:
     print(r.stdout[-2000:], r.stderr[-3000:])
     sys.exit(1)
 src = os.path.join(B, 'dist', 'PackSwitcher.exe')
+if CI:
+    os.makedirs(os.path.join(REPO, 'dist'), exist_ok=True)
+    shutil.copy2(src, os.path.join(REPO, 'dist', 'Portalis.exe'))
+    print('exe', os.path.getsize(src) // 1024, 'KB -> dist/Portalis.exe')
+    sys.exit(0)
 dst = os.path.join(LIB, 'Portalis.exe')
 for old in ('Выбор карты и сборки.exe', 'Куботека.exe'):
     try:

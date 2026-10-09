@@ -42,7 +42,7 @@ def patched(self, *a):
         def act():
             try:
                 if name == 'splash':
-                    sp = [w for w in self.winfo_children() if isinstance(w, tk.Toplevel)]
+                    sp = [w for w in self.winfo_children() if (isinstance(w, tk.Toplevel) or getattr(w, '_inpage', False))]
                     if sp:
                         grab(sp[0], 'splash')
                 elif name in ps.TAB_ORDER:
@@ -54,7 +54,7 @@ def patched(self, *a):
                     hooks['finish'](True, ['Карта «OneBlock» установлена, файлов: 1520',
                                            'Скопировано модов: 21', 'Версия в TLauncher: Fabric 26.1.2'])
                     def snap():
-                        top = [w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1]
+                        top = [w for w in self.winfo_children() if (isinstance(w, tk.Toplevel) or getattr(w, '_inpage', False))][-1]
                         top.attributes('-topmost', True)
                         grab(top, 'done'); top.destroy(); run(i + 1)
                     self.after(700, snap)
@@ -68,7 +68,7 @@ def patched(self, *a):
                     remote = dict(remote, version='2099.01.01', changes=['Новая карта: Пример', 'Обновлена сборка RPG Pack'])
                     hooks['open_update'](remote)
                     def snap():
-                        top = [w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1]
+                        top = [w for w in self.winfo_children() if (isinstance(w, tk.Toplevel) or getattr(w, '_inpage', False))][-1]
                         top.attributes('-topmost', True)
                         grab(top, 'update'); run(i + 1)
                     self.after(3500, snap)

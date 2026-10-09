@@ -40,7 +40,7 @@ def patched(self, *a):
     h = self._hooks
 
     def top():
-        return [w for w in self.winfo_children() if isinstance(w, tk.Toplevel)][-1]
+        return [w for w in self.winfo_children() if (isinstance(w, tk.Toplevel) or getattr(w, '_inpage', False))][-1]
 
     def click(w, text):
         for x in walk(w):

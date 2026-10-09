@@ -39,7 +39,7 @@ def patched(self, *a):
             yield from walk(c)
 
     def tops():
-        return [w for w in self.winfo_children() if isinstance(w, tk.Toplevel)]
+        return [w for w in self.winfo_children() if (isinstance(w, tk.Toplevel) or getattr(w, '_inpage', False))]
     at(300, lambda: hk['show']('builder', animated=False))
 
     def open_ver():

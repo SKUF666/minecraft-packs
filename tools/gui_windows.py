@@ -25,7 +25,7 @@ def walk(w):
 
 
 def tops(self):
-    return [w for w in self.winfo_children() if isinstance(w, tk.Toplevel)]
+    return [w for w in self.winfo_children() if (isinstance(w, tk.Toplevel) or getattr(w, '_inpage', False))]
 
 
 def patched(self, *a):

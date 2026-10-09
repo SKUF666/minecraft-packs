@@ -42,7 +42,7 @@ def patched(self, *a):
         steps.append((ms, fn))
 
     def tops():
-        return [w for w in self.winfo_children() if isinstance(w, tk.Toplevel)]
+        return [w for w in self.winfo_children() if (isinstance(w, tk.Toplevel) or getattr(w, '_inpage', False))]
     at(1500, lambda: h['show']('maps'))
     at(7000, lambda: grab(self, 'wm_ours'))
     at(300, lambda: print('в интернет:', click(self, 'Из интернета')))
