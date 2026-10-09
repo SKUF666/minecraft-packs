@@ -4828,8 +4828,9 @@ def cf_key():
     if k:
         return k
     try:
-        with open(os.path.join(ROOT, "curseforge.json"), encoding="utf-8") as fh:
-            return (json.load(fh).get("key") or "").strip() or None
+        with open(os.path.join(ROOT, "curseforge.json"), encoding="utf-8-sig") as fh:  # Блокнот пишет и с BOM
+            k = (json.load(fh).get("key") or "").strip()
+            return k if k and not k.startswith("ВСТАВЬ") else None
     except (OSError, ValueError):
         return None
 
@@ -4918,7 +4919,7 @@ def cf_modpack_file(mod_id, gv=None):
 
 # Карты (класс «Worlds»): разделы CurseForge под наши разделы и сортировки
 CF_WORLDS = 17
-CF_MAP_CATS = {"adventure": 253, "survival": 248, "parkour": 251, "puzzles": 252, "games": 250, "buildings": 249,
+CF_MAP_CATS = {"adventure": 248, "survival": 253, "parkour": 251, "puzzles": 252, "games": 250, "buildings": 249,
                "cities": 249, "houses": 249, "mods": 4464}
 CF_MAP_SORT = {None: 11, "visits": 6, "rating": 2, "comments": 6}
 
@@ -4958,7 +4959,8 @@ def cf_map_page(cf_id, url):
     try:
         body = _html_text(cf_get("mods/%d/description" % int(cf_id)).get("data", ""))
     except Exception:
-        body = m.get("summary", "")
+        body = ""
+    body = body or m.get("summary", "")  # в описании бывают одни картинки - тогда краткое
     shots = [(x.get("thumbnailUrl") or x.get("url"), x.get("url")) for x in m.get("screenshots") or [] if x.get("url")]
     fs = cf_get("mods/%d/files" % int(cf_id), {"pageSize": 30}).get("data", [])
     fs.sort(key=lambda f: f.get("fileDate", ""), reverse=True)
