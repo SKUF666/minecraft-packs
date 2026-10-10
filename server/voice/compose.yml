@@ -1,0 +1,24 @@
+services:
+  voice:
+    build: .
+    container_name: voice
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      VOICE_HOST: 0.0.0.0
+      VOICE_PORT: "8765"
+    # Порт наружу не публикуем: снаружи ходит только Caddy (voice:8765 в сети web).
+    expose:
+      - "8765"
+    networks: [web]
+    mem_limit: 256m
+    stop_grace_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  web:
+    external: true

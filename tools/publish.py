@@ -453,7 +453,7 @@ def main():
     shutil.copy2(mpath, os.path.join(lib, 'manifest.json'))
     os.makedirs(os.path.join(REPO_DIR, 'src'), exist_ok=True)
     shutil.copy2(os.path.join(lib, 'PackSwitcher.pyw'), os.path.join(REPO_DIR, 'src', 'PackSwitcher.pyw'))
-    for m in ('mc_launch.py', 'skin_maker.py', 'mod_doctor.py'):  # модули программы - тоже в исходники
+    for m in ('mc_launch.py', 'skin_maker.py', 'mod_doctor.py', 'portalis_voice.py', 'skin3d.py'):  # модули программы - тоже в исходники
         if os.path.isfile(os.path.join(lib, m)):
             shutil.copy2(os.path.join(lib, m), os.path.join(REPO_DIR, 'src', m))
     for p in to_upload:

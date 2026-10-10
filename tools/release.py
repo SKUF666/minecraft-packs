@@ -8,7 +8,7 @@ import os, sys, shutil, subprocess, time, json, tempfile
 sys.stdout.reconfigure(encoding='utf-8')
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LIB = os.path.join(REPO, 'library')
-MODULES = ('PackSwitcher.pyw', 'mc_launch.py', 'skin_maker.py', 'mod_doctor.py')
+MODULES = ('PackSwitcher.pyw', 'mc_launch.py', 'skin_maker.py', 'mod_doctor.py', 'portalis_voice.py', 'skin3d.py')
 
 
 def run(*args, check=True, capture=False):

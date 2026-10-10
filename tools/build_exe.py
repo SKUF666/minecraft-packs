@@ -9,7 +9,7 @@ B = os.path.join(os.environ.get('RUNNER_TEMP') or os.environ.get('TEMP', '.'), '
 os.makedirs(B, exist_ok=True)
 shutil.copy2(os.path.join(REPO, 'src', 'PackSwitcher.pyw') if CI else os.path.join(LIB, 'PackSwitcher.pyw'),
              os.path.join(B, 'PackSwitcher.pyw'))
-MODULES = ('mc_launch.py', 'skin_maker.py', 'mod_doctor.py')  # модули рядом с программой - входят в exe
+MODULES = ('mc_launch.py', 'skin_maker.py', 'mod_doctor.py', 'portalis_voice.py', 'skin3d.py')  # модули рядом с программой - входят в exe
 for m in MODULES:
     src_m = os.path.join(REPO, 'src', m) if CI else os.path.join(LIB, m)
     if os.path.isfile(src_m):

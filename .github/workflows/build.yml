@@ -21,7 +21,7 @@ jobs:
         with:
           python-version: '3.14'
       - name: Install build tools
-        run: python -m pip install --upgrade pip pyinstaller pillow
+        run: python -m pip install --upgrade pip pyinstaller pillow sounddevice websocket-client
       - name: Build Portalis.exe
         run: python tools/build_exe.py --ci
       - name: Upload unsigned exe
