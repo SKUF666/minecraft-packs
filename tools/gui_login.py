@@ -11,6 +11,8 @@ ps = importlib.util.module_from_spec(importlib.util.spec_from_loader('ps', L)); 
 ps.fetch_remote_manifest = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('offline test'))
 ps.set_game_dir(os.path.join(tempfile.mkdtemp(prefix='portalis-login-'), '.minecraft'))
 store = {'favorites': {}}
+if os.environ.get('PORTALIS_LANG'):  # PORTALIS_LANG=en - тот же прогон на английском
+    store['lang'] = os.environ['PORTALIS_LANG']
 ps.load_settings = lambda: dict(store)
 ps.save_settings = lambda d: (store.clear(), store.update(d))
 orig = tk.Tk.mainloop
@@ -26,7 +28,7 @@ def patched(self, *a):
         steps.append((ms, fn))
 
     def shot(name, w=None):
-        winshot.shot(w or self, os.path.join(OUT, 'login_' + name + '.png'))
+        winshot.shot(w or self, os.path.join(OUT, 'login_' + os.environ.get('PORTALIS_LANG', '') + name + '.png'))
 
     def walk(w):
         yield w

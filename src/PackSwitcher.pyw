@@ -46,6 +46,18 @@ except ImportError:
 import urllib.parse
 import urllib.error
 import re
+try:  # запуск игры без лаунчера и мастерская скинов - отдельные модули рядом с программой
+    import mc_launch
+except Exception:
+    mc_launch = None
+try:
+    import skin_maker
+except Exception:
+    skin_maker = None
+try:  # проверка совместимости модов до запуска игры
+    import mod_doctor
+except Exception:
+    mod_doctor = None
 import base64
 import html as _html
 
@@ -64,6 +76,124 @@ def _pick_root():
 
 
 ROOT = _pick_root()
+
+
+# ---------- язык интерфейса: русский (как написан код) или английский (lang_en.json рядом с данными) ----------
+# Надписи переводятся на лету: tkinter-надписи (text=...), заголовки, кнопки-картинки, шапка. Словарь: русская строка ->
+# перевод; строки с %s/%d - шаблоны (подставленные значения тоже переводятся, если они есть в словаре).
+LANG = "ru"
+_TR, _TR_TPL, _TR_CACHE = {}, [], {}
+_TR_PH = re.compile(r"%(\([^)]+\))?[-+ 0#]*\d*(?:\.\d+)?[sdfrx%]")
+_TR_CYR = re.compile("[А-Яа-яЁё]")
+
+
+def system_lang():
+    """ru, если Windows на русском (или украинском/белорусском/казахском), иначе en."""
+    try:
+        lid = ctypes.windll.kernel32.GetUserDefaultUILanguage() & 0x3FF
+        return "ru" if lid in (0x19, 0x22, 0x23, 0x3F) else "en"
+    except Exception:
+        return "ru"
+
+
+def load_lang(lang):
+    global LANG
+    LANG = lang if lang in ("ru", "en") else "ru"
+    _TR.clear()
+    del _TR_TPL[:]
+    _TR_CACHE.clear()
+    if LANG == "ru":
+        return
+    try:
+        with open(os.path.join(ROOT, "lang_%s.json" % LANG), encoding="utf-8") as fh:
+            d = json.load(fh)
+    except (OSError, ValueError):
+        return
+    _TR.update(d)
+    for ru, en in d.items():
+        if "%" not in ru or not _TR_PH.search(ru):
+            continue
+        rx, pos = "", 0
+        for m in _TR_PH.finditer(ru):
+            rx += re.escape(ru[pos:m.start()])
+            t = m.group(0)[-1]
+            rx += "%" if m.group(0) == "%%" else "(-?[\\d.,]+)" if t in "dfx" else "(.+?)"
+            pos = m.end()
+        rx += re.escape(ru[pos:])
+        first = _TR_PH.split(ru)[0] or ""
+        _TR_TPL.append((ru[:_TR_PH.search(ru).start()], ru[_TR_PH.search(ru).end():] if False else "",
+                        re.compile("^" + rx + "$", re.S), en))
+    _TR_TPL.sort(key=lambda x: -len(x[0]))
+
+
+def tr(text):
+    """Перевод надписи на язык интерфейса (русский - как есть)."""
+    if LANG == "ru" or not isinstance(text, str) or not _TR_CYR.search(text):
+        return text
+    hit = _TR.get(text)
+    if hit is not None:
+        return hit
+    hit = _TR_CACHE.get(text)
+    if hit is not None:
+        return hit
+    out = None
+    core = text.strip()
+    if core != text and core:  # те же слова с пробелами по краям
+        inner = tr(core)
+        if inner != core:
+            out = text[:len(text) - len(text.lstrip())] + inner + text[len(text.rstrip()):]
+    if out is None and ", " in core and core not in _TR and not any(p_ in core for p_ in (". ", ": ")):
+        parts_ = [tr(x) for x in core.split(", ")]  # перечисление: «Карты, Сборки»
+        if any(a_ != b_ for a_, b_ in zip(parts_, core.split(", "))):
+            out = text.replace(core, ", ".join(parts_))
+    if out is None:
+        for prefix, _x, rx, en in _TR_TPL:
+            if prefix and not text.startswith(prefix):
+                continue
+            m = rx.match(text)
+            if m:
+                vals = iter([tr(g) if g else "" for g in m.groups()])
+                out = _TR_PH.sub(lambda mm: "%" if mm.group(0) == "%%" else next(vals, ""), en)
+                break
+    if out is None:  # «Играть: TLauncher», «Фишка: ...»: начало и конец переводятся отдельно
+        m = re.match(r"^(.*?(?::|—|·) )(.+)$", text, re.S)
+        if m and (m.group(1) in _TR or m.group(1).strip() in _TR):
+            out = tr(m.group(1)) + tr(m.group(2))
+    if out is None:  # «14.9 млн», «3 МБ»
+        m = re.match(r"^([-+]?[\d.,]+) ([А-Яа-яЁё.]+)$", text)
+        if m and m.group(2) in _TR:
+            out = m.group(1) + " " + _TR[m.group(2)]
+    if out is None and "\n" in text:
+        out = "\n".join(tr(x) for x in text.split("\n"))
+    if out is None:
+        out = text
+    if len(_TR_CACHE) > 6000:
+        _TR_CACHE.clear()
+    _TR_CACHE[text] = out
+    return out
+
+
+def install_tr():
+    """Все надписи tkinter (text=..., заголовки окон) проходят через tr()."""
+    import tkinter
+    if getattr(tkinter.Misc, "_portalis_tr", False):
+        return
+    orig_opt = tkinter.Misc._options
+
+    def _options(self, cnf, kw=None):
+        if LANG != "ru":
+            if kw and isinstance(kw.get("text"), str):
+                kw = dict(kw, text=tr(kw["text"]))
+            if isinstance(cnf, dict) and isinstance(cnf.get("text"), str):
+                cnf = dict(cnf, text=tr(cnf["text"]))
+        return orig_opt(self, cnf, kw)
+    tkinter.Misc._options = _options
+    orig_title = tkinter.Wm.wm_title
+
+    def wm_title(self, string=None):
+        return orig_title(self, tr(string) if string else string)
+    tkinter.Wm.wm_title = tkinter.Wm.title = wm_title
+    tkinter.Misc._portalis_tr = True
 SINGLE_FILE = os.path.abspath(ROOT) != os.path.abspath(APP_DIR)
 os.makedirs(ROOT, exist_ok=True)
 MC = os.path.join(os.environ["APPDATA"], ".minecraft")
@@ -3339,7 +3469,7 @@ def select_version(version, title="", log=print, lv=None):
     name = launcher_title(lid)
     vdir = os.path.join(MC, "versions", version)
     missing = not os.path.isfile(os.path.join(vdir, version + ".json"))
-    spec = version_spec(version, lv) if missing and mode in ("profiles", "legacy") else None
+    spec = version_spec(version, lv) if missing and mode in ("profiles", "legacy", "direct") else None
     if spec and spec[1] != "vanilla":
         try:
             log("Версии «%s» нет в папке игры - скачиваю %s %s" % (version, LOADER_TITLES[spec[1]], spec[0]))
@@ -3348,6 +3478,12 @@ def select_version(version, title="", log=print, lv=None):
             missing = False
         except Exception as e:
             log("Версию скачать не вышло: %s" % e)
+    if mode == "direct":
+        st = load_settings()
+        st["direct_version"] = version
+        save_settings(st)
+        log("Версия для запуска: %s" % version)
+        return True, ""
     if mode == "tl":
         ok = set_tlauncher_version(version)
         log("Версия в TLauncher: %s%s" % (version, "" if ok else " (TLauncher открыт, выбери версию в нём вручную)"))
@@ -3373,6 +3509,8 @@ def select_version(version, title="", log=print, lv=None):
 
 def launcher_exe(lid):
     """Путь к exe лаунчера: указанный вручную, из обычного места установки или из меню «Пуск»."""
+    if lid == "portalis":
+        return "builtin"
     s = load_settings().get("launcher_paths", {})
     if s.get(lid) and os.path.isfile(s[lid]):
         return s[lid]
@@ -3479,6 +3617,8 @@ def deep_find_launchers(ids, budget=25.0):
 
 
 def run_target(target, args=()):
+    if target == "builtin":  # сам Portalis
+        return DIRECT_HOOK["fn"] and DIRECT_HOOK["fn"]()
     if target.lower().endswith(".exe") and os.path.isfile(target):
         if args:
             subprocess.Popen([target] + list(args), cwd=os.path.dirname(target))
@@ -3496,8 +3636,33 @@ def launcher_title(lid):
     return next((x["name"] for x in load_launchers() if x["id"] == lid), "TLauncher")
 
 
+DIRECT_HOOK = {"fn": None}  # окно программы подставляет сюда запуск игры (Portalis как лаунчер)
+
+
+def total_ram_mb():
+    class MS(ctypes.Structure):
+        _fields_ = [("l", ctypes.c_ulong), ("load", ctypes.c_ulong), ("total", ctypes.c_ulonglong),
+                    ("avail", ctypes.c_ulonglong), ("tp", ctypes.c_ulonglong), ("ap", ctypes.c_ulonglong),
+                    ("tv", ctypes.c_ulonglong), ("av", ctypes.c_ulonglong), ("ae", ctypes.c_ulonglong)]
+    m = MS()
+    m.l = ctypes.sizeof(MS)
+    try:
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+        return int(m.total // (1 << 20))
+    except Exception:
+        return 8192
+
+
+def direct_java(version):
+    """javaw.exe для версии (компонент Java из описания версии), или None - тогда её надо скачать."""
+    comp = mc_launch.java_component(version, MC) if mc_launch else "java-runtime-delta"
+    return find_game_java(comp) or (mc_launch.find_javaw(comp, MC) if mc_launch else None), comp
+
+
 def open_launcher():
     lid = chosen_launcher()
+    if lid == "portalis":
+        return bool(DIRECT_HOOK["fn"] and DIRECT_HOOK["fn"]())
     exe = launcher_exe(lid)
     if lid == "tlauncher" and not exe:
         return open_tlauncher()
@@ -7127,6 +7292,7 @@ def hero_pil(name, w, h, pbg, r=14, vines=True, seed=3, frame="panel"):
 
 
 def pill_pil(avatar, name, status, status_col, hover=False):
+    name, status = tr(name), tr(status)
     """Плашка аккаунта в шапке: овал с полупрозрачным фоном, обводкой-градиентом, круглым аватаром и текстом."""
     S = 2
     f1, f2 = ui_font(15 * S, True), ui_font(11 * S)
@@ -7173,6 +7339,7 @@ def google_g_pil(size):
 
 
 def google_button_pil(text, w, h=46, hover=False):
+    text = tr(text)
     """Кнопка «Войти через Google» по образцу Google: белая, со скруглением, цветная G слева."""
     S = 2
     W, H = w * S, h * S
@@ -7335,6 +7502,7 @@ def render_cape_side(png, side="outer", scale=10):
 
 
 def header_pil(w, h, icon, title, sub=""):
+    title, sub = tr(title), tr(sub)
     """Шапка отдельного окна: скруглённая плашка с градиентом, свечением, значком и заголовком."""
     S = 2
     W, H = w * S, h * S
@@ -7421,11 +7589,13 @@ def gui():
 
     cleanup_after_update()
     tidy_old_name()
+    load_lang(load_settings().get("lang") or system_lang())
+    install_tr()
     apply_style(load_settings().get("style"))
     apply_theme(load_settings().get("theme"))
     win = tk.Tk()
     win.withdraw()
-    win.title(APP_NAME + " — карты, сборки и серверы Minecraft")
+    win.title(APP_NAME + tr(" — карты, сборки и серверы Minecraft"))
     win.geometry("1080x760")
     win.minsize(1000, 660)
     win.configure(bg=BG)
@@ -8379,7 +8549,7 @@ def gui():
             except Exception:
                 pbg = BG
             tk.Label.__init__(self, parent, bd=0, highlightthickness=0, cursor="hand2", bg=pbg, padx=0, pady=0)
-            self._o = dict(text=text, style=style, color=color, hover=hover, icon=icon, size=size, bold=bold, fg=fg, on=on,
+            self._o = dict(text=tr(text), style=style, color=color, hover=hover, icon=icon, size=size, bold=bold, fg=fg, on=on,
                            padx=padx, pady=pady, pbg=pbg)
             self._cmd = cmd
             self._imgs = {}
@@ -8459,7 +8629,7 @@ def gui():
                 if k in cnf:
                     own[k] = cnf.pop(k)
             if "text" in own:
-                self._o["text"] = own["text"].strip() if isinstance(own["text"], str) else own["text"]
+                self._o["text"] = tr(own["text"].strip()) if isinstance(own["text"], str) else own["text"]
             if "font" in own and isinstance(own["font"], tuple):
                 self._o["size"] = own["font"][1]
                 self._o["bold"] = "bold" in own["font"][2:]
@@ -8540,6 +8710,110 @@ def gui():
                                                               anchor="se"),
                     done=lambda: f.winfo_exists() and f.destroy(), ease=lambda t: t * t)
         win.after(ms, hide)
+
+    # --- Portalis как лаунчер: запуск игры без других программ (офлайн, со своим ником) ---
+    def direct_settings(then=None):
+        """Ник и память для запуска игры самим Portalis."""
+        st_ = load_settings()
+        t = new_window()
+        t.title("Запуск без лаунчера")
+        t.geometry("520x330")
+        fr = tk.Frame(t, bg=BG, padx=24, pady=18)
+        fr.pack(fill="both", expand=True)
+        tk.Label(fr, text="Ник в игре", font=(FONT, 10, "bold"), fg=MUTED, bg=BG, anchor="w").pack(fill="x")
+        me_ = (soc_data().get("me") or {}).get("login", "") if soc().ready() else ""
+        e = REntry(fr, font=(FONT, 12), bg=CARD_HI, fg=TEXT, insertbackground=TEXT, relief="flat",
+                   highlightthickness=1, highlightbackground=LINE, highlightcolor=ACCENT)
+        e.pack(fill="x", ipady=5, pady=(3, 0))
+        e.insert(0, st_.get("direct_nick") or st_.get("skin_nick") or (me_[:16] if me_ else "Player"))
+        tk.Label(fr, text="латиница, цифры и «_», 3-16 символов - так тебя увидят в игре", font=(FONT, 9), fg=MUTED,
+                 bg=BG, anchor="w").pack(fill="x", pady=(2, 10))
+        total = total_ram_mb()
+        opts = [m for m in (2048, 3072, 4096, 6144, 8192, 12288) if m <= total * 0.75] or [2048]
+        cur = st_.get("direct_ram") or min(4096, opts[-1])
+        ram = {"v": cur}
+        rr = tk.Frame(fr, bg=BG)
+        rr.pack(fill="x")
+        tk.Label(rr, text="Память для игры:", font=(FONT, 10, "bold"), fg=TEXT, bg=BG).pack(side="left", padx=(0, 8))
+        rb = filter_pick(rr, "Память", [("", [(m, "%d ГБ" % (m // 1024)) for m in opts])], cur,
+                         lambda v: (ram.update(v=v), rb.configure(text="Память: %d ГБ   ▾" % (v // 1024))))
+        rb.pack(side="left")
+        tk.Label(rr, text="   у компьютера %d ГБ" % round(total / 1024.0), font=(FONT, 9), fg=MUTED, bg=BG).pack(side="left")
+
+        def save(ev=None):
+            nick = e.get().strip()
+            if not re.match(r"^[A-Za-z0-9_]{3,16}$", nick):
+                toast("Ник: латиница, цифры и «_», от 3 до 16 символов.", "warn")
+                return
+            st2 = load_settings()
+            st2.update(direct_nick=nick, direct_ram=ram["v"])
+            save_settings(st2)
+            t.destroy()
+            if then:
+                then()
+        e.bind("<Return>", save)
+        bt = tk.Frame(fr, bg=BG)
+        bt.pack(fill="x", side="bottom")
+        big_button(bt, "Сохранить" if not then else "Играть", save, icon="ic_check.png" if not then else "ic_play.png").pack(
+            side="right")
+
+    def direct_launch():
+        """Запуск игры самим Portalis: версия, которую выбрала карта или сборка, ник и память из настроек."""
+        if mc_launch is None:
+            toast("Запуск без лаунчера не собран в этой версии программы.", "err")
+            return False
+        st_ = load_settings()
+        if not st_.get("direct_nick"):
+            direct_settings(direct_launch)
+            return True
+        version = st_.get("direct_version")
+        if not version or not os.path.isfile(os.path.join(MC, "versions", version, version + ".json")):
+            have = installed_versions()
+            if not have:
+                toast("Сначала выбери карту или сборку, или скачай версию во вкладке «Версии».", "warn",
+                      ("Версии", lambda: show("versions")), 7000)
+                return False
+            version = have[0]["id"]
+        if game_running():
+            toast("Minecraft уже запущен.", "info")
+            return True
+        java, comp = direct_java(version)
+        sp = version_spec(version) or (None, None, None)
+        if not java:
+            toast("Для этой версии нужна Java «%s» - скачаю её вместе с версией." % comp, "info", ms=6000)
+            if sp[0]:
+                version_dialog(sp[0], sp[1] or "vanilla", sp[2])
+            return False
+        try:
+            p_ = mc_launch.launch(version, MC, st_["direct_nick"], java, int(st_.get("direct_ram") or 4096),
+                                  log=lambda *a: None)
+        except mc_launch.MissingFilesError as e:
+            toast("У версии %s не хватает файлов (%d) - докачаю." % (version, len(e.missing)), "warn", ms=6000)
+            if sp[0]:
+                version_dialog(sp[0], sp[1] or "vanilla", sp[2])
+            return False
+        except Exception as e:
+            toast("Не получилось запустить игру: %s" % str(e)[:140], "err", ms=9000)
+            return False
+        state["direct_proc"] = p_
+        toast("Запускаю Minecraft %s как %s. Первый запуск бывает долгим - до минуты." % (version, st_["direct_nick"]),
+              "ok", ms=8000)
+
+        def watch(n=0):  # игра закрылась сразу - показываем, почему (последние строки журнала)
+            if p_.poll() is None:
+                if n < 40:
+                    win.after(1500, lambda: watch(n + 1))
+                return
+            if n < 20 and p_.returncode:
+                try:
+                    tail = open(p_.log_path, encoding="utf-8", errors="replace").read()[-600:]
+                except Exception:
+                    tail = ""
+                messagebox.showerror("Игра закрылась", "Minecraft закрылся с ошибкой (код %s).\n\n%s" % (
+                    p_.returncode, tail.strip()[-400:] or "Журнал: " + p_.log_path))
+        win.after(1500, watch)
+        return True
+    DIRECT_HOOK["fn"] = direct_launch
 
     def launch_now():
         lid = chosen_launcher()
@@ -8655,6 +8929,23 @@ def gui():
             clickable(cell, lambda key=key: (t.destroy(), choose_style(key)))
         grid_.columnconfigure(0, weight=1)
         grid_.columnconfigure(1, weight=1)
+        dsection(body_, "Язык / Language")
+        lr = tk.Frame(body_, bg=BG)
+        lr.pack(fill="x")
+
+        def set_lang(code):
+            st_ = load_settings()
+            if (st_.get("lang") or system_lang()) == code:
+                return
+            st_["lang"] = code
+            save_settings(st_)
+            t.destroy()
+            if messagebox.askyesno("Portalis", "Язык сменится после перезапуска. Перезапустить сейчас?\n"
+                                               "The language changes after a restart. Restart now?"):
+                restart_app()
+        cur_l = load_settings().get("lang") or system_lang()
+        chip(lr, "Русский", cur_l == "ru", lambda: set_lang("ru")).pack(side="left", padx=(0, 6))
+        chip(lr, "English", cur_l == "en", lambda: set_lang("en")).pack(side="left")
         dsection(body_, "Только цвета")
         cr = tk.Frame(body_, bg=BG)
         cr.pack(fill="x")
@@ -8670,7 +8961,8 @@ def gui():
 
     def refresh_foot():
         shortcut_btn.configure(text="Ярлык создан ✓" if shortcuts_exist() else "Создать ярлык")
-        with_icon(play_btn, "ic_play.png", ("Открыть " if launcher_mode() == "mrpack" else "Играть: ") + launcher_title(chosen_launcher()))
+        with_icon(play_btn, "ic_play.png", "Играть" if launcher_mode() == "direct" else
+                  ("Открыть " if launcher_mode() == "mrpack" else "Играть: ") + launcher_title(chosen_launcher()))
 
     def as_hex(c):
         """Цвет словом («white») или #rgb -> #rrggbb."""
@@ -8681,6 +8973,7 @@ def gui():
 
     def badge(parent, text, color=LINE, fg=TEXT):
         """Бейдж-«таблетка»: скруглённый, с лёгким бликом (картинкой)."""
+        text = tr(text)
         try:
             pbg = parent.cget("bg")
         except Exception:
@@ -8816,7 +9109,7 @@ def gui():
         """Выпадающий список в стиле окна: подпись со стрелкой и тёмное меню. raw - пункты как есть."""
         def short(name):
             return name if raw or name.startswith(NO_MODS) else name.rsplit(" (", 1)[0]
-        disp = tk.StringVar(value=short(var.get()) + "   ▾")
+        disp = tk.StringVar(value=tr(short(var.get())) + "   ▾")
         box = tk.Frame(parent, bg=bg)
         if caption:
             tk.Label(box, text=caption, font=(FONT, 8), fg=MUTED, bg=bg).pack(anchor="w")
@@ -8830,10 +9123,10 @@ def gui():
                        font=(FONT, 10), bd=0, relief="flat")
         for ch in choices:
             menu.add_command(label="  " + short(ch) + "  ",
-                             command=lambda ch=ch: (var.set(ch), disp.set(short(ch) + "   ▾")))
+                             command=lambda ch=ch: (var.set(ch), disp.set(tr(short(ch)) + "   ▾")))
         def open_pick(e=None):
             pick_popup(hold, [("", [(ch, short(ch)) for ch in choices])], var.get(),
-                       lambda ch: (var.set(ch), disp.set(short(ch) + "   ▾")), caption or "Выбери", 420, True)
+                       lambda ch: (var.set(ch), disp.set(tr(short(ch)) + "   ▾")), caption or "Выбери", 420, True)
             return "break"
         b.bind("<Button-1>", open_pick)
         hold.bind("<Button-1>", open_pick)
@@ -8855,7 +9148,8 @@ def gui():
             w.destroy()
         c = current() or {}
         lid = chosen_launcher()
-        ver = (get_tlauncher_version() if lid == "tlauncher" else None) or c.get("tl_version") or ""
+        ver = (get_tlauncher_version() if lid == "tlauncher" else
+               load_settings().get("direct_version") if lid == "portalis" else None) or c.get("tl_version") or ""
         last_map = load_settings().get("last_map")
         items = [("tab_launchers.png", "Лаунчер", launcher_title(lid), "launchers")]
         if launcher_mode(lid) == "mrpack":
@@ -8918,6 +9212,7 @@ def gui():
                  wraplength=700).pack(fill="x", pady=(6, 0))
 
     def search_box(parent, key, hint):
+        hint = tr(hint)
         """Поле поиска: фильтрует по мере ввода, Esc очищает. Ctrl+F ставит в него курсор."""
         box = tk.Frame(parent, bg=CARD_HI, padx=13, pady=3)
         island(box, vines=False, radius=11, glow=False, flat=True)
@@ -8977,7 +9272,7 @@ def gui():
     def filter_pick(parent, caption, groups, current, on_pick, custom=None, width=420):
         """Фильтр выпадающим списком: таблетка «Версия: 1.21 ▾», по нажатию - красивое окошко выбора."""
         lab = next((l_ for _g, items in groups for v, l_ in items if v == current), current or "Все")
-        b = chip(parent, "%s: %s   ▾" % (caption, lab), current not in (None, "all", ""), lambda: None)
+        b = chip(parent, "%s: %s   ▾" % (tr(caption), tr(lab)), current not in (None, "all", ""), lambda: None)
         b._cmd = lambda: win.after(10, lambda: pick_popup(  # после щелчка: иначе он же закроет окошко «мимо»
             b, groups, current, on_pick, caption, width, list_mode=len(groups) == 1 and not custom, custom=custom))
         return b
@@ -9322,6 +9617,66 @@ def gui():
                      lambda n, logs: toast("«%s» убрана, место освобождено." % title))
         small_button(row, "Удалить скачанное", go, bg=row["bg"], icon="ic_delete.png").pack(side="left", padx=(8, 0))
 
+    def pack_doctor(p):
+        """Проблемы модов сборки: [{level, text, fix, mods}], или None - проверять нечего (без модов, ванилла)."""
+        if mod_doctor is None:
+            return None
+        mods = os.path.join(p["path"], "mods")
+        if not os.path.isdir(mods) or not any(f.endswith(".jar") for f in os.listdir(mods)):
+            return None
+        sp = version_spec(p.get("tl_version") or "") or version_spec(p["version_dir"])
+        if not sp or sp[1] == "vanilla":
+            return None
+        try:
+            return mod_doctor.check_mods(mods, sp[0], sp[1], sp[2])
+        except Exception:
+            return None
+
+    def doctor_section(t, body, p):
+        """Раздел «Проверка модов» в окне сборки: считается в фоне, ошибки красным, предупреждения жёлтым."""
+        if mod_doctor is None:
+            return
+        dsection(body, "Проверка модов")
+        box = tk.Frame(body, bg=BG)
+        box.pack(fill="x")
+        note = tk.Label(box, text="Проверяю, подходят ли моды друг к другу...", font=(FONT, 10), fg=MUTED, bg=BG, anchor="w")
+        note.pack(fill="x")
+
+        def done(probs):
+            if not box.winfo_exists():
+                return
+            note.destroy()
+            if probs is None:
+                tk.Label(box, text="Модов не скачано - проверю, когда сборка будет скачана.", font=(FONT, 10), fg=MUTED,
+                         bg=BG, anchor="w").pack(fill="x")
+                return
+            errs = [x for x in probs if x["level"] == "error"]
+            warns = [x for x in probs if x["level"] == "warn"]
+            if not errs and not warns:
+                tk.Label(box, text="✓ Конфликтов не найдено: моды подходят к версии, загрузчику и друг к другу.",
+                         font=(FONT, 10, "bold"), fg=ACCENT_HI, bg=BG, anchor="w").pack(fill="x")
+                return
+            tk.Label(box, text="Найдено: ошибок %d, предупреждений %d" % (len(errs), len(warns)), font=(FONT, 10, "bold"),
+                     fg="#e05a5a" if errs else GOLD, bg=BG, anchor="w").pack(fill="x", pady=(0, 4))
+            for x in (errs + warns)[:30]:
+                rw = tk.Frame(box, bg=CARD, padx=12, pady=7)
+                island(rw, vines=False, radius=10, border="#e05a5a" if x["level"] == "error" else GOLD)
+                rw.pack(fill="x", pady=(0, 4))
+                tk.Label(rw, text=("✕  " if x["level"] == "error" else "!  ") + x["text"], font=(FONT, 10),
+                         fg=TEXT, bg=CARD, anchor="w", justify="left", wraplength=760).pack(fill="x")
+                if x.get("fix"):
+                    tk.Label(rw, text="Что сделать: " + x["fix"], font=(FONT, 9), fg=MUTED, bg=CARD, anchor="w",
+                             justify="left", wraplength=760).pack(fill="x", pady=(2, 0))
+            auto_wrap(body)
+        def work():
+            probs = pack_doctor(p)
+            if probs and LANG != "ru":  # сообщения собираются из кусков - для английского переводим целиком
+                tx = translate_many([x["text"] for x in probs] + [x.get("fix") or "" for x in probs], LANG)
+                for i, x in enumerate(probs):
+                    x["text"], x["fix"] = tx[i], tx[len(probs) + i] or x.get("fix")
+            return probs
+        soc_bg(work, done, err_toast=False)
+
     def enable_pack(p):
         if launcher_mode() == "mrpack":
             def go_pack():
@@ -9334,6 +9689,13 @@ def gui():
         def go():
             ps2 = find_packs()
             pk = next((q for q in ps2 if q["path"] == p["path"]), p)
+            errs = [x for x in (pack_doctor(pk) or []) if x["level"] == "error"]
+            if errs and not messagebox.askyesno(
+                    "Проблемы с модами", "В сборке есть моды, из-за которых игра может не запуститься:\n\n%s%s\n\n"
+                    "Подробности - в окне сборки («Подробнее»). Всё равно включить?" % (
+                        "\n".join("• " + x["text"] for x in errs[:5]),
+                        ("\n• ...и ещё %d" % (len(errs) - 5)) if len(errs) > 5 else "")):
+                return
             run_task("Включаю «%s»" % pk["name"], lambda log: switch(pk, ps2, True, log), finish)
         ensure_items(missing_items(pack=p), go, "Скачать «%s»" % p["name"].rsplit(" (", 1)[0])
 
@@ -9421,6 +9783,8 @@ def gui():
         if miss:
             badges.append(("не скачана · %s" % fmt_mb(miss.get("dl", 0)), "#4a3f17", "#f3d27a"))
         detail_header(t, body, img, p["name"].rsplit(" (", 1)[0], badges, p.get("description", ""))
+        if not miss:
+            doctor_section(t, body, p)
         try:
             with open(os.path.join(p["path"], "mods.json"), encoding="utf-8") as fh:
                 data = json.load(fh)
@@ -10549,11 +10913,23 @@ def gui():
         info.grid(row=1, column=0, columnspan=2, sticky="we", padx=(0, 14), pady=(0, 14))
         tk.Label(info, text="Мой лаунчер: %s" % launcher_title(mine), font=(FONT, 12, "bold"), fg=TEXT, bg=PANEL,
                  anchor="w").pack(fill="x")
-        how = {"tl": "Portalis ставит карты и моды в папку игры и сам выбирает в нём версию.",
+        how = {"direct": "Portalis сам запускает игру: кнопка «Играть» внизу - и Minecraft открывается с выбранной "
+                         "картой или сборкой. Лаунчер не нужен.",
+               "tl": "Portalis ставит карты и моды в папку игры и сам выбирает в нём версию.",
                "legacy": "Portalis ставит карты и моды в его папку игры и сам выбирает версию, если лаунчер закрыт.",
                "profiles": "Portalis ставит карты и моды в папку игры и создаёт в нём профиль «Portalis» с нужной версией.",
                "mrpack": "Portalis собирает пакет (сборка, мир карты, серверы) и передаёт его лаунчеру: "
                          "он сам создаст экземпляр с нужной версией."}.get(mode, "")
+        if mode == "direct":
+            st_ = load_settings()
+            dr = tk.Frame(info, bg=PANEL)
+            dr.pack(fill="x", pady=(6, 0))
+            tk.Label(dr, text="Ник: %s   ·   память: %s   ·   версия: %s" % (
+                st_.get("direct_nick") or "не задан", ("%d ГБ" % (st_["direct_ram"] // 1024)) if st_.get("direct_ram")
+                else "4 ГБ", st_.get("direct_version") or "выберется картой или сборкой"), font=(FONT, 10), fg=TEXT,
+                bg=PANEL).pack(side="left")
+            small_button(dr, "Ник и память...", lambda: direct_settings(lambda: show("launchers", animated=False)),
+                         bg=PANEL, icon="ic_settings.png").pack(side="right")
         tk.Label(info, text=how + ("" if state.get("installed_launchers") is not None else "   Ищу установленные лаунчеры..."),
                  font=(FONT, 10), fg=MUTED, bg=PANEL, anchor="w", justify="left", wraplength=900).pack(fill="x", pady=(4, 0))
         if mode != "mrpack":
@@ -14599,6 +14975,187 @@ def gui():
                                     win.winfo_rooty() + 60))
         fade_in_window(t)
 
+    def color_pick(anchor, current, on_pick, title="Цвет"):
+        """Свой цвет - панель внутри окна: сетка оттенков (тон x яркость), серые и поле для #кода.
+        Открывается после щелчка (иначе этот же щелчок закрыл бы её как «мимо»)."""
+        win.after(10, lambda: _color_pick(anchor, current, on_pick, title))
+
+    def _color_pick(anchor, current, on_pick, title):
+        def pick(v):
+            close_popup()
+            on_pick(v)
+        close_popup()
+        t = InPage("popup", esc=False)
+        popup_st["w"] = t
+        fr = tk.Frame(t, bg=CARD, padx=16, pady=14)
+        fr.pack(fill="both", expand=True)
+        hd = tk.Frame(fr, bg=CARD)
+        hd.pack(fill="x")
+        tk.Label(hd, text=title, font=(FONT, 12, "bold"), fg=TEXT, bg=CARD).pack(side="left")
+        small_button(hd, "✕", close_popup, bg=CARD).pack(side="right")
+        grid = tk.Frame(fr, bg=CARD)
+        grid.pack(pady=(10, 0))
+        keep_ = []
+        rows = [(0.35, 1.0), (0.55, 1.0), (0.8, 0.95), (0.95, 0.85), (0.9, 0.65), (0.85, 0.45)]
+        cols = [colorsys.hsv_to_rgb(h / 16.0, s_, v_) for s_, v_ in rows for h in range(16)]
+        cols += [(g / 15.0,) * 3 for g in range(16)]
+        for i, (r_, g_, b_) in enumerate(cols):
+            hexc = "#%02x%02x%02x" % (int(r_ * 255), int(g_ * 255), int(b_ * 255))
+            im = PILImage.new("RGBA", (22, 22), (0, 0, 0, 0))
+            ImageDraw.Draw(im).rounded_rectangle((1, 1, 20, 20), 5, fill=_hex(hexc),
+                                                 outline=_hex("#ffffff" if hexc == current else _mixc(hexc, "#000000", 0.3)),
+                                                 width=2 if hexc == current else 1)
+            sw = tk.Label(grid, image=pil_photo(im, keep_), bg=CARD, cursor="hand2", bd=0)
+            sw.grid(row=i // 16, column=i % 16, padx=1, pady=1)
+            sw.bind("<Button-1>", lambda e, hexc=hexc: pick(hexc))
+        t._keep = keep_
+        cr = tk.Frame(fr, bg=CARD)
+        cr.pack(fill="x", pady=(10, 0))
+        tk.Label(cr, text="Код цвета:", font=(FONT, 10), fg=MUTED, bg=CARD).pack(side="left", padx=(0, 6))
+        e = REntry(cr, font=(FONT, 11), bg=CARD_HI, fg=TEXT, insertbackground=TEXT, width=10, relief="flat",
+                   highlightthickness=1, highlightbackground=LINE, highlightcolor=ACCENT)
+        e.insert(0, current or "#")
+        e.pack(side="left", ipady=3)
+
+        def typed(ev=None):
+            v = e.get().strip()
+            if re.match(r"^#?[0-9a-fA-F]{6}$", v):
+                pick("#" + v.lstrip("#").lower())
+            else:
+                toast("Цвет пишется как #ff8800", "warn")
+            return "break"
+        e.bind("<Return>", typed)
+        small_button(cr, "Выбрать", typed, bg=CARD).pack(side="left", padx=6)
+        t.update_idletasks()
+        W, H = max(420, t.winfo_reqwidth()), t.winfo_reqheight()
+        t.geometry("%dx%d+%d+%d" % (W, H, anchor.winfo_rootx(), anchor.winfo_rooty() + anchor.winfo_height() + 6))
+        return t
+
+    # --- мастерская скинов: скин из частей и цветов ---
+    def skin_workshop(row):
+        """Собрать свой скин: руки, кожа, причёска, глаза, лицо, одежда, обувь, аксессуар и цвета; сохранить в «Мои скины»."""
+        if skin_maker is None:
+            return
+        o = state.setdefault("skin_spec", skin_maker.default_spec())
+        o.setdefault("_slot", "top_color")
+        outer = tk.Frame(inner, bg=CARD, padx=18, pady=16)
+        outer.grid(row=row, column=0, columnspan=2, sticky="we", padx=(0, 14), pady=(0, 12))
+        island(outer, border=_mixc(ACCENT, CARD, 0.4))
+        body = tk.Frame(outer, bg=CARD)
+        body.pack(fill="x")
+        keep_ = []
+        parts = skin_maker.SKIN_PARTS
+
+        def opts(key):
+            return [(x[0], x[1]) if isinstance(x, (tuple, list)) else (x, x) for x in parts.get(key, [])]
+
+        def setv(**kw):
+            o.update(kw)
+            rebuild()
+
+        def rebuild():
+            frozen = freeze_paint(canvas, True)
+            try:
+                for w in body.winfo_children():
+                    w.destroy()
+                del keep_[:]
+                fill()
+                win.update_idletasks()
+                flush_islands()
+            finally:
+                if frozen:
+                    freeze_paint(canvas, False)
+
+        def skin_png():
+            spec = {k: v for k, v in o.items() if not k.startswith("_")}
+            im = skin_maker.make_skin(spec)
+            buf = io.BytesIO()
+            im.save(buf, "PNG")
+            return buf.getvalue()
+
+        def label(parent, text):
+            tk.Label(parent, text=text, font=(FONT, 10, "bold"), fg=TEXT, bg=CARD, anchor="w").pack(fill="x", pady=(10, 4))
+
+        def fill():
+            hd = tk.Frame(body, bg=CARD)
+            hd.pack(fill="x")
+            tk.Label(hd, image=art("tab_skins.png", 40, 40), bg=CARD).pack(side="left")
+            ht = tk.Frame(hd, bg=CARD)
+            ht.pack(side="left", padx=10)
+            tk.Label(ht, text="Мастерская скинов", font=(FONT, 15, "bold"), fg=TEXT, bg=CARD, anchor="w").pack(fill="x")
+            tk.Label(ht, text="собери персонажа из частей и цветов - скин сразу виден слева", font=(FONT, 9), fg=MUTED,
+                     bg=CARD, anchor="w").pack(fill="x")
+            small_button(hd, "Случайный", lambda: (o.update(skin_maker.random_spec(random.randrange(1 << 30))),
+                                                   rebuild()), bg=CARD, icon="ic_bolt.png").pack(side="right")
+            small_button(hd, "Сначала", lambda: (o.clear(), o.update(skin_maker.default_spec(), _slot="top_color"),
+                                                 rebuild()), bg=CARD).pack(side="right", padx=6)
+            row_ = tk.Frame(body, bg=CARD)
+            row_.pack(fill="x", pady=(12, 0))
+            pv = tk.Frame(row_, bg=PANEL, padx=16, pady=14)
+            pv.pack(side="left", anchor="n")
+            island(pv, vines=False, radius=12)
+            png = skin_png()
+            try:
+                tk.Label(pv, image=pil_photo(render_skin(png, o.get("model") == "slim", 5), keep_), bg=PANEL).pack()
+            except Exception:
+                tk.Label(pv, image=pil_photo(skin_maker.render_preview(PILImage.open(io.BytesIO(png)), 5), keep_),
+                         bg=PANEL).pack()
+            nm = REntry(pv, font=(FONT, 11), bg=CARD_HI, fg=TEXT, insertbackground=TEXT, relief="flat", width=18,
+                        highlightthickness=1, highlightbackground=LINE, highlightcolor=ACCENT)
+            nm.insert(0, o.get("_name") or "Мой скин")
+            nm.pack(pady=(12, 6), ipady=3)
+            nm.bind("<KeyRelease>", lambda e: o.update(_name=nm.get()))
+
+            def save():
+                fn = save_my_skin((nm.get().strip() or "Мой скин")[:40], skin_png(), o.get("model") == "slim", None,
+                                  "мастерская")
+                toast("Скин сохранён в «Мои скины»: %s" % fn[:-4], "ok", ("Надеть", lambda: wear_dialog(
+                    os.path.join(SKINS_DIR, fn), None, fn[:-4])), 8000)
+                show("skins", animated=False)
+            big_button(pv, "Сохранить скин", save, icon="ic_check.png").pack(fill="x")
+            ctl = tk.Frame(row_, bg=CARD, padx=20)
+            ctl.pack(side="left", fill="both", expand=True)
+            for key, cap in (("model", "Руки"), ("hair", "Причёска"), ("eyes", "Глаза"), ("face", "Лицо"),
+                             ("top", "Верх"), ("bottom", "Низ"), ("shoes", "Обувь"), ("accessory", "Аксессуар")):
+                label(ctl, cap)
+                items = opts(key)
+                half = (len(items) + 1) // 2 if len(items) > 6 else len(items)
+                for part in (items[:half], items[half:]):
+                    if part:
+                        pr = tk.Frame(ctl, bg=CARD)
+                        pr.pack(fill="x", pady=(0, 4))
+                        chip_row(pr, part, o.get(key), lambda v, key=key: setv(**{key: v}), CARD)
+            label(ctl, "Цвета  (выбери, что красим, потом цвет)")
+            slots = [("skin", "Кожа"), ("hair_color", "Волосы"), ("eye_color", "Глаза"), ("top_color", "Верх"),
+                     ("top_accent", "Отделка"), ("bottom_color", "Низ"), ("shoes_color", "Обувь"),
+                     ("accessory_color", "Аксессуар")]
+            sr = tk.Frame(ctl, bg=CARD)
+            sr.pack(fill="x")
+            for i, (k, cap) in enumerate(slots):
+                on = o["_slot"] == k
+                col = o.get(k, "#888888")
+                b = PButton(sr, ("✓ " if on else "") + cap, lambda k=k: setv(_slot=k), "primary", color=col,
+                            hover=_mixc(col, "#ffffff", 0.15), size=9, bold=True,
+                            fg="#111111" if sum(_rgb(col)) > 450 else "#ffffff")
+                b.grid(row=i // 4, column=i % 4, padx=(0, 6), pady=(0, 6), sticky="w")
+            pal = tk.Frame(ctl, bg=CARD)
+            pal.pack(fill="x", pady=(6, 0))
+            slot = o["_slot"]
+            pal_key = skin_maker.COLOR_KEYS.get(slot, "colors")
+            for col in [x[0] if isinstance(x, (tuple, list)) else x for x in parts.get(pal_key, [])][:20]:
+                sw = tk.Label(pal, bg=CARD, cursor="hand2", bd=0)
+                im = PILImage.new("RGBA", (26, 26), (0, 0, 0, 0))
+                ImageDraw.Draw(im).ellipse((1, 1, 24, 24), fill=_hex(col), outline=_hex(
+                    "#ffffff" if col == o.get(slot) else _mixc(col, "#ffffff", 0.35)), width=2)
+                sw.configure(image=pil_photo(im, keep_))
+                sw.pack(side="left", padx=(0, 4))
+                sw.bind("<Button-1>", lambda e, col=col: setv(**{o["_slot"]: col}))
+            own = small_button(pal, "Свой...", lambda: color_pick(own, o.get(o["_slot"]),
+                                                                  lambda c_: setv(**{o["_slot"]: c_}), "Свой цвет"),
+                               bg=CARD, icon="ic_palette.png")
+            own.pack(side="left", padx=(6, 0))
+        fill()
+
     def cape_maker():
         """Мастерская плащей открывается прямо на вкладке «Скины»."""
         state["cape_open"] = True
@@ -14676,11 +15233,10 @@ def gui():
                             fg="#111111" if sum(_rgb(o[k])) > 450 else "#ffffff")
                 b.pack(side="left", padx=(0, 8))
 
-            def own_color():
-                c = colorchooser.askcolor(o[o["slot"]], parent=win, title="Цвет плаща")
-                if c and c[1]:
-                    setv(**{o["slot"]: c[1]})
-            small_button(cr, "Свой...", own_color, bg=CARD, icon="ic_palette.png").pack(side="left")
+            own_b = small_button(cr, "Свой...", lambda: color_pick(own_b, o[o["slot"]],
+                                                                   lambda c_: setv(**{o["slot"]: c_}), "Цвет плаща"),
+                                 bg=CARD, icon="ic_palette.png")
+            own_b.pack(side="left")
             pal = tk.Frame(ctl, bg=CARD)
             pal.pack(fill="x", pady=(8, 0))
             for col in ("#b03a2e", "#d63031", "#e84393", "#e67e22", "#f4d03f", "#fdcb6e", "#28b463", "#00b894",
@@ -14814,7 +15370,14 @@ def gui():
         small_button(lk, "Скрыть мастерскую" if state.get("cape_open") else "Сделать плащ", lambda: (
             state.update(cape_open=not state.get("cape_open")), show("skins", animated=False)), bg=PANEL,
             icon="ic_palette.png").pack(side="right", padx=4)
+        if skin_maker is not None:
+            small_button(lk, "Скрыть мастерскую скинов" if state.get("skinws_open") else "Сделать скин", lambda: (
+                state.update(skinws_open=not state.get("skinws_open")), show("skins", animated=False)), bg=PANEL,
+                icon="ic_add.png").pack(side="right", padx=4)
         row += 1
+        if state.get("skinws_open"):
+            skin_workshop(row)
+            row += 1
         if state.get("cape_open"):
             cape_panel(row)
             row += 1
@@ -14972,7 +15535,7 @@ def gui():
                 run_task("Сохраняю скин", work, lambda fn, logs: (toast("Сохранено в «Мои скины»: %s" % fn[:-4], "ok"),
                                                                   show("skins", animated=False)))
             for w in (cell, lb) + tuple(cell.winfo_children()):
-                w.bind("<Button-1>", lambda e, f=take_g: f())
+                w.bind("<Button-1>", lambda e=None, f=take_g: f())
         mb = tk.Frame(inner, bg=BG)
         mb.grid(row=state["gal_row"], column=0, columnspan=2, pady=(0, 14))
         state["gal_more"] = mb
@@ -15403,7 +15966,7 @@ def gui():
                   "builder_build": builder_build, "builder_state": builder_state, "cape_maker": cape_maker,
                   "soc_dm": soc_dm, "messagebox": messagebox, "open_server": open_server,
                   "open_my_profile": open_my_profile, "state": state,
-                  "style_window": style_window, "version_menu": version_menu, "login_window": login_window, "party_create_window": party_create_window,
+                  "style_window": style_window, "version_menu": version_menu, "login_window": login_window, "party_create_window": party_create_window, "color_pick": color_pick,
                   "pick_popup": pick_popup}
     # Окно открывается там же и таким же, каким его закрыли; горячие клавиши.
     g = settings.get("geometry", "")

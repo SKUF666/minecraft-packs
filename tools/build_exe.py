@@ -9,6 +9,11 @@ B = os.path.join(os.environ.get('RUNNER_TEMP') or os.environ.get('TEMP', '.'), '
 os.makedirs(B, exist_ok=True)
 shutil.copy2(os.path.join(REPO, 'src', 'PackSwitcher.pyw') if CI else os.path.join(LIB, 'PackSwitcher.pyw'),
              os.path.join(B, 'PackSwitcher.pyw'))
+MODULES = ('mc_launch.py', 'skin_maker.py', 'mod_doctor.py')  # модули рядом с программой - входят в exe
+for m in MODULES:
+    src_m = os.path.join(REPO, 'src', m) if CI else os.path.join(LIB, m)
+    if os.path.isfile(src_m):
+        shutil.copy2(src_m, os.path.join(B, m))
 Image.open(os.path.join(REPO, 'docs', 'icon.png') if CI else os.path.join(LIB, 'icon.png')).save(os.path.join(B, 'app.ico'),
                                                sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
 # Сведения о файле (видны в «Свойствах» и в окне SmartScreen): название и версия по дате.
