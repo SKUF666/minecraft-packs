@@ -58,6 +58,15 @@ try:  # проверка совместимости модов до запуск
     import mod_doctor
 except Exception:
     mod_doctor = None
+try:  # 3D-просмотр скина: крутится мышью, плащ и элитры на модели
+    import skin3d
+except Exception:
+    skin3d = None
+try:  # голосовой чат пати (микрофон и звук - sounddevice, связь - websocket-client)
+    import portalis_voice
+except Exception:
+    portalis_voice = None
+VOICE_URL = "wss://voice.arch-flow.ru/ws"
 import base64
 import html as _html
 
@@ -1099,6 +1108,29 @@ class Social:
         else:
             self.rest("DELETE", "feed_likes", {"event_id": "eq.%d" % eid, "user_id": "eq." + self.uid})
 
+    # --- популярное у игроков Portalis (шаг 8 на сервере) ---
+    def play(self, kind, key, title, url=None):
+        """Отметка «играл сегодня» (одна в день на карту или сборку)."""
+        self.rest("POST", "plays?on_conflict=user_id,kind,key,day", body={
+            "user_id": self.uid, "kind": kind, "key": key[:200], "title": (title or "")[:120] or None,
+            "url": (url or "")[:400] or None}, prefer="resolution=ignore-duplicates")
+
+    def top_played(self, kind="map", days=7, lim=12):
+        try:
+            return self.rest("POST", "rpc/top_played", body={"days": days, "k": kind, "lim": lim}) or []
+        except SocialError as e:
+            if e.code in (400, 404):
+                return None
+            raise
+
+    def top_rated(self, min_n=1, lim=12):
+        try:
+            return self.rest("POST", "rpc/top_rated", body={"min_n": min_n, "lim": lim}) or []
+        except SocialError as e:
+            if e.code in (400, 404):
+                return None
+            raise
+
     # --- оценки карт ---
     def review(self, map_key, stars, text=None):
         self.rest("POST", "map_reviews?on_conflict=map_key,user_id", body={
@@ -1312,6 +1344,13 @@ class Social:
 
     def delete_proposal(self, prop_id):
         self.rest("DELETE", "party_proposals", {"id": "eq.%d" % prop_id})
+
+    def merge_lobby(self, pid, **fields):
+        """Добавить/поменять поля лобби пати, не трогая остальные (карта пати, общий мир...)."""
+        cur = (self.party(pid) or {}).get("lobby") or {}
+        cur.update(fields)
+        self.rest("PATCH", "parties", {"id": "eq." + pid}, {"lobby": cur})
+        return cur
 
     def set_lobby(self, pid, lobby):
         """Карта пати (выбирает хозяин): {map, title, version, pack}."""
@@ -9589,6 +9628,7 @@ def gui():
             pk = next((q for q in ps2 if pack and q["path"] == pack["path"]), None)
             st = load_settings(); st["last_map"] = m["title"]; save_settings(st)
             stat_map(m["title"])
+            play_log("map", map_key(m), m["title"])
             run_task("Готовлю «%s»" % m["title"], lambda log: install_map(m, pk, fresh, ps2, log), finish)
         ensure_items(missing_items(m, pack, packs), go, "Скачать «%s»" % m["title"])
 
@@ -9696,6 +9736,7 @@ def gui():
                         "\n".join("• " + x["text"] for x in errs[:5]),
                         ("\n• ...и ещё %d" % (len(errs) - 5)) if len(errs) > 5 else "")):
                 return
+            play_log("pack", pack_item_id(pk), pk["name"].rsplit(" (", 1)[0])
             run_task("Включаю «%s»" % pk["name"], lambda log: switch(pk, ps2, True, log), finish)
         ensure_items(missing_items(pack=p), go, "Скачать «%s»" % p["name"].rsplit(" (", 1)[0])
 
@@ -10019,6 +10060,7 @@ def gui():
                 and (not state.get("f_fav_maps") or is_fav(map_key(m)))]
         toggle_chip(flt, "Только скачанные", "f_dl_maps").pack(side="left", padx=(0, 8))
         toggle_chip(flt, "♥ Избранное", "f_fav_maps").pack(side="left")
+        top_block(fbox)
         tk.Label(flt, text="   показано %d из %d" % (len(maps), total), font=(FONT, 9), fg=MUTED, bg=BG).pack(side="left")
         if total and not maps:
             empty_note(2, "Под этот фильтр карт нет. Сбрось фильтры или очисти поиск (Esc).")
@@ -10386,6 +10428,7 @@ def gui():
             return ok
         st = load_settings(); st["last_map"] = x["title"]; save_settings(st)
         stat_map(x["title"])
+        play_log("map", map_key(x), x["title"], x.get("url"))
         run_task("Ставлю «%s»" % x["title"], work, finish)
 
     def open_web_map(x):
@@ -10537,6 +10580,9 @@ def gui():
                 badge(bl, "включена", "#2f6b34", "white").pack(side="left", padx=(0, 6))
             if p.get("user"):
                 badge(bl, "своя", "#3b2f6b", "white").pack(side="left")
+            ups_ = mod_upd_for(p) if p.get("user") else []
+            if ups_:
+                badge(bl, "обновления: %d" % len(ups_), "#5a4c1c", "#f3d27a").pack(side="left", padx=(6, 0))
             miss = not_downloaded(pack_item_id(p))
             dl_badge(bl, miss)
             tk.Label(c, text=p.get("description", ""), font=(FONT, 10), fg="#c3c7d1", bg=CARD,
@@ -10558,6 +10604,9 @@ def gui():
                         run_task("Убираю «%s»" % p["name"], lambda log: delete_user_pack(p, log),
                                  lambda ok, logs: toast("Сборка убрана в Корзину.", "ok"))
                 small_button(row, "Изменить", lambda p=p: edit_user_pack(p), bg=CARD, icon="ic_settings.png").pack(side="left")
+                if mod_upd_for(p):
+                    small_button(row, "Обновить моды", lambda p=p: update_mods_now(p), bg=CARD,
+                                 icon="tab_update.png").pack(side="left", padx=4)
                 small_button(row, "Удалить", drop, bg=CARD, icon="ic_delete.png").pack(side="left", padx=4)
             clickable(c, lambda p=p: open_pack(p))
 
@@ -11765,6 +11814,65 @@ def gui():
         poll()
         fade_in_window(t)
 
+    def auto_mod_check(force=False):
+        """Раз в сутки в фоне: есть ли новые версии модов у своих сборок (конструктор и модпаки).
+        Итог - в settings["mod_upd"] {папка сборки: [[файл, было, стало], ...]}; на карточке - «обновления: N»."""
+        st_ = load_settings()
+        if not force and time.time() - st_.get("mod_upd_t", 0) < 20 * 3600:
+            win.after(6 * 3600 * 1000, auto_mod_check)
+            return
+        packs = [p for p in find_packs() if p.get("user") and p.get("mr_files")]
+        if not packs:
+            return
+
+        def work():
+            res = {}
+            for p in packs:
+                try:
+                    res[p["path"]] = [list(u) for u in mod_updates(p, log=lambda *a: None)]
+                except Exception:
+                    pass
+            return res
+
+        def done(res):
+            st2 = load_settings()
+            st2["mod_upd"], st2["mod_upd_t"] = res, time.time()
+            save_settings(st2)
+            n = len([v for v in res.values() if v])
+            if n:
+                toast("Есть новые версии модов в своих сборках: %d. Обновить - на карточке сборки." % n, "info",
+                      ("Сборки", lambda: show("packs")), 9000)
+                if state.get("tab") == "packs":
+                    state["keep_scroll"] = True
+                    show("packs", animated=False)
+            win.after(6 * 3600 * 1000, auto_mod_check)
+        soc_bg(work, done, err_toast=False)
+
+    def mod_upd_for(p):
+        return (load_settings().get("mod_upd") or {}).get(p["path"]) or []
+
+    def update_mods_now(p):
+        """Обновить моды в один клик: конструктор собирает НОВУЮ сборку со свежими версиями (старая остаётся),
+        модпак - ставится свежей версией из каталога."""
+        ups = mod_upd_for(p)
+        name = p["name"].rsplit(" (", 1)[0]
+        if p.get("constructor"):
+            if messagebox.askyesno("Обновить моды", "Обновить %d %s в «%s»?\n\n%s\n\nPortalis соберёт новую сборку «%s новая» со "
+                                   "свежими версиями, а эта останется как есть - если что-то сломается, вернёшься к ней." % (
+                                       len(ups), plural(len(ups), "мод", "мода", "модов"), name,
+                                       "\n".join("• %s: %s → %s" % tuple(u) for u in ups[:15]), name)):
+                st_ = load_settings()
+                (st_.get("mod_upd") or {}).pop(p["path"], None)
+                save_settings(st_)
+                rebuild_pack(p, name + " новая")
+        else:
+            mp = (p.get("modpack") or {}).get("name") or name
+            toast("Это модпак: поставь его свежую версию - «Конструктор» → «Модпаки» → «%s»." % mp, "info", ms=9000)
+            state.setdefault("cb", None)
+            builder_state()
+            builder_set(ptype="modpack", q=mp)
+            show("builder")
+
     def rebuild_pack(p, name):
         """Собрать сборку заново с теми же модами (свежие версии) под новым именем."""
         c = p.get("constructor") or {}
@@ -12531,6 +12639,7 @@ def gui():
         save_settings(st_)
 
     def stat_map(title):
+        state["last_play"] = (title, time.time())  # друзья увидят «играет: <карта>»
         s_ = my_stats()
         maps = [x for x in (s_.get("maps") or []) if x != title]
         new = title not in (s_.get("maps") or [])
@@ -12545,6 +12654,115 @@ def gui():
         save_stats(s_)
         if new:
             feed_add("map", "играет в «%s»" % title[:80], {"title": title})
+
+    def play_log(kind, key, title, url=None):
+        c = soc()
+        if key and c.ready() and c.logged_in():
+            soc_bg(lambda: c.play(kind, key, title, url), err_toast=False)
+            state.pop("top_cache", None)
+
+    def top_data(then):
+        """Популярное за неделю и лучшие по оценкам (кэш 10 минут). then(dict) в окне; None - нет аккаунта/сервера."""
+        c = soc()
+        if not (c.ready() and c.logged_in()):
+            return then(None)
+        tc = state.get("top_cache")
+        if tc and time.time() - tc["t"] < 600:
+            return then(tc)
+
+        def work():
+            return {"t": time.time(), "played": c.top_played("map", 7, 10), "rated": c.top_rated(1, 10),
+                    "packs": c.top_played("pack", 7, 8)}
+
+        def done(r):
+            state["top_cache"] = r
+            then(r)
+        soc_bg(work, done, err_toast=False)
+
+    def top_block(parent):
+        """«Популярно у игроков Portalis»: во что играют на этой неделе и лучшие по оценкам; нажатие - открыть карту."""
+        holder = tk.Frame(parent, bg=BG)
+        holder.pack(fill="x", pady=(10, 0))
+
+        def open_key(key, title, url):
+            m_ = next((m for m in find_maps() if map_key(m) == key), None)
+            if m_:
+                return open_map(m_)
+            if url:
+                return open_web_map({"url": url, "title": title or url, "versions": [], "cover": None, "desc": "",
+                                     "author": "", "views": 0, "date": "", "ru": False})
+            toast("Эта карта из чужого каталога - найди её поиском: %s" % (title or key), "info")
+
+        def fill(r):
+            if not holder.winfo_exists():
+                return
+            for w_ in holder.winfo_children():
+                w_.destroy()
+            if not r or (not r.get("played") and not r.get("rated")):
+                holder.pack_forget()
+                return
+            box = tk.Frame(holder, bg=PANEL, padx=16, pady=12)
+            island(box, vines=False, radius=14)
+            box.pack(fill="x")
+            hd = tk.Frame(box, bg=PANEL)
+            hd.pack(fill="x")
+            tk.Label(hd, image=art("ic_crown.png", 22, 22), bg=PANEL).pack(side="left")
+            tk.Label(hd, text="  Популярно у игроков Portalis", font=(FONT, 13, "bold"), fg=TEXT, bg=PANEL).pack(side="left")
+            cols = tk.Frame(box, bg=PANEL)
+            cols.pack(fill="x", pady=(8, 0))
+            cols.grid_columnconfigure(0, weight=1, uniform="t")
+            cols.grid_columnconfigure(1, weight=1, uniform="t")
+            for ci, (cap, rows, fmt) in enumerate((
+                    ("Играют на этой неделе", r.get("played") or [],
+                     lambda x: "%d %s" % (x["players"], plural(int(x["players"]), "игрок", "игрока", "игроков"))),
+                    ("Лучшие по оценкам", r.get("rated") or [],
+                     lambda x: "★ %s  (%d)" % (x["avg"], int(x["n"]))))):
+                col = tk.Frame(cols, bg=PANEL)
+                col.grid(row=0, column=ci, sticky="nwe", padx=(0, 12) if ci == 0 else (12, 0))
+                tk.Label(col, text=cap, font=(FONT, 10, "bold"), fg=GOLD, bg=PANEL, anchor="w").pack(fill="x", pady=(0, 4))
+                if not rows:
+                    tk.Label(col, text="пока пусто", font=(FONT, 9), fg=MUTED, bg=PANEL, anchor="w").pack(fill="x")
+                for i, x in enumerate(rows[:5]):
+                    title = x.get("title") or next((m["title"] for m in find_maps() if map_key(m) == x["key"]), x["key"])
+                    rw = tk.Frame(col, bg=CARD, padx=10, pady=5, cursor="hand2")
+                    rw.pack(fill="x", pady=(0, 3))
+                    tk.Label(rw, text="%d." % (i + 1), font=(FONT, 10, "bold"), fg=MUTED, bg=CARD).pack(side="left")
+                    tk.Label(rw, text="  " + title[:40], font=(FONT, 10, "bold"), fg=TEXT, bg=CARD).pack(side="left")
+                    tk.Label(rw, text=fmt(x), font=(FONT, 9), fg=ACCENT_HI, bg=CARD).pack(side="right")
+                    clickable(rw, lambda x=x, title=title: open_key(x["key"], title, x.get("url")))
+            auto_wrap(holder)
+        top_data(fill)
+
+    def friends_now(fr):
+        """«Сейчас играют»: друзья в игре - во что, и можно сыграть в то же самое."""
+        d = soc_data()
+        playing = [f["profile"] for f in d.get("friends") or [] if f["state"] == "friend"
+                   and is_online(f["profile"]) and f["profile"].get("status") == "playing"]
+        if not playing:
+            return
+        box = tk.Frame(fr, bg=CARD, padx=14, pady=12)
+        island(box)
+        box.pack(fill="x", pady=(10, 0))
+        tk.Label(box, text="Сейчас играют", font=(FONT, 13, "bold"), fg=TEXT, bg=CARD, anchor="w").pack(fill="x")
+        for p in playing[:10]:
+            rw = tk.Frame(box, bg=PANEL, padx=10, pady=6)
+            island(rw, vines=False, radius=10)
+            rw.pack(fill="x", pady=(6, 0))
+            av = tk.Label(rw, bg=PANEL, cursor="hand2")
+            av.pack(side="left")
+            want_pic("nowav:%s:%d" % (p.get("avatar"), len(p.get("avatar") or "")),
+                     lambda p=p: avatar_pil(p.get("avatar"), 30, p.get("login", ""), "#4caf50"), av)
+            av.bind("<Button-1>", lambda e, p=p: open_profile(p))
+            what = (p.get("status_detail") or "Minecraft").replace("играет: ", "")
+            tk.Label(rw, text="  %s  " % p.get("nick", "?"), font=(FONT, 10, "bold"), fg=TEXT, bg=PANEL).pack(side="left")
+            tk.Label(rw, text="играет: " + what, font=(FONT, 10), fg=GOLD, bg=PANEL).pack(side="left")
+            m_ = next((m for m in find_maps() if m["title"] == what), None)
+            pk = next((q for q in find_packs() if q["name"].rsplit(" (", 1)[0] == what), None)
+            if m_:
+                small_button(rw, "Тоже сыграть", lambda m_=m_: open_map(m_), bg=PANEL, icon="ic_play.png").pack(side="right")
+            elif pk:
+                small_button(rw, "Та же сборка", lambda pk=pk: open_pack(pk), bg=PANEL, icon="ic_play.png").pack(side="right")
+            small_button(rw, "Написать", lambda p=p: soc_dm(p), bg=PANEL, icon="ic_mail.png").pack(side="right", padx=6)
 
     def feed_add(kind, text, payload=None):
         c = soc()
@@ -13541,6 +13759,7 @@ def gui():
         right.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
         soc_friends(left)
         soc_party(right)
+        friends_now(fr)
         soc_public(fr)
         soc_feed(fr)
         auto_wrap(fr)
@@ -13947,6 +14166,8 @@ def gui():
         tk.Label(lb_, text=("Автозапуск: когда хозяин откроет мир, приглашение уйдёт само, а готовые игроки подключатся "
                             "без кнопок." if auto_on else "Автозапуск выключен - подключайся кнопкой «Присоединиться»."),
                  font=(FONT, 8), fg=MUTED, bg=PANEL, anchor="w", justify="left", wraplength=420).pack(fill="x", pady=(4, 0))
+        voice_block(box, party)
+        party_world_block(box, party, lob)
         # предложения «во что пойти»
         ph = tk.Frame(box, bg=CARD)
         ph.pack(fill="x", pady=(2, 2))
@@ -14734,6 +14955,283 @@ def gui():
             soc_bg(fetch, done)
         load()
 
+    # --- голосовой чат пати ---
+    def voice_stop():
+        vc = state.pop("voice", None)
+        if vc is not None:
+            try:
+                vc.stop()
+            except Exception:
+                pass
+
+    def voice_event(kind, data):
+        """События голоса приходят из фоновых потоков - в окно передаём через after."""
+        def ui():
+            if kind == "error":
+                toast("Голос: %s" % data, "warn", ms=6000)
+            if kind == "closed":
+                voice_stop()
+            if state.get("tab") == "friend" and kind in ("connected", "roster", "closed", "error"):
+                soc_render()
+            elif kind == "speaking":
+                paint_speaking()
+        try:
+            win.after(0, ui)
+        except Exception:
+            pass
+
+    def paint_speaking():
+        """Подсветка тех, кто сейчас говорит (без перерисовки всей вкладки)."""
+        vc = state.get("voice")
+        for slot, lb in list(state.get("voice_labels", {}).items()):
+            try:
+                if lb.winfo_exists():
+                    talking = vc is not None and time.time() - vc.speaking.get(slot, 0) < 0.6
+                    lb.configure(fg=ACCENT_HI if talking else TEXT)
+            except Exception:
+                pass
+
+    def voice_start(party):
+        if portalis_voice is None:
+            toast("Голосовой чат не собран в этой версии программы.", "err")
+            return
+        voice_stop()
+        c = soc()
+        me_ = soc_data().get("me") or {}
+        st_ = load_settings()
+        try:
+            vc = portalis_voice.VoiceClient(VOICE_URL, lambda: c._token(), party["id"], me_.get("nick", "игрок"),
+                                            on_event=voice_event, input_device=st_.get("voice_in"),
+                                            output_device=st_.get("voice_out"))
+            vc.set_volume(float(st_.get("voice_vol", 1.0)))
+            vc.set_ptt(bool(st_.get("voice_ptt")))
+            vc.set_mic(not st_.get("voice_muted"))
+            vc.start()
+        except Exception as e:
+            toast("Голос не включился: %s" % str(e)[:120], "err")
+            return
+        state["voice"] = vc
+        state["voice_party"] = party["id"]
+        toast("Подключаюсь к голосу пати... Лучше в наушниках - так не будет эха.", "info", ms=5000)
+
+        def meter():  # уровень микрофона и подсветка говорящих раз в 150 мс
+            v = state.get("voice")
+            if v is None:
+                return
+            bar = state.get("voice_meter")
+            try:
+                if bar is not None and bar.winfo_exists():
+                    w_ = int(120 * min(1.0, v.level * 6))
+                    bar.coords("lvl", 0, 0, w_, 8)
+            except Exception:
+                pass
+            paint_speaking()
+            win.after(150, meter)
+        meter()
+
+    def voice_block(box, party):
+        """Голос в пати: подключиться, микрофон, рация (говорить, пока держишь кнопку), громкость, кто говорит."""
+        if portalis_voice is None:
+            return
+        vc = state.get("voice")
+        if vc is not None and state.get("voice_party") != party.get("id"):
+            voice_stop()  # перешёл в другую пати
+            vc = None
+        fr_ = tk.Frame(box, bg=PANEL, padx=10, pady=8)
+        island(fr_, vines=False, radius=10, border=ACCENT if vc is not None else None)
+        fr_.pack(fill="x", pady=(0, 6))
+        top_ = tk.Frame(fr_, bg=PANEL)
+        top_.pack(fill="x")
+        tk.Label(top_, text="🎤", font=(FONT, 12), fg=TEXT, bg=PANEL).pack(side="left")
+        tk.Label(top_, text=" Голос пати", font=(FONT, 10, "bold"), fg=TEXT, bg=PANEL).pack(side="left")
+        if vc is None:
+            tk.Label(top_, text="   говорите голосом, пока играете", font=(FONT, 9), fg=MUTED, bg=PANEL).pack(side="left")
+            big_button(top_, "Подключиться", lambda: voice_start(party), icon="ic_invite.png").pack(side="right")
+            return
+        small_button(top_, "Отключиться", lambda: (voice_stop(), soc_render()), bg=PANEL).pack(side="right")
+        st_ = load_settings()
+        ctl = tk.Frame(fr_, bg=PANEL)
+        ctl.pack(fill="x", pady=(6, 0))
+        mic_on = not st_.get("voice_muted")
+
+        def flip_mic():
+            st2 = load_settings()
+            st2["voice_muted"] = mic_on
+            save_settings(st2)
+            vc.set_mic(not mic_on)
+            soc_render()
+        chip(ctl, "Микрофон: вкл" if mic_on else "Микрофон: выкл", mic_on, flip_mic).pack(side="left")
+        ptt = bool(st_.get("voice_ptt"))
+
+        def flip_ptt():
+            st2 = load_settings()
+            st2["voice_ptt"] = not ptt
+            save_settings(st2)
+            vc.set_ptt(not ptt)
+            soc_render()
+        chip(ctl, ("✓ " if ptt else "") + "Рация", ptt, flip_ptt).pack(side="left", padx=6)
+        if ptt:
+            talk = PButton(ctl, "Держи и говори", lambda: None, "primary", size=9)
+            talk.pack(side="left", padx=(0, 6))
+            talk.bind("<ButtonPress-1>", lambda e: vc.talking(True), add="+")
+            talk.bind("<ButtonRelease-1>", lambda e: vc.talking(False), add="+")
+        vol = float(st_.get("voice_vol", 1.0))
+        filter_pick(ctl, "Громкость", [("", [(0.5, "Тише"), (1.0, "Обычно"), (1.5, "Громче"), (2.0, "Очень громко")])],
+                    vol, lambda v: (vc.set_volume(v), save_settings(dict(load_settings(), voice_vol=v)), soc_render())
+                    ).pack(side="left")
+        mt = tk.Canvas(ctl, width=120, height=8, bg=CARD_HI, highlightthickness=0, bd=0)
+        mt.pack(side="left", padx=(10, 0))
+        mt.create_rectangle(0, 0, 0, 8, fill=ACCENT, width=0, tags="lvl")
+        state["voice_meter"] = mt
+        ppl = tk.Frame(fr_, bg=PANEL)
+        ppl.pack(fill="x", pady=(6, 0))
+        state["voice_labels"] = {}
+        if not vc.connected:
+            tk.Label(ppl, text=vc.error or "Подключаюсь...", font=(FONT, 9), fg=GOLD if not vc.error else "#e05a5a",
+                     bg=PANEL, anchor="w").pack(fill="x")
+        for m in vc.roster:
+            lb = tk.Label(ppl, text=("🔇 " if m.get("muted") else "● ") + m.get("nick", "?") +
+                          ("  (ты)" if m.get("slot") == vc.my_slot else ""), font=(FONT, 9, "bold"), fg=TEXT, bg=PANEL)
+            lb.pack(side="left", padx=(0, 10))
+            state["voice_labels"][m.get("slot")] = lb
+        if vc.mic_silent:
+            tk.Label(fr_, text="Микрофон молчит: проверь, что он подключён и включён в Windows (Параметры → Система → Звук).",
+                     font=(FONT, 8), fg=GOLD, bg=PANEL, anchor="w", justify="left", wraplength=420).pack(fill="x", pady=(4, 0))
+
+    # --- общий мир пати: мир хозяина сам сохраняется в облако пати, любой может стать хозяином ---
+    PW_NAME = "shared_world.zip"
+
+    def newest_world(since=0):
+        """Мир из saves, который менялся последним (после since), или None."""
+        best = None
+        for w in _listdir(SAVES):
+            ld = os.path.join(SAVES, w, "level.dat")
+            if os.path.isfile(ld) and os.path.getmtime(ld) > since and (best is None or os.path.getmtime(ld) > best[1]):
+                best = (w, os.path.getmtime(ld))
+        return best[0] if best else None
+
+    def party_host_id(party):
+        return ((party or {}).get("lobby") or {}).get("host") or (party or {}).get("owner")
+
+    def party_world_save(pid, world, quiet=False):
+        """Мир -> облако пати (party/<id>/shared_world.zip) и отметка в лобби: какой мир, когда, кто сохранил."""
+        c = soc()
+
+        def work():
+            data = world_zip(os.path.join(SAVES, world))
+            c.upload("worlds", "party/%s/%s" % (pid, PW_NAME), data, "application/zip", upsert=True)
+            me_ = soc_data().get("me") or {}
+            c.merge_lobby(pid, world_title=world, world_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                          world_by=me_.get("nick", ""), world_size=len(data))
+            return len(data)
+
+        def done(n):
+            toast("Мир «%s» сохранён в пати (%s): продолжить может любой из пати." % (world, fmt_mb(n)), "ok", ms=7000)
+            soc_refresh()
+        soc_bg(work, done, err_toast=not quiet)
+
+    def party_world_tick(playing):
+        """Хозяин пати поиграл и закрыл игру - его мир сам уходит в облако пати."""
+        d = soc_data()
+        was = state.get("pw_was", False)
+        state["pw_was"] = playing
+        party = d.get("party") or {}
+        if not party or party_host_id(party) != soc().uid:
+            state.pop("pw_session", None)
+            return
+        if playing and not was:
+            state["pw_session"] = {"pid": party["id"], "t": time.time() - 60}
+        elif was and not playing and state.get("pw_session"):
+            ses = state.pop("pw_session")
+            w = newest_world(ses["t"])
+            if w and load_settings().get("party_world_auto", True):
+                party_world_save(ses["pid"], w, quiet=True)
+
+    def party_become_host(party):
+        """Скачать общий мир пати, стать хозяином и запустить игру (приглашение уйдёт пати само)."""
+        c, d = soc(), soc_data()
+        lob = party.get("lobby") or {}
+        title = lob.get("world_title") or "Мир пати"
+        if game_running():
+            toast("Сначала закрой игру.", "warn")
+            return
+        if not messagebox.askyesno("Стать хозяином", "Скачать мир «%s» (сохранён %s) и стать хозяином пати?\n"
+                                   "Если у тебя уже есть мир с таким именем, он не удалится - останется рядом с пометкой "
+                                   "«до отката»." % (title, local_time(lob.get("world_at") or "", "%d.%m %H:%M"))):
+            return
+
+        def work(log):
+            dst = os.path.join(ROOT, "_update", "cloud", "party_" + PW_NAME)
+            log("Скачиваю мир пати «%s»" % title)
+            c.download_file("worlds", "party/%s/%s" % (party["id"], PW_NAME), dst)
+            world_rollback(dst, title, log)
+            os.remove(lp(dst))
+            c.merge_lobby(party["id"], host=c.uid)
+            me_ = d.get("me") or {}
+            c.send("%s теперь хозяин и продолжает мир «%s». Ждите приглашение." % (me_.get("nick", "Игрок"), title),
+                   pid=party["id"])
+            return True
+
+        def after(ok, logs):
+            if not ok:
+                return
+            state["pw_session"] = {"pid": party["id"], "t": time.time() - 60}
+            state["auto_host"] = {"pid": party["id"], "since": time.time()}
+            toast("Ты хозяин. Запускаю игру: открой мир «%s», потом Esc → «Открыть для сети» - приглашение уйдёт само."
+                  % title, "ok", ms=12000)
+            launch_now()
+            soc_refresh()
+        run_task("Беру мир пати", work, after)
+
+    def party_world_block(box, party, lob):
+        """«Общий мир пати»: последний сохранённый мир, кто хозяин, «Стать хозяином» / «Сохранить сейчас»."""
+        c = soc()
+        host = party_host_id(party)
+        me_host = host == c.uid
+        fr_ = tk.Frame(box, bg=PANEL, padx=10, pady=8)
+        island(fr_, vines=False, radius=10)
+        fr_.pack(fill="x", pady=(0, 6))
+        top_ = tk.Frame(fr_, bg=PANEL)
+        top_.pack(fill="x")
+        tk.Label(top_, image=art("tab_maps.png", 20, 20), bg=PANEL).pack(side="left")
+        tk.Label(top_, text="  Общий мир пати", font=(FONT, 10, "bold"), fg=TEXT, bg=PANEL).pack(side="left")
+        host_nick = next((m.get("nick") for m in soc_data().get("members") or [] if m.get("id") == host), "?")
+        tk.Label(top_, text="   хозяин: %s" % ("ты" if me_host else host_nick), font=(FONT, 9), fg=MUTED,
+                 bg=PANEL).pack(side="left")
+        if lob.get("world_title"):
+            tk.Label(fr_, text="«%s»  ·  сохранён %s%s  ·  %s" % (
+                lob["world_title"], local_time(lob.get("world_at") or "", "%d.%m %H:%M"),
+                (", " + lob["world_by"]) if lob.get("world_by") else "", fmt_mb(lob.get("world_size") or 0)),
+                font=(FONT, 9), fg=GOLD, bg=PANEL, anchor="w").pack(fill="x", pady=(3, 0))
+        else:
+            tk.Label(fr_, text="Когда хозяин поиграет и закроет игру, мир сам сохранится сюда - потом любой из пати "
+                               "сможет стать хозяином и продолжить.", font=(FONT, 9), fg=MUTED, bg=PANEL, anchor="w",
+                     justify="left", wraplength=420).pack(fill="x", pady=(3, 0))
+        br = tk.Frame(fr_, bg=PANEL)
+        br.pack(fill="x", pady=(5, 0))
+        if me_host:
+            def save_now():
+                if game_running():
+                    toast("Сначала закрой игру - иначе мир сохранится не до конца.", "warn")
+                    return
+                w = newest_world()
+                if not w:
+                    toast("В saves нет миров.", "warn")
+                    return
+                party_world_save(party["id"], w)
+            small_button(br, "Сохранить мир сейчас", save_now, bg=PANEL, icon="ic_backup.png").pack(side="left")
+            on_ = load_settings().get("party_world_auto", True)
+
+            def flip():
+                st_ = load_settings()
+                st_["party_world_auto"] = not on_
+                save_settings(st_)
+                soc_render()
+            chip(br, ("✓ " if on_ else "") + "Сохранять после игры", on_, flip).pack(side="left", padx=6)
+        elif lob.get("world_title"):
+            big_button(br, "Стать хозяином", lambda: party_become_host(party), icon="ic_crown.png").pack(side="left")
+            tk.Label(br, text="  скачать мир и продолжить у себя", font=(FONT, 9), fg=MUTED, bg=PANEL).pack(side="left")
+
     def party_start(lob):
         """Хозяин: все готовы -> запускаю карту, а когда мир откроется для сети, приглашение уйдёт само."""
         c, d = soc(), soc_data()
@@ -14805,7 +15303,9 @@ def gui():
                 state["soc_beat"] = now
                 playing = game_running()
                 cur = current() or {}
-                detail = (cur.get("name") or "Minecraft").rsplit(" (", 1)[0] if playing else None
+                lp_ = state.get("last_play")
+                detail = ((lp_[0] if lp_ and time.time() - lp_[1] < 6 * 3600 else None) or
+                          (cur.get("name") or "Minecraft").rsplit(" (", 1)[0]) if playing else None
                 soc_bg(lambda: c.set_status("playing" if playing else "online", detail), err_toast=False)
                 try:
                     stats_tick(c)
@@ -14813,6 +15313,10 @@ def gui():
                     pass
                 try:
                     backup_tick(c, playing)
+                except Exception:
+                    pass
+                try:
+                    party_world_tick(playing)
                 except Exception:
                     pass
             if state.get("tab") == "friend":
@@ -14906,10 +15410,9 @@ def gui():
         fr.pack(fill="both", expand=True)
         top = tk.Frame(fr, bg=BG)
         top.pack(fill="x")
-        prev = tk.Label(top, bg=BG)
-        prev.pack(side="left", anchor="n")
         try:
-            prev.configure(image=pil_photo(render_skin(open(skin_path, "rb").read(), None, 4)))
+            skin3d_view(top, open(skin_path, "rb").read(), None, cape_path, size=(170, 240), bg=BG).pack(
+                side="left", anchor="n")
         except Exception:
             pass
         info = tk.Frame(top, bg=BG, padx=16)
@@ -15096,7 +15599,11 @@ def gui():
             island(pv, vines=False, radius=12)
             png = skin_png()
             try:
-                tk.Label(pv, image=pil_photo(render_skin(png, o.get("model") == "slim", 5), keep_), bg=PANEL).pack()
+                if skin3d is not None:
+                    skin3d_view(pv, png, o.get("model") == "slim", None, size=(200, 280), bg=PANEL,
+                                st=state.setdefault("ws3d", {})).pack()
+                else:
+                    tk.Label(pv, image=pil_photo(render_skin(png, o.get("model") == "slim", 5), keep_), bg=PANEL).pack()
             except Exception:
                 tk.Label(pv, image=pil_photo(skin_maker.render_preview(PILImage.open(io.BytesIO(png)), 5), keep_),
                          bg=PANEL).pack()
@@ -15317,13 +15824,133 @@ def gui():
             big_button(nr, "Сохранить плащ", save, icon="ic_cape.png").pack(side="right")
         fill_panel()
 
-    def skin_card(parent, col, row, title, sub, png, slim, buttons_):
+    def skin3d_view(parent, png, slim=None, cape=None, size=(220, 300), bg=PANEL, st=None, controls=True):
+        """Скин в 3D: тяни мышью - персонаж поворачивается, колесо - ближе/дальше, двойной щелчок - как было.
+        Под ним - плащ / элитры / шаг. st - словарь, где помнить поворот между перерисовками вкладки."""
+        fr = tk.Frame(parent, bg=bg)
+        if skin3d is None:
+            tk.Label(fr, image=pil_photo(render_skin(png, slim, 5)), bg=bg).pack()
+            return fr
+        v = st if st is not None else {}
+        v.setdefault("yaw", 30.0)
+        v.setdefault("pitch", 10.0)
+        v.setdefault("zoom", 1.0)
+        v.setdefault("cape", True)
+        v.setdefault("elytra", False)
+        v.setdefault("walk", False)
+        lb = tk.Label(fr, bg=bg, cursor="fleur", bd=0)
+        lb.pack()
+        job = {"id": None, "drag": None}
+
+        def draw(ss=2):
+            job["id"] = None
+            try:
+                im = skin3d.render(png, yaw=v["yaw"], pitch=v["pitch"], size=size, slim=slim,
+                                   cape=cape if v["cape"] or v["elytra"] else None, elytra=bool(cape) and v["elytra"],
+                                   pose="walk" if v["walk"] else "stand", ss=ss, zoom=v["zoom"])
+            except Exception:
+                lb.configure(image=pil_photo(render_skin(png, slim, 5)), cursor="")
+                return
+            ph = getattr(lb, "_ph", None)
+            if ph is None:
+                lb._ph = ImageTk.PhotoImage(im)
+                lb.configure(image=lb._ph)
+            else:
+                ph.paste(im)
+
+        def later(ss):
+            if job["id"] is not None:
+                return
+            job["id"] = lb.after_idle(lambda: draw(ss))
+
+        def press(e):
+            job["drag"] = (e.x_root, e.y_root)
+
+        def move(e):
+            if job["drag"] is None:
+                return
+            x0, y0 = job["drag"]
+            job["drag"] = (e.x_root, e.y_root)
+            v["yaw"] = (v["yaw"] + (e.x_root - x0) * 0.8) % 360
+            v["pitch"] = max(-60.0, min(60.0, v["pitch"] - (e.y_root - y0) * 0.5))
+            later(1)
+
+        def release(e):
+            job["drag"] = None
+            lb.after(30, lambda: draw(2) if lb.winfo_exists() else None)
+
+        def wheel(e):
+            v["zoom"] = max(0.6, min(1.8, v["zoom"] * (1.1 if e.delta > 0 else 1 / 1.1)))
+            later(2)
+            return "break"
+
+        def reset(e=None):
+            v.update(yaw=30.0, pitch=10.0, zoom=1.0)
+            draw(2)
+        lb.bind("<ButtonPress-1>", press)
+        lb.bind("<B1-Motion>", move)
+        lb.bind("<ButtonRelease-1>", release)
+        lb.bind("<MouseWheel>", wheel)
+        lb.bind("<Double-Button-1>", reset)
+        draw(2)
+        if controls:
+            ctl = tk.Frame(fr, bg=bg)
+            ctl.pack(pady=(6, 0))
+
+            def flip(key):
+                v[key] = not v[key]
+                if key == "cape" and v["cape"]:
+                    v["elytra"] = False
+                if key == "elytra" and v["elytra"]:
+                    v["cape"] = False
+                for w_ in ctl.winfo_children():
+                    w_.destroy()
+                fill_ctl()
+                draw(2)
+
+            def fill_ctl():
+                if cape:
+                    chip(ctl, "Плащ", v["cape"], lambda: ctl.after(1, lambda: flip("cape")), size=8).pack(side="left", padx=(0, 4))
+                    chip(ctl, "Элитры", v["elytra"], lambda: ctl.after(1, lambda: flip("elytra")), size=8).pack(side="left", padx=(0, 4))
+                chip(ctl, "Шаг", v["walk"], lambda: ctl.after(1, lambda: flip("walk")), size=8).pack(side="left", padx=(0, 4))
+                chip(ctl, "Сбросить", False, reset, size=8).pack(side="left")
+            fill_ctl()
+        return fr
+
+    def skin3d_window(title, png, slim=None, cape=None):
+        """Скин в 3D крупно - внутри окна программы."""
+        t = new_window()
+        t.title(title or "Скин в 3D")
+        t.configure(bg=BG)
+        t.geometry("660x500")
+        fr = tk.Frame(t, bg=BG, padx=20, pady=14)
+        fr.pack(fill="both", expand=True)
+        box = tk.Frame(fr, bg=PANEL, padx=14, pady=10)
+        island(box, vines=False, radius=12)
+        box.pack(side="left", anchor="n")
+        skin3d_view(box, png, slim, cape, size=(250, 330), bg=PANEL).pack()
+        info = tk.Frame(fr, bg=BG, padx=18)
+        info.pack(side="left", fill="y")
+        tk.Label(info, text=title or "Скин", font=(FONT, 15, "bold"), fg=TEXT, bg=BG, anchor="w", justify="left",
+                 wraplength=260).pack(fill="x")
+        for line in ("Тяни мышью - персонаж повернётся.", "Колесо мыши - ближе или дальше.",
+                     "Двойной щелчок - вернуть как было.") + (("Плащ и элитры - кнопками под скином.",) if cape else ()):
+            tk.Label(info, text="• " + line, font=(FONT, 9), fg=MUTED, bg=BG, anchor="w", justify="left",
+                     wraplength=260).pack(fill="x", pady=(4, 0))
+        small_button(info, "Закрыть", t.destroy, bg=BG).pack(side="bottom", anchor="w")
+
+    def skin_card(parent, col, row, title, sub, png, slim, buttons_, cape=None):
         c = card(parent, col, row)
         top = tk.Frame(c, bg=CARD)
         top.pack(fill="x")
-        pv = tk.Label(top, bg=CARD, image=blank(180, 160))
+        pv = tk.Label(top, bg=CARD, image=blank(180, 160), cursor="hand2" if skin3d else "")
         pv.pack(side="left")
         want_pic("skin:%s:%s" % (hashlib.sha1(png).hexdigest()[:16], slim), skin_photo_producer(png, slim, 5), pv)
+        if skin3d is not None:
+            pv.bind("<Button-1>", lambda e: win.after(10, lambda: skin3d_window(title, png, slim, cape)))
+            buttons_ = list(buttons_) + [("small", "Покрутить в 3D", lambda: win.after(10, lambda: skin3d_window(
+                title, png, slim, cape)),
+                                          "ic_search.png")]
         info = tk.Frame(top, bg=CARD, padx=12)
         info.pack(side="left", fill="both", expand=True)
         tk.Label(info, text=title, font=(FONT, 13, "bold"), fg=TEXT, bg=CARD, anchor="w", justify="left",
@@ -15398,7 +16025,7 @@ def gui():
                 sub = "%s · %s%s" % (r["source"], "тонкие руки" if r["slim"] else "обычные руки",
                                      " · есть плащ" if r.get("cape") else "")
                 skin_card(inner, i % 2, row + i // 2, sk["nick"], sub, r["skin"], r["slim"],
-                          [("big", "Сохранить себе", save_it, "ic_backup.png")])
+                          [("big", "Сохранить себе", save_it, "ic_backup.png")], cape=r.get("cape"))
             row += (len(sk["found"]) + 1) // 2
         # Мои скины
         mine = my_skins()
@@ -15426,7 +16053,7 @@ def gui():
                       ("тонкие руки" if m.get("slim") else "обычные руки") + (" · с плащом" if cape else "")
                       + (" · " + m["source"] if m.get("source") else ""), png, m.get("slim"),
                       [("big", "Надеть", lambda p=path, c=cape, n=m["name"]: wear_dialog(p, c, n), "ic_check.png"),
-                       ("small", "Удалить", rm, "ic_delete.png")])
+                       ("small", "Удалить", rm, "ic_delete.png")], cape=cape)
         row += (len(mine) + 1) // 2
         capes = sorted(f for f in _listdir(os.path.join(SKINS_DIR, "Плащи")) if f.lower().endswith(".png"))
         if capes:
@@ -15986,6 +16613,10 @@ def gui():
             win.update()
             srv_.stop()
         pic_pool.shutdown(wait=False, cancel_futures=True)
+        try:
+            voice_stop()
+        except Exception:
+            pass
         s = load_settings()
         if win.state() == "normal":
             s["geometry"] = win.geometry()
@@ -16076,6 +16707,7 @@ def gui():
             save_settings(s)
             win.after(2500, lambda: toast("Сделать ярлык программы на рабочем столе и в меню «Пуск»?", "info",
                                           ("Создать ярлык", make_shortcuts), 12000))
+    win.after(45000, auto_mod_check)  # после запуска, когда всё остальное уже загрузилось
     wait = max(0, int(1150 - (time.perf_counter() - splash_t0) * 1000))
     win.after(wait, reveal)
     win.mainloop()
