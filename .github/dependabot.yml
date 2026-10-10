@@ -1,0 +1,8 @@
+# Сборка на GitHub Actions: Dependabot сам предлагает обновить действия (checkout, setup-python, upload-artifact),
+# когда выходят новые версии или исправления безопасности.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
