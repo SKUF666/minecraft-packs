@@ -1,6 +1,7 @@
-# Сборка Portalis.exe на GitHub: из исходника src/PackSwitcher.pyw, тем же скриптом, что и локально.
-# Подпись: после одобрения заявки SignPath Foundation сюда добавляется шаг
-# signpath/github-action-submit-signing-request (секрет SIGNPATH_API_TOKEN, organization-id, project-slug).
+# Сборка Portalis.exe на GitHub: из исходника src/PackSwitcher.pyw (+ модули рядом), тем же скриптом, что и локально.
+# Подпись SignPath Foundation включается сама, когда в настройках репозитория есть секрет SIGNPATH_API_TOKEN
+# и переменные SIGNPATH_ORGANIZATION_ID, SIGNPATH_PROJECT_SLUG, SIGNPATH_POLICY_SLUG (их выдаёт SignPath после одобрения).
+# Выпуск: python tools/release.py --note "..." - запускает эту сборку, берёт отсюда exe и публикует.
 name: Build Portalis
 on:
   workflow_dispatch:
@@ -8,9 +9,12 @@ on:
     tags: ['v*']
 permissions:
   contents: read
+  actions: read
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      HAS_SIGNPATH: ${{ secrets.SIGNPATH_API_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,8 +24,28 @@ jobs:
         run: python -m pip install --upgrade pip pyinstaller pillow
       - name: Build Portalis.exe
         run: python tools/build_exe.py --ci
-      - uses: actions/upload-artifact@v4
+      - name: Upload unsigned exe
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.HAS_SIGNPATH == 'true' && 'Portalis-unsigned' || 'Portalis' }}
+          path: dist/Portalis.exe
+          if-no-files-found: error
+      - name: Sign with SignPath
+        if: env.HAS_SIGNPATH == 'true'
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.upload.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed
+      - name: Upload signed exe
+        if: env.HAS_SIGNPATH == 'true'
+        uses: actions/upload-artifact@v4
         with:
           name: Portalis
-          path: dist/Portalis.exe
+          path: signed/Portalis.exe
           if-no-files-found: error
