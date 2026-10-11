@@ -119,6 +119,9 @@ def load_lang(lang):
     except (OSError, ValueError):
         return
     _TR.update(d)
+    for ru, en in d.items():  # «   Ищу...» в словаре с пробелами - найдётся и без них (когда фразу склеили с другой)
+        if ru.strip() != ru and ru.strip():
+            _TR.setdefault(ru.strip(), en.strip())
     for ru, en in d.items():
         if "%" not in ru or not _TR_PH.search(ru):
             continue
@@ -145,7 +148,7 @@ def tr(text):
     hit = _TR_CACHE.get(text)
     if hit is not None:
         return hit
-    out = None
+    out = partial = None
     core = text.strip()
     if core != text and core:  # те же слова с пробелами по краям
         inner = tr(core)
@@ -155,6 +158,8 @@ def tr(text):
         parts_ = [tr(x) for x in core.split(", ")]  # перечисление: «Карты, Сборки»
         if any(a_ != b_ for a_, b_ in zip(parts_, core.split(", "))):
             out = text.replace(core, ", ".join(parts_))
+            if _TR_CYR.search(out):  # переведена только часть - сначала попробуем другие способы
+                partial, out = out, None
     if out is None:
         for prefix, _x, rx, en in _TR_TPL:
             if prefix and not text.startswith(prefix):
@@ -168,6 +173,22 @@ def tr(text):
         m = re.match(r"^(.*?(?::|—|·) )(.+)$", text, re.S)
         if m and (m.group(1) in _TR or m.group(1).strip() in _TR):
             out = tr(m.group(1)) + tr(m.group(2))
+    if out is None:  # «1.  Отключи шифрование...» - номер шага отдельно
+        m = re.match(r"^(\s*(?:\d+[.)]|[-+−•●▶✓])\s+)(.+)$", text, re.S)  # и «+  плюс», «−  минус»
+        if m:
+            rest = tr(m.group(2))
+            if rest != m.group(2):
+                out = m.group(1) + rest
+    if out is None and "·" in core:  # «Fabric 26.1.2 · выбрано 3»: каждая часть сама по себе
+        parts_ = re.split(r"(\s*·\s*)", text)
+        tp = [x if i % 2 else tr(x) for i, x in enumerate(parts_)]
+        if tp != parts_:
+            out = "".join(tp)
+    if out is None and "  " in core:  # «Скачать  Minecraft 26.1.2», «фраза.   Ищу...»: части через двойной пробел
+        parts_ = re.split(r"(\s{2,})", core)
+        tp = [x if i % 2 else tr(x) for i, x in enumerate(parts_)]
+        if tp != parts_:
+            out = text.replace(core, "".join(tp))
     if out is None:  # «14.9 млн», «3 МБ»
         m = re.match(r"^([-+]?[\d.,]+) ([А-Яа-яЁё.]+)$", text)
         if m and m.group(2) in _TR:
@@ -175,7 +196,7 @@ def tr(text):
     if out is None and "\n" in text:
         out = "\n".join(tr(x) for x in text.split("\n"))
     if out is None:
-        out = text
+        out = partial or text
     if len(_TR_CACHE) > 6000:
         _TR_CACHE.clear()
     _TR_CACHE[text] = out
@@ -1934,7 +1955,7 @@ def _tr_chunks(text, limit=_TR_CHUNK):
         else:
             pieces.append((line, end_sep))
 
-    chunks, buf, size = [], "", 0
+    chunks, buf, size, last_sep = [], "", 0, ""
     for frag, sep in pieces:
         if buf and size + len(frag) > limit:
             chunks.append((buf[:-len(last_sep)] if last_sep else buf, last_sep))
@@ -1959,11 +1980,12 @@ def _tr_piece(piece, target, source):
 _TR_POOL = concurrent.futures.ThreadPoolExecutor(1)  # переводы в фоне - в одном постоянном потоке
 
 
-def translate(text, target="ru", source="auto", cache_path=TR_CACHE):
+def translate(text, target=None, source="auto", cache_path=TR_CACHE):
     """Переводит text на язык target. Абзацы и переводы строк сохраняются.
     Короткий текст уходит GET-запросом, длинный (>1500) — POST, текст длиннее
     1800 символов режется по абзацам. При любой ошибке возвращает исходный текст.
     cache_path — необязательный JSON-файл для кэша между запусками."""
+    target = target or LANG  # по умолчанию - на язык интерфейса (в английском режиме описания не русифицируем)
     if not isinstance(text, str) or not text.strip():
         return text
     key = _tr_key(text, target, source)
@@ -1984,10 +2006,11 @@ def translate(text, target="ru", source="auto", cache_path=TR_CACHE):
     return result
 
 
-def translate_many(texts, target="ru", source="auto", cache_path=TR_CACHE):
+def translate_many(texts, target=None, source="auto", cache_path=TR_CACHE):
     """Переводит список коротких строк, упаковывая несколько строк в один запрос
     через разделитель "\\n§§§\\n". Если Google испортил разделитель и число частей
     не совпало, пачка переводится по одной строке. Порядок сохраняется."""
+    target = target or LANG
     texts = list(texts)
     result = list(texts)
     pending = []  # индексы, которые надо перевести
@@ -2048,12 +2071,13 @@ _TR_CYR_RE = re.compile(r"[Ѐ-ӿ]")
 _TR_LAT_RE = re.compile(r"[A-Za-z]")
 
 
-def needs_translation(text, target="ru"):
+def needs_translation(text, target=None):
     """Эвристика: нужен ли перевод на target.
     ru: False, если текст в основном кириллический; True, если в основном латиница
         (или другой алфавит, например китайский).
     en: наоборот — True для кириллицы и других алфавитов, False для латиницы.
     Ссылки не учитываются. Пустой текст или текст без букв — False."""
+    target = target or LANG
     if not isinstance(text, str):
         return False
     clean = _TR_URL_RE.sub(" ", text)
@@ -2408,9 +2432,9 @@ def web_maps_page(wm):
             items, nxt = mm_list(pg, cat, ver, wm.get("sort"), q)
         else:
             items, nxt = cf_maps(pg, cat, ver, wm.get("sort"), q)
-        if src != "mi" and items:  # описания английских каталогов - по-русски (одним запросом, с кэшем)
-            ru = translate_many([x.get("desc", "") for x in items])
-            for x, d in zip(items, ru):
+        tx = [x for x in items if needs_translation(x.get("desc", ""))]
+        if tx:  # описания - на язык интерфейса (одним запросом, с кэшем): английские по-русски и наоборот
+            for x, d in zip(tx, translate_many([x.get("desc", "") for x in tx])):
                 x["desc"] = d
         return pg, items, nxt
     todo = [x for x in srcs if x not in done and time.time() - _WM_DOWN.get(x, 0) > 600]
@@ -4117,6 +4141,31 @@ def vtuple(v):
         return tuple(int(x) for x in str(v).split("."))
     except ValueError:
         return (0,)
+
+
+ERROR_LOG = os.path.join(ROOT, "errors.log")
+
+
+def log_error(where, exc_info=None):
+    """Ошибка -> errors.log в папке Portalis (последние ~300 КБ). В exe без консоли иначе она пропадает молча.
+    Возвращает последнюю строку ошибки (для сообщения в окне)."""
+    import traceback
+    try:
+        text = "".join(traceback.format_exception(*(exc_info or sys.exc_info())))
+    except Exception:
+        text = "?"
+    try:
+        if os.path.isfile(ERROR_LOG) and os.path.getsize(ERROR_LOG) > 300 << 10:
+            with open(ERROR_LOG, encoding="utf-8", errors="replace") as fh:
+                old = fh.read()[-150 << 10:]
+            with open(ERROR_LOG, "w", encoding="utf-8") as fh:
+                fh.write(old)
+        with open(ERROR_LOG, "a", encoding="utf-8") as fh:
+            fh.write("\n=== %s  %s  версия %s\n%s" % (time.strftime("%Y-%m-%d %H:%M:%S"), where,
+                                                      load_local_manifest().get("version", "?"), text))
+    except OSError:
+        pass
+    return (text.strip().splitlines() or ["?"])[-1][:160]
 
 
 def load_local_manifest(root=ROOT):
@@ -7309,9 +7358,11 @@ def hero_pil(name, w, h, pbg, r=14, vines=True, seed=3, frame="panel"):
     im = cover_pil(name, w, h, 1.0, 0.45)
     shade = PILImage.new("RGBA", (w, h), (0, 0, 0, 0))
     sd = ImageDraw.Draw(shade)
-    sw = max(1, int(w * 0.5))
+    # затемнение держится под всем текстом (до ~540 px) и только потом сходит на нет - буквы не лезут на картинку
+    sw = max(1, min(w, max(int(w * 0.55), 820)))
     for x in range(0, sw, 2):
-        a = int(175 * (1 - x / float(sw)) ** 1.8)
+        t = max(0.0, (x - 0.45 * sw) / (0.55 * sw))
+        a = int(190 * (1 - t) ** 1.5)
         sd.rectangle((x, 0, x + 1, h), fill=_hex(BG, a))
     im.alpha_composite(shade)
     frame = style_frame(frame) if frame else None
@@ -7623,6 +7674,7 @@ if getattr(sys, "frozen", False):
 
 def gui():
     import tkinter as tk
+    import tkinter.font as tkfont
     from tkinter import messagebox, simpledialog, filedialog, colorchooser
     _tk_messagebox, _tk_simpledialog = messagebox, simpledialog
 
@@ -7634,6 +7686,29 @@ def gui():
     apply_theme(load_settings().get("theme"))
     win = tk.Tk()
     win.withdraw()
+    err_seen = {"t": 0, "n": 0}
+
+    def on_tk_error(exc, val, tb):
+        """Ошибка в обработчике кнопки или таймера: в журнал и коротко в окно (не чаще раза в 20 секунд)."""
+        last = log_error("окно", (exc, val, tb))
+        err_seen["n"] += 1
+        if time.time() - err_seen["t"] > 20:
+            err_seen["t"] = time.time()
+            try:
+                toast("Что-то пошло не так: %s. Подробности - в errors.log (кнопка «Папка Portalis»)." % last, "err",
+                      ms=8000)
+            except Exception:
+                pass
+        try:  # и как раньше (в консоли - текст ошибки; проверочные прогоны ловят её здесь же)
+            tk.Tk.report_callback_exception(win, exc, val, tb)
+        except Exception:
+            pass
+    win.report_callback_exception = on_tk_error
+    try:  # ошибки фоновых потоков - тоже в журнал
+        threading.excepthook = lambda a: log_error("поток %s" % getattr(a.thread, "name", "?"),
+                                                   (a.exc_type, a.exc_value, a.exc_traceback))
+    except Exception:
+        pass
     win.title(APP_NAME + tr(" — карты, сборки и серверы Minecraft"))
     win.geometry("1080x760")
     win.minsize(1000, 660)
@@ -9360,8 +9435,9 @@ def gui():
         f = tk.Frame(inner, bg=BG)
         f.grid(row=row, column=0, columnspan=2, sticky="we", padx=(0, 14), pady=(4, 10))
         tk.Label(f, text=text, font=(FONT, 14, "bold"), fg=TEXT, bg=BG).pack(side="left")
-        if sub:
-            tk.Label(f, text="   " + sub, font=(FONT, 10), fg=MUTED, bg=BG).pack(side="left", pady=(3, 0))
+        if sub:  # подпись уступает место кнопкам справа (поиск и т. п.) и в узком окне сокращается многоточием
+            elide_label(tk.Label(f, font=(FONT, 10), fg=MUTED, bg=BG, width=1, anchor="w"), sub).pack(
+                side="left", fill="x", expand=True, padx=(12, 8), pady=(3, 0))
         return f
 
     # --- фоновые задачи, чтобы окно не зависало ---
@@ -10075,6 +10151,8 @@ def gui():
             tk.Label(info, text=m["title"], font=(FONT, 15, "bold"), fg=TEXT, bg=CARD, anchor="w").pack(fill="x")
             bl = tk.Frame(info, bg=CARD)
             bl.pack(fill="x", pady=(4, 6))
+            if map_key(m):  # сердечко - первым, чтобы в узком окне его не вытеснили значки
+                fav_heart(bl, map_key(m)).pack(side="right")
             badge(bl, m["version"], BLUE, "white").pack(side="left", padx=(0, 6))
             badge(bl, m["genre"]).pack(side="left", padx=(0, 6))
             if m.get("user"):
@@ -10082,8 +10160,6 @@ def gui():
             miss = not_downloaded(map_item_id(m))
             dl_badge(bl, miss)
             rating_slot(bl, map_key(m), CARD)
-            if map_key(m):
-                fav_heart(bl, map_key(m)).pack(side="right")
             pl = tk.Frame(info, bg=CARD)
             pl.pack(fill="x")
             tk.Label(pl, text=m["players"], font=(FONT, 9), fg=MUTED, bg=CARD).pack(side="left")
@@ -10675,6 +10751,12 @@ def gui():
             name, _, modes = s["name"].partition(" - ")
             btns = tk.Frame(r, bg=r["bg"])  # кнопки - первыми: в узком окне сжимается текст, а не они
             btns.pack(side="right")
+            # справа налево: версии и адрес не сжимаются, ужимается только список режимов
+            vl = "%s   %s" % (s.get("versions", ""), s.get("lang", ""))
+            tk.Label(r, text=vl.strip(), font=(FONT, 9), fg=MUTED, bg=r["bg"], anchor="w",
+                     width=16 if vl.strip() else 0).pack(side="right", padx=(0, 6))
+            tk.Label(r, text=s["ip"], font=("Consolas", 10), fg=ACCENT_HI, bg=r["bg"], anchor="w",
+                     width=max(18, len(s["ip"]) + 1)).pack(side="right")
             icon = os.path.join(ROOT, s.get("icon", ""))
             if s.get("icon") and os.path.isfile(icon):
                 tk.Label(r, image=image(icon), bg=r["bg"]).pack(side="left", padx=(0, 12))
@@ -10685,10 +10767,8 @@ def gui():
             lab = tk.Label(nf, text=srv_text(st), font=(FONT, 8, "bold"), fg=srv_color(st), bg=r["bg"], anchor="w")
             lab.pack(anchor="w")
             srv_labels[s["ip"]] = lab
-            tk.Label(r, text=modes, font=(FONT, 10), fg="#c3c7d1", bg=r["bg"], width=22, anchor="w").pack(side="left")
-            tk.Label(r, text=s["ip"], font=("Consolas", 10), fg=ACCENT_HI, bg=r["bg"], width=23, anchor="w").pack(side="left")
-            tk.Label(r, text="%s   %s" % (s.get("versions", ""), s.get("lang", "")), font=(FONT, 9),
-                     fg=MUTED, bg=r["bg"], anchor="w").pack(side="left")
+            elide_label(tk.Label(r, font=(FONT, 10), fg="#c3c7d1", bg=r["bg"], width=1, anchor="w"), modes).pack(
+                side="left", fill="x", expand=True, padx=(0, 8))
 
             def copy(ip=s["ip"]):
                 win.clipboard_clear(); win.clipboard_append(ip)
@@ -11105,6 +11185,7 @@ def gui():
     pic_cache = {}       # ключ -> PIL-картинка (None - не удалось)
     pic_wait = {}        # ключ -> [виджеты, ждущие картинку]
     pic_busy = set()
+    pic_failed = {}      # ключ -> когда не удалось загрузить (через минуту можно снова)
     pic_pool = concurrent.futures.ThreadPoolExecutor(6)
 
     def blank(w, h):
@@ -11126,17 +11207,25 @@ def gui():
         if key in pic_cache:
             if pic_cache[key] is not None:
                 widget.configure(image=pil_photo(pic_cache[key], keep))
-            return
+                return
+            if time.time() - pic_failed.get(key, 0) < 60:
+                return
+            pic_cache.pop(key, None)  # не загрузилась минуту назад - пробуем снова (сеть могла моргнуть)
+            pic_busy.discard(key)
         pic_wait.setdefault(key, []).append(widget)
         if key in pic_busy:
             return
         pic_busy.add(key)
 
         def job():
-            try:
-                pic_cache[key] = producer()
-            except Exception:
-                pic_cache[key] = None
+            for i in range(3):  # картинки из сети: пара повторов, иначе в галерее остаются пустые клетки
+                try:
+                    pic_cache[key] = producer()
+                    return
+                except Exception:
+                    time.sleep(1.0 + i)
+            pic_failed[key] = time.time()
+            pic_cache[key] = None
         pic_pool.submit(job)
         if not state.get("pic_poll"):
             state["pic_poll"] = True
@@ -11176,8 +11265,8 @@ def gui():
         hid = hc.create_image(0, 0, anchor="nw")
         for dx, dy, color in ((2, 2, "#000000"), (0, 0, "white")):
             hc.create_text(42 + dx, 52 + dy, text=title, font=(FONT, 19, "bold"), fill=color, anchor="w")
-        hc.create_text(43, 88, text=sub, font=(FONT, 10), fill="#000000", anchor="w", width=560)
-        hc.create_text(42, 87, text=sub, font=(FONT, 10), fill="#d7deea", anchor="w", width=560)
+        hc.create_text(43, 88, text=sub, font=(FONT, 10), fill="#000000", anchor="w", width=500)
+        hc.create_text(42, 87, text=sub, font=(FONT, 10), fill="#d7deea", anchor="w", width=500)
         st = {"w": 0, "ph": None}
 
         def paint(e=None):
@@ -11194,6 +11283,30 @@ def gui():
         hc.bind("<Configure>", lambda e: hc.after(30, paint))
         return hc
 
+    def elide_label(lb, text):
+        """Надпись, которая в узком месте обрезается многоточием («BedWars, SkyWars, Mu…»), а не посреди буквы."""
+        f = tkfont.Font(font=lb.cget("font"))
+        full = tr(text)
+
+        def fit(e=None):
+            w = lb.winfo_width() - 4
+            if w < 8:
+                return
+            if f.measure(full) <= w:
+                lb.configure(text=full)
+                return
+            lo, hi = 0, len(full)
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if f.measure(full[:mid].rstrip(" ,·") + "…") <= w:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            lb.configure(text=full[:lo].rstrip(" ,·") + "…" if lo else "")
+        lb.configure(text=full)
+        lb.bind("<Configure>", fit, add="+")
+        return lb
+
     def chip_row(parent, items, current, on_pick, bg=BG):
         for value, text in items:
             chip(parent, text, current == value, lambda v=value: on_pick(v)).pack(side="left", padx=(0, 5), pady=1)
@@ -11201,9 +11314,9 @@ def gui():
     def fmt_count(n):
         n = int(n or 0)
         if n >= 1000000:
-            return "%.1f млн" % (n / 1e6)
+            return ("%.1fM" if LANG == "en" else "%.1f млн") % (n / 1e6)
         if n >= 1000:
-            return "%d тыс." % (n // 1000)
+            return ("%dK" if LANG == "en" else "%d тыс.") % (n // 1000)
         return str(n)
 
     def plural(n, one, few, many):
@@ -11398,8 +11511,9 @@ def gui():
         ne.insert(0, cb["name"])
         ne.pack(side="left", padx=(8, 10), ipady=3)
         ne.bind("<KeyRelease>", lambda ev: cb.update(name=ne.get()))
-        tk.Label(top, text="%s %s · %s %d %s" % (LOADER_TITLES[cb["loader"]], cb["gv"], "выбрано" if n_sel != 1 else "выбран",
-                                               n_sel, plural(n_sel, "проект", "проекта", "проектов")),
+        sel_t = ("%d selected" % n_sel if LANG == "en" else "%s %d %s" % (
+            "выбрано" if n_sel != 1 else "выбран", n_sel, plural(n_sel, "проект", "проекта", "проектов")))
+        tk.Label(top, text="%s %s · %s" % (LOADER_TITLES[cb["loader"]], cb["gv"], sel_t),
                  font=(FONT, 10), fg=MUTED, bg=CARD).pack(side="left")
         if n_sel:
             big_button(top, "Собрать сборку", lambda: builder_build(), icon="ic_add.png").pack(side="right")
@@ -16033,7 +16147,7 @@ def gui():
         row += 1
         if not mine:
             tk.Label(inner, text="Пока пусто. Найди скин по нику, выбери стандартный или из галереи ниже — "
-                                 "или добавь свой PNG кнопкой «Добавить из файла».", font=(FONT, 10), fg=MUTED, bg=BG,
+                                 "или добавь свой PNG кнопкой «Загрузить скин».", font=(FONT, 10), fg=MUTED, bg=BG,
                      anchor="w", justify="left", wraplength=900).grid(row=row, column=0, columnspan=2, sticky="we",
                                                                       pady=(0, 12))
             row += 1
@@ -16636,12 +16750,160 @@ def gui():
         win.destroy()
     win.protocol("WM_DELETE_WINDOW", on_close)
 
+    # --- быстрый поиск по всему (Ctrl+K): карты, сборки, серверы, свои скины, вкладки и действия ---
+    TAB_TITLES = {"maps": "Карты", "packs": "Сборки", "builder": "Конструктор", "skins": "Скины", "versions": "Версии",
+                  "servers": "Серверы", "friend": "Друзья", "launchers": "Лаунчеры"}
+
+    def qs_index():
+        """Всё, что можно найти: (что это, название, подробности, слова для поиска, действие)."""
+        out = []
+        for k in TAB_ORDER:
+            out.append(("вкладка", TAB_TITLES[k], "Ctrl+%d" % (TAB_ORDER.index(k) + 1), "",
+                        lambda k=k: show(k)))
+        acts = [("Оформление", "темы, рамки, язык / language", "тема стиль цвет language", style_window),
+                ("Сделать скин", "мастерская скинов", "скин персонаж мастерская", lambda: (
+                    state.update(skinws_open=True), show("skins", animated=False))),
+                ("Сделать плащ", "мастерская плащей", "плащ cape", lambda: (
+                    state.update(cape_open=True), show("skins", animated=False))),
+                ("Проверить обновления", "новая версия Portalis и каталога", "обновить update",
+                 lambda: check_updates(manual=True)),
+                ("Папка игры", MC, ".minecraft saves", lambda: os.makedirs(MC, exist_ok=True) or os.startfile(MC)),
+                ("Папка Portalis", ROOT, "данные", lambda: os.startfile(ROOT)),
+                ("Своя сборка", "собрать сборку из любых модов", "моды конструктор", lambda: show("builder"))]
+        if soc().ready():
+            acts += [("Облако и резервные копии", "миры в облаке, копии по расписанию", "бэкап backup мир",
+                      cloud_window),
+                     ("Создать пати", "позвать друзей играть вместе", "пати друзья party", party_create_window),
+                     ("Мой профиль", "аватар, статус, достижения", "профиль аккаунт", open_my_profile)]
+        else:
+            acts.append(("Войти", "друзья, пати, чат и облако", "аккаунт вход регистрация", login_window))
+        for title, sub, words, fn in acts:
+            out.append(("действие", title, sub, words, fn))
+        for m in find_maps():
+            out.append(("карта", m["title"], "%s · %s" % (m["version"], m.get("genre", "")),
+                        " ".join(str(m.get(k_, "")) for k_ in ("desc", "players", "author")), lambda m=m: open_map(m)))
+        for p in find_packs():
+            out.append(("сборка", p["name"].rsplit(" (", 1)[0], p["name"].rsplit(" (", 1)[-1].rstrip(")")
+                        if " (" in p["name"] else "", " ".join(str(x) for x in (p.get("mr_files") or {})),
+                        lambda p=p: open_pack(p)))
+        for sv in load_servers():
+            name, _, modes = sv["name"].partition(" - ")
+            out.append(("сервер", name, sv["ip"], modes + " " + str(sv.get("note", "")), lambda sv=sv: open_server(sv)))
+        for m in my_skins():
+            def see(m=m):
+                path = os.path.join(SKINS_DIR, m["file"])
+                cape = os.path.join(SKINS_DIR, m["cape"]) if m.get("cape") else None
+                show("skins", animated=False)
+                if skin3d is not None:
+                    win.after(200, lambda: skin3d_window(m["name"], open(path, "rb").read(), m.get("slim"), cape))
+            out.append(("скин", m["name"], "мои скины", "скин", see))
+        return out
+
+    def qs_rank(items, q):
+        q = q.strip().lower()
+        if not q:  # пусто - вкладки и действия
+            return [x for x in items if x[0] in ("вкладка", "действие")][:9]
+        words = q.split()
+        res = []
+        for x in items:
+            kind, title, sub, more = x[0], x[1], x[2], x[3]
+            t_ = (title + " " + tr(title)).lower()
+            hay = " ".join((t_, sub.lower(), tr(sub).lower(), more.lower(), tr(more).lower(), kind, tr(kind).lower()))
+            if not all(w in hay for w in words):
+                continue
+            score = 0 if t_.startswith(q) or tr(title).lower().startswith(q) else 1 if q in t_ else 2
+            res.append((score, len(title), x))
+        res.sort(key=lambda r: (r[0], r[1]))
+        return [r[2] for r in res[:9]]
+
+    def quick_search(e=None):
+        """Окошко поиска по всей программе: печатаешь - сразу видно, стрелки и Enter - открыть."""
+        if state.get("busy_modal"):
+            return "break"
+        close_popup()
+        t = InPage("popup", esc=False)
+        popup_st["w"] = t
+        fr = tk.Frame(t, bg=CARD, padx=20, pady=16)
+        fr.pack(fill="both", expand=True)
+        island(fr, frame="card")
+        hd = tk.Frame(fr, bg=CARD)
+        hd.pack(fill="x")
+        tk.Label(hd, image=art("ic_search.png", 20, 20), bg=CARD).pack(side="left")
+        tk.Label(hd, text="  Быстрый поиск", font=(FONT, 13, "bold"), fg=TEXT, bg=CARD).pack(side="left")
+        tk.Label(hd, text="↑ ↓ и Enter - открыть, Esc - закрыть", font=(FONT, 9), fg=MUTED, bg=CARD).pack(side="right")
+        en = REntry(fr, font=(FONT, 13), bg=CARD_HI, fg=TEXT, insertbackground=TEXT, relief="flat",
+                    highlightthickness=1, highlightbackground=LINE, highlightcolor=ACCENT)
+        en.pack(fill="x", pady=(10, 8), ipady=6)
+        box = tk.Frame(fr, bg=CARD)
+        box.pack(fill="both", expand=True)
+        items = qs_index()
+        st = {"hits": [], "sel": 0, "rows": []}
+        kind_col = {"карта": BLUE, "сборка": "#7a5cc4", "сервер": "#3a8f6a", "скин": "#b0703a", "вкладка": "#4a5060",
+                    "действие": ACCENT}
+
+        def run(i):
+            if 0 <= i < len(st["hits"]):
+                fn = st["hits"][i][4]
+                close_popup()
+                win.after(10, fn)
+
+        def paint():
+            for i, (row, labs) in enumerate(st["rows"]):
+                bg = CARD_HI if i == st["sel"] else CARD
+                for w_ in (row,) + labs:
+                    w_.configure(bg=bg)
+
+        def fill(e=None):
+            if e is not None and e.keysym in ("Up", "Down", "Return", "Escape"):
+                return
+            for w_ in box.winfo_children():
+                w_.destroy()
+            st["hits"], st["sel"], st["rows"] = qs_rank(items, en.get()), 0, []
+            if not st["hits"]:
+                tk.Label(box, text="Ничего не нашлось. Попробуй другое слово.", font=(FONT, 10), fg=MUTED, bg=CARD,
+                         anchor="w").pack(fill="x", pady=8)
+            for i, (kind, title, sub, _m, _fn) in enumerate(st["hits"]):
+                row = tk.Frame(box, bg=CARD, padx=8, pady=5, cursor="hand2")
+                row.pack(fill="x")
+                k_ = tk.Label(row, text=" %s " % kind, font=(FONT, 8, "bold"), fg="white", bg=kind_col.get(kind, BLUE),
+                              width=9)
+                k_.pack(side="left")
+                a_ = tk.Label(row, text="  " + title, font=(FONT, 11, "bold"), fg=TEXT, bg=CARD, anchor="w")
+                a_.pack(side="left")
+                b_ = tk.Label(row, text="   " + sub, font=(FONT, 9), fg=MUTED, bg=CARD, anchor="w")
+                b_.pack(side="left", fill="x", expand=True)
+                st["rows"].append((row, (a_, b_)))
+                for w_ in (row, k_, a_, b_):
+                    w_.bind("<Button-1>", lambda e, i=i: run(i))
+                    w_.bind("<Enter>", lambda e, i=i: (st.update(sel=i), paint()))
+            paint()
+            place()
+
+        def move(d):
+            if st["hits"]:
+                st["sel"] = (st["sel"] + d) % len(st["hits"])
+                paint()
+            return "break"
+
+        def place():
+            t.update_idletasks()
+            W = min(680, max(420, win.winfo_width() - 80))
+            H = t.winfo_reqheight()
+            t.geometry("%dx%d+%d+%d" % (W, H, win.winfo_rootx() + (win.winfo_width() - W) // 2, win.winfo_rooty() + 110))
+        en.bind("<KeyRelease>", fill)
+        en.bind("<Down>", lambda e: move(1))
+        en.bind("<Up>", lambda e: move(-1))
+        en.bind("<Return>", lambda e: (run(st["sel"]), "break")[1])
+        en.bind("<Escape>", lambda e: (close_popup(), "break")[1])
+        t.bind("<Escape>", close_popup)
+        fill()
+        t.after(30, en.focus_set)
+        return "break"
+
     def focus_search(e=None):
         en = state.get("search_entry")
-        if state["tab"] not in ("maps", "packs"):
-            show("maps")
-            win.after(350, focus_search)
-            return
+        if state["tab"] not in ("maps", "packs"):  # на остальных вкладках Ctrl+F - быстрый поиск по всему
+            return quick_search()
         try:
             en.focus_set()
             en.select_range(0, "end")
@@ -16649,6 +16911,9 @@ def gui():
             pass
     for key in ("<Control-f>", "<Control-F>", "<Control-Cyrillic_a>", "<Control-Cyrillic_A>"):
         win.bind_all(key, focus_search)
+    for key in ("<Control-k>", "<Control-K>", "<Control-Cyrillic_el>", "<Control-Cyrillic_EL>"):
+        win.bind_all(key, quick_search)
+    win._hooks["quick_search"] = quick_search
     for i, k in enumerate(TAB_ORDER, 1):
         win.bind_all("<Control-Key-%d>" % i, lambda e, k=k: show(k))
     win.bind_all("<F5>", lambda e: (state.update(installed_launchers=None, net_cache=None), show(state["tab"], animated=False)))
@@ -16708,6 +16973,15 @@ def gui():
             win.after(2500, lambda: toast("Сделать ярлык программы на рабочем столе и в меню «Пуск»?", "info",
                                           ("Создать ярлык", make_shortcuts), 12000))
     win.after(45000, auto_mod_check)  # после запуска, когда всё остальное уже загрузилось
+
+    def qs_tip():  # один раз: рассказать про быстрый поиск
+        st_ = load_settings()
+        if not st_.get("qs_tip"):
+            st_["qs_tip"] = 1
+            save_settings(st_)
+            toast("Новое: Ctrl+K - быстрый поиск по всей программе: карты, сборки, серверы, скины и настройки.",
+                  "info", ("Открыть", quick_search), 9000)
+    win.after(6000, qs_tip)
     wait = max(0, int(1150 - (time.perf_counter() - splash_t0) * 1000))
     win.after(wait, reveal)
     win.mainloop()
