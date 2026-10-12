@@ -544,21 +544,57 @@ def _listdir(d):
         return []
 
 
+_READ_CACHE = {}  # путь -> (mtime_ns, размер, текст): описания карт и сборок не перечитываются, пока не изменились
+_JARS_CACHE = {}  # папка mods -> (mtime_ns, число .jar)
+
+
+def _read_json_cached(path):
+    """Содержимое JSON-файла (новый словарь каждый раз) или None. Читает диск, только если файл изменился."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    hit = _READ_CACHE.get(path)
+    if hit is None or hit[0] != st.st_mtime_ns or hit[1] != st.st_size:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                hit = _READ_CACHE[path] = (st.st_mtime_ns, st.st_size, fh.read())
+        except OSError:
+            return None
+    try:
+        return json.loads(hit[2])
+    except ValueError:
+        return None
+
+
+def _count_jars(d):
+    """Сколько .jar в папке; пересчёт - только когда в папке что-то добавили или убрали (меняется её время)."""
+    try:
+        mt = os.stat(d).st_mtime_ns
+    except OSError:
+        return 0
+    hit = _JARS_CACHE.get(d)
+    if hit is None or hit[0] != mt:
+        hit = _JARS_CACHE[d] = (mt, len(jars(d)))
+    return hit[1]
+
+
 def find_packs():
     packs = []
-    for vdir in _listdir(ROOT):
+    try:
+        vdirs = sorted(e.name for e in os.scandir(ROOT) if e.is_dir())
+    except OSError:
+        vdirs = []
+    for vdir in vdirs:
         vp = os.path.join(ROOT, vdir)
-        if not os.path.isdir(vp) or vdir.startswith(("_", ".")) or vp == MAPS_DIR:
+        if vdir.startswith(("_", ".")) or vp == MAPS_DIR or vdir in ("Оформление", "Лаунчеры", "Серверы", "Скины"):
             continue
-        for pdir in _listdir(vp):
-            meta = os.path.join(vp, pdir, "pack.json")
-            if not os.path.isfile(meta):
-                continue
-            try:
-                with open(meta, encoding="utf-8") as fh:
-                    m = json.load(fh)
-            except Exception:
-                continue
+        try:  # только подпапки: в «Оформлении» сотня картинок, и спрашивать у каждой pack.json - заметно долго
+            subs = sorted(e.name for e in os.scandir(vp) if e.is_dir())
+        except OSError:
+            subs = []
+        for pdir in subs:
+            m = _read_json_cached(os.path.join(vp, pdir, "pack.json"))
             if not isinstance(m, dict):
                 continue
             m.setdefault("name", pdir)
@@ -566,7 +602,7 @@ def find_packs():
             m.setdefault("minecraft", vdir.partition(" ")[2])
             m["path"] = os.path.join(vp, pdir)
             m["version_dir"] = vdir
-            m["count"] = len(jars(os.path.join(vp, pdir, "mods")))
+            m["count"] = _count_jars(os.path.join(vp, pdir, "mods"))
             if not m["count"]:
                 try:
                     with open(os.path.join(vp, pdir, "mods.json"), encoding="utf-8") as fh:
@@ -721,14 +757,7 @@ def find_maps():
     if not os.path.isdir(MAPS_DIR):
         return maps
     for d in _listdir(MAPS_DIR):
-        meta = os.path.join(MAPS_DIR, d, "map.json")
-        if not os.path.isfile(meta):
-            continue
-        try:
-            with open(meta, encoding="utf-8") as fh:
-                m = json.load(fh)
-        except Exception:
-            continue
+        m = _read_json_cached(os.path.join(MAPS_DIR, d, "map.json"))
         if not isinstance(m, dict) or not m.get("version"):
             continue  # без версии игры карту не поставить
         m.setdefault("id", d)
@@ -2438,11 +2467,21 @@ def web_maps_page(wm):
                 x["desc"] = d
         return pg, items, nxt
     todo = [x for x in srcs if x not in done and time.time() - _WM_DOWN.get(x, 0) > 600]
-    futs = [(src, _WM_THREADS.setdefault(src, concurrent.futures.ThreadPoolExecutor(1)).submit(one, src)) for src in todo]
-    lists, errs = [], []
+    pending = wm.setdefault("pending", {})  # каталоги, не успевшие к прошлой порции: их ответ войдёт в эту
+    futs = [(src, pending.pop(src, None) or
+             _WM_THREADS.setdefault(src, concurrent.futures.ThreadPoolExecutor(1)).submit(one, src)) for src in todo]
+    fs = [f for _s, f in futs]
+    # медленный каталог не держит ленту: после первого ответа остальным ещё 6 секунд, опоздавшие - в следующую порцию
+    first, _rest = concurrent.futures.wait(fs, timeout=120, return_when=concurrent.futures.FIRST_COMPLETED)
+    if first:
+        concurrent.futures.wait(fs, timeout=6)
+    lists, errs = [], ([] if first or not fs else ["каталоги карт не ответили за 2 минуты"])
     for src, f in futs:
+        if not f.done():
+            pending[src] = f
+            continue
         try:
-            pg, items, nxt = f.result(timeout=120)
+            pg, items, nxt = f.result()
             pages[src] = pg
             lists.append(items)
             if not nxt:
@@ -2456,7 +2495,7 @@ def web_maps_page(wm):
         for lst in lists:
             if i < len(lst):
                 out.append(lst[i])
-    return out, any(x not in done and time.time() - _WM_DOWN.get(x, 0) > 600 for x in srcs), errs
+    return out, bool(pending) or any(x not in done and time.time() - _WM_DOWN.get(x, 0) > 600 for x in srcs), errs
 
 
 def mi_pick_download(info, want=None):
@@ -2757,6 +2796,55 @@ def import_user_map(src, title=None, version=None, log=print):
         shutil.rmtree(lp(tmp), ignore_errors=True)
     log("Карта «%s» (Minecraft %s) добавлена, файлов: %d" % (title, version, n))
     return dst
+
+
+def classify_drop(path):
+    """Что за файл перетащили в окно: "skin", "cape", "map", "mrpack", "cfpack", "mod", "resourcepack" или None."""
+    low = path.lower()
+    if os.path.isdir(path):
+        if os.path.isfile(os.path.join(path, "level.dat")) or _find_worlds(path):
+            return "map"
+        return None
+    ext = os.path.splitext(low)[1]
+    if ext == ".png":
+        try:
+            im = PILImage.open(path)
+            w, h = im.size
+        except Exception:
+            return None
+        name = os.path.basename(low)
+        if "cape" in name or "плащ" in name:
+            return "cape"
+        if w % 64 == 0 and h == w:
+            return "skin"
+        if w % 64 == 0 and h * 2 == w:  # 64x32: старый скин или плащ - у скина есть руки справа внизу
+            k = w // 64
+            arms = im.convert("RGBA").crop((44 * k, 16 * k, 56 * k, 32 * k)).getextrema()[3][1]
+            return "skin" if arms > 0 else "cape"
+        if w % 22 == 0 and h * 22 >= w * 17 * 0.9:
+            return "cape"
+        return None
+    if ext == ".mrpack":
+        return "mrpack"
+    if ext == ".jar":
+        return "mod"
+    if ext in (".rar", ".7z"):
+        return "map"
+    if ext == ".zip":
+        try:
+            with zipfile.ZipFile(path) as z:
+                names = z.namelist()
+        except Exception:
+            return None
+        if "modrinth.index.json" in names:
+            return "mrpack"
+        if any(n.endswith("level.dat") for n in names):
+            return "map"
+        if "manifest.json" in names:
+            return "cfpack"
+        if "pack.mcmeta" in names or any(n.startswith("shaders/") for n in names):
+            return "resourcepack"
+    return None
 
 
 def import_cape(path):
@@ -4231,11 +4319,33 @@ def _wg_drop(host, port):
             pass
 
 
+_CURL_HOSTS = set()  # сайты, которые пускают только «браузерный» TLS Windows: к ним сразу через curl.exe
+_CURL_EXE = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "curl.exe")
+
+
+def curl_get(url, timeout=30, headers=None):
+    """Страница через curl.exe из Windows (Schannel). Cloudflare на части сайтов отличает TLS Питона (OpenSSL) от
+    браузера и отвечает 403, а curl Windows пускает. -> bytes или исключение."""
+    if not os.path.isfile(_CURL_EXE):
+        raise RuntimeError("нет curl.exe")
+    cmd = [_CURL_EXE, "-s", "-L", "--max-time", str(int(timeout)), "-A", UA_BROWSER, "-w", "\n%{http_code}"]
+    for k, v in (headers or {}).items():
+        if k.lower() != "user-agent":
+            cmd += ["-H", "%s: %s" % (k, v)]
+    r = subprocess.run(cmd + [url], capture_output=True, timeout=timeout + 10, creationflags=0x08000000)
+    body, _, code = r.stdout.rpartition(b"\n")
+    if r.returncode or code.strip() not in (b"200", b"206"):
+        raise RuntimeError("HTTP %s" % (code.strip().decode("ascii", "replace") or r.returncode))
+    return body
+
+
 def web_get(url, timeout=30, tries=3, headers=None):
     """Страница или картинка с сайта: как _get, но соединение остаётся открытым для следующих запросов
     (в своём потоке). Переадресации, повторы при сбоях, 403/429/5xx (случайные отказы Cloudflare)."""
     h = {"User-Agent": UA_BROWSER}  # HTTP/1.1 и так держит соединение; лишние заголовки Cloudflare режет (403)
     h.update(headers or {})
+    if urllib.parse.urlsplit(url).hostname in _CURL_HOSTS:
+        return curl_get(url, timeout, headers)
     last, redirects, attempt = None, 0, 0
     while attempt < tries:
         u = urllib.parse.urlsplit(url)
@@ -4263,6 +4373,13 @@ def web_get(url, timeout=30, tries=3, headers=None):
         if r.status in (200, 206):
             return data
         last = RuntimeError("HTTP %d" % r.status)
+        if r.status == 403 and attempt == 0:  # отказ «не браузер»: пробуем тем же запросом через curl Windows
+            try:
+                data = curl_get(url, timeout, headers)
+                _CURL_HOSTS.add(host)
+                return data
+            except Exception:
+                pass
         if r.status in (403, 429) or r.status >= 500:  # новое соединение: прокси может выйти через другой адрес
             _wg_drop(host, port)
             attempt += 1
@@ -4935,6 +5052,61 @@ def _apply_plan(man, plan, root=ROOT, log=print, progress=None, cancel=None, ask
 
 
 apply_update = apply_plan
+
+
+CACHE_DIRS = ("archives", "icons", "installers", "mrpack", "cfpack", "cloud", "import_map")  # в _update: скачается снова
+
+
+def dir_size(path):
+    """Сколько байт занимает папка (со всеми вложенными). Недоступное пропускается."""
+    total = 0
+    try:
+        if os.path.isfile(path):
+            return os.path.getsize(path)
+    except OSError:
+        return 0
+    for d, _dirs, fs in os.walk(lp(path)):
+        for f in fs:
+            try:
+                total += os.path.getsize(os.path.join(d, f))
+            except OSError:
+                pass
+    return total
+
+
+def storage_report(root=ROOT, mc=None):
+    """Что занимает место: {"items": [(часть описи, байт)], "versions": [(имя, путь, байт)],
+    "cache": [(имя, путь, байт)], "saves": байт, "shared": [(подпись, байт)]}."""
+    mc = mc or MC
+    man = load_local_manifest(root)
+    rep_ = {"items": [], "versions": [], "cache": [], "saves": 0, "shared": []}
+    for it in man.get("items", []):
+        if it.get("kind") in ("map", "pack") and item_downloaded(it, root):
+            n = dir_size(os.path.join(root, it["path"]))
+            if n:
+                rep_["items"].append((it, n))
+    vdir = os.path.join(mc, "versions")
+    for v in _listdir(vdir):
+        p = os.path.join(vdir, v)
+        if os.path.isdir(p):
+            rep_["versions"].append((v, p, dir_size(p)))
+    upd = os.path.join(root, "_update")
+    for name in _listdir(upd):
+        p = os.path.join(upd, name)
+        if name in CACHE_DIRS or name.startswith("old_"):
+            n = dir_size(p)
+            if n:
+                rep_["cache"].append((name, p, n))
+    for name in _listdir(root):  # хвосты прошлых обновлений, если Корзина их не приняла
+        if name.startswith("_Старое после обновления"):
+            p = os.path.join(root, name)
+            rep_["cache"].append((name, p, dir_size(p)))
+    rep_["saves"] = dir_size(os.path.join(mc, "saves"))
+    for label, sub in (("Библиотеки игры", "libraries"), ("Звуки и текстуры игры", "assets")):
+        rep_["shared"].append((label, dir_size(os.path.join(mc, sub))))
+    for k in ("items", "versions", "cache"):
+        rep_[k].sort(key=lambda x: -x[-1])
+    return rep_
 
 
 def remove_item(item, root=ROOT, log=print):
@@ -9100,11 +9272,23 @@ def gui():
                                                                     99, _mixc(color, "#ffffff", 0.12), False))
         return tk.Label(parent, text=text, image=ph, bg=pbg, bd=0, padx=0, pady=0)
 
+    _img_cache = {}
+
     def image(path):
         try:
-            im = tk.PhotoImage(file=path)
-        except Exception:
-            im = tk.PhotoImage(width=120, height=120)
+            st_ = os.stat(path)
+            key = (path, st_.st_mtime_ns, st_.st_size)
+        except OSError:
+            key = (path, 0, 0)
+        im = _img_cache.get(key)
+        if im is None:
+            try:
+                im = tk.PhotoImage(file=path)
+            except Exception:
+                im = tk.PhotoImage(width=120, height=120)
+            if len(_img_cache) > 300:
+                _img_cache.clear()
+            _img_cache[key] = im
         images.append(im)
         return im
 
@@ -9288,9 +9472,9 @@ def gui():
                           bg="#1b1d23", anchor="w", cursor="hand2")
             l2.pack(anchor="w")
             for w_ in (box, ic, tx, l1, l2):
-                w_.bind("<Button-1>", lambda e, t=tab: show(t))
-                w_.bind("<Enter>", lambda e, l2=l2: l2.configure(fg=ACCENT_HI))
-                w_.bind("<Leave>", lambda e, l2=l2: l2.configure(fg=TEXT))
+                w_.bind("<Button-1>", lambda e=None, t=tab: show(t))
+                w_.bind("<Enter>", lambda e=None, l2=l2: l2.winfo_exists() and l2.configure(fg=ACCENT_HI))
+                w_.bind("<Leave>", lambda e=None, l2=l2: l2.winfo_exists() and l2.configure(fg=TEXT))
         refresh_account()
 
     def check_more():
@@ -9311,6 +9495,7 @@ def gui():
         for w in inner.winfo_children():
             w.destroy()
         images.clear()
+        _isl_seed[0] = 1000  # те же варианты рамок при каждом показе вкладки - картинки рамок берутся из кэша
         canvas.yview_moveto(0)
         inner.grid_columnconfigure(0, weight=1, uniform="c")
         inner.grid_columnconfigure(1, weight=1, uniform="c")
@@ -12090,7 +12275,8 @@ def gui():
 
     def build_versions():
         vv = versions_state()
-        section("Версии игры", 0, "любая версия Minecraft — без лаунчера")
+        vh_ = section("Версии игры", 0, "любая версия Minecraft — без лаунчера")
+        small_button(vh_, "Место на диске", storage_window, bg=BG, icon="ic_folder.png").pack(side="right")
         hero(1, "versions_wide.png", "Любая версия — одним нажатием",
              "Portalis скачает игру, загрузчик модов, звуки и нужную Java прямо в папку игры. "
              "Потом её увидит любой лаунчер, даже без интернета.")
@@ -16147,7 +16333,8 @@ def gui():
         row += 1
         if not mine:
             tk.Label(inner, text="Пока пусто. Найди скин по нику, выбери стандартный или из галереи ниже — "
-                                 "или добавь свой PNG кнопкой «Загрузить скин».", font=(FONT, 10), fg=MUTED, bg=BG,
+                                 "или добавь свой PNG кнопкой «Загрузить скин» "
+                                 "(или просто перетащи файл в окно).", font=(FONT, 10), fg=MUTED, bg=BG,
                      anchor="w", justify="left", wraplength=900).grid(row=row, column=0, columnspan=2, sticky="we",
                                                                       pady=(0, 12))
             row += 1
@@ -16750,6 +16937,232 @@ def gui():
         win.destroy()
     win.protocol("WM_DELETE_WINDOW", on_close)
 
+    # --- перетащить файлы в окно: скин, плащ, карта (архив или папка мира), модпак ---
+    def handle_drop(paths):
+        for path in paths[:5]:
+            kind = classify_drop(path)
+            name = os.path.splitext(os.path.basename(path.rstrip("\\/")))[0]
+            if kind == "skin":
+                fn = save_my_skin(name, open(path, "rb").read(), None, None, "из файла")
+                toast("Скин добавлен в «Мои скины»: %s" % fn[:-4], "ok", ("Скины", lambda: show("skins")))
+            elif kind == "cape":
+                try:
+                    fn = import_cape(path)
+                    toast("Плащ добавлен: %s" % fn[:-4], "ok", ("Скины", lambda: show("skins")))
+                except Exception as e:
+                    toast("Не плащ: %s" % e, "err")
+            elif kind == "map":
+                lv = level_info(path) if os.path.isdir(path) else (None, None)
+                title = simpledialog.askstring("Своя карта", "Название карты:", initialvalue=lv[0] or name, parent=win)
+                if title is None:
+                    continue
+                run_task("Добавляю карту", lambda log, p=path, t_=title: import_user_map(p, t_ or None, None, log),
+                         lambda r, logs: (toast("Карта добавлена в каталог.", "ok"), show("maps", animated=False)))
+                break  # одна задача за раз
+            elif kind == "mrpack":
+                run_task("Ставлю модпак", lambda log, p=path: import_mrpack(p, None, log),
+                         lambda r, logs: r and toast("Модпак в сборках.", "ok", ("Сборки", lambda: show("packs"))))
+                break
+            elif kind == "cfpack":
+                if not cf_key():
+                    toast("Модпаки CurseForge ставятся, когда подключён ключ CurseForge.", "warn")
+                    continue
+                run_task("Ставлю модпак", lambda log, p=path: import_cfpack(p, None, log),
+                         lambda r, logs: r and toast("Модпак в сборках.", "ok", ("Сборки", lambda: show("packs"))))
+                break
+            elif kind == "mod":
+                toast("«%s» - это мод. Добавь его в свою сборку: «Сборки» → «Изменить» или «Конструктор»." % name,
+                      "info", ("Конструктор", lambda: show("builder")), 8000)
+            elif kind == "resourcepack":
+                toast("«%s» - ресурс-пак или шейдеры: их ставят в сборку (в «Конструкторе» - «Текстуры» и "
+                      "«Шейдеры»)." % name, "info", ("Конструктор", lambda: show("builder")), 8000)
+            else:
+                toast("Не знаю, что делать с «%s». Перетаскивай скин (PNG), плащ, карту (архив или папку мира) "
+                      "или модпак (.mrpack)." % os.path.basename(path), "warn", ms=8000)
+
+    def enable_drop():
+        """Окно принимает файлы из Проводника (WM_DROPFILES), без сторонних библиотек."""
+        try:
+            from ctypes import wintypes
+            user32, shell32, comctl32 = ctypes.windll.user32, ctypes.windll.shell32, ctypes.windll.comctl32
+            user32.GetParent.restype = wintypes.HWND
+            hwnd = user32.GetParent(win.winfo_id()) or win.winfo_id()
+            shell32.DragQueryFileW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_wchar_p, ctypes.c_uint]
+            shell32.DragFinish.argtypes = [ctypes.c_void_p]
+            comctl32.DefSubclassProc.argtypes = [wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM]
+            comctl32.DefSubclassProc.restype = ctypes.c_ssize_t
+            PROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM,
+                                      ctypes.c_size_t, ctypes.c_size_t)
+
+            def proc(h, msg, wp, lp_, _id, _ref):
+                if msg == 0x0233:  # WM_DROPFILES
+                    try:
+                        n = shell32.DragQueryFileW(wp, 0xFFFFFFFF, None, 0)
+                        out = []
+                        for i in range(n):
+                            ln = shell32.DragQueryFileW(wp, i, None, 0)
+                            buf = ctypes.create_unicode_buffer(ln + 1)
+                            shell32.DragQueryFileW(wp, i, buf, ln + 1)
+                            out.append(buf.value)
+                        shell32.DragFinish(wp)
+                        win.after(10, lambda: handle_drop(out))
+                    except Exception:
+                        log_error("перетаскивание")
+                    return 0
+                return comctl32.DefSubclassProc(h, msg, wp, lp_)
+            cb = PROC(proc)
+            state["drop_proc"] = cb  # держим ссылку: иначе обработчик соберёт сборщик мусора
+            comctl32.SetWindowSubclass.argtypes = [wintypes.HWND, PROC, ctypes.c_size_t, ctypes.c_size_t]
+            if comctl32.SetWindowSubclass(hwnd, cb, 0x50D, 0):
+                shell32.DragAcceptFiles(hwnd, True)
+        except Exception:
+            log_error("перетаскивание: подключение")
+
+    # --- «Место на диске»: что занимает место и что можно убрать в Корзину ---
+    def storage_window():
+        t, body = detail_window("Место на диске", full=True)
+        window_header(body, "tab_versions_64.png" if os.path.isfile(os.path.join(ART, "tab_versions_64.png"))
+                      else "tab_versions.png", "Место на диске",
+                      "что занимает место и что можно освободить: убранное уходит в Корзину").pack(fill="x")
+        box = tk.Frame(body, bg=BG)
+        box.pack(fill="both", expand=True, pady=(12, 0))
+        tk.Label(box, text="Считаю, сколько что занимает...", font=(FONT, 11, "bold"), fg=GOLD, bg=BG,
+                 anchor="w").pack(fill="x")
+        mc = MC
+
+        def refresh():
+            if t.winfo_exists():
+                t.destroy()
+                storage_window()
+
+        def gone(title):
+            def done(*a):
+                toast("«%s» - в Корзине, место освобождено." % title, "ok")
+                refresh()
+            return done
+
+        def render(rep_):
+            if not box.winfo_exists():
+                return
+            for w_ in box.winfo_children():
+                w_.destroy()
+            items_ = sum(n for _i, n in rep_["items"])
+            vers_ = sum(x[2] for x in rep_["versions"])
+            cache_ = sum(x[2] for x in rep_["cache"])
+            shared_ = sum(n for _l, n in rep_["shared"])
+            parts = [("Карты и сборки", items_, ACCENT), ("Версии игры", vers_, BLUE), ("Миры", rep_["saves"], GOLD),
+                     ("Библиотеки и звуки", shared_, "#7a5cc4"), ("Кэш Portalis", cache_, "#8a8f9c")]
+            total = sum(p[1] for p in parts) or 1
+            top = tk.Frame(box, bg=PANEL, padx=16, pady=12)
+            island(top, vines=False, radius=12)
+            top.pack(fill="x", pady=(0, 12))
+            tk.Label(top, text="Всего: %s" % fmt_mb(total), font=(FONT, 14, "bold"), fg=TEXT, bg=PANEL,
+                     anchor="w").pack(fill="x")
+            bar = tk.Canvas(top, height=14, bg=CARD_HI, highlightthickness=0, bd=0)
+            bar.pack(fill="x", pady=(8, 6))
+
+            def draw_bar(e=None):
+                bar.delete("all")
+                w_, x = max(1, bar.winfo_width()), 0
+                for _n, size, col in parts:
+                    dx = w_ * size / total
+                    if dx >= 1:
+                        bar.create_rectangle(x, 0, x + dx, 14, fill=col, width=0)
+                    x += dx
+            bar.bind("<Configure>", draw_bar)
+            leg = tk.Frame(top, bg=PANEL)
+            leg.pack(fill="x")
+            for name, size, col in parts:
+                tk.Label(leg, text="■", font=(FONT, 11), fg=col, bg=PANEL).pack(side="left")
+                tk.Label(leg, text=" %s %s    " % (name, fmt_mb(size)), font=(FONT, 9), fg=MUTED, bg=PANEL).pack(
+                    side="left")
+
+            def section_(title, sub=""):
+                hf = tk.Frame(box, bg=BG)
+                hf.pack(fill="x", pady=(10, 4))
+                tk.Label(hf, text=title, font=(FONT, 12, "bold"), fg=TEXT, bg=BG).pack(side="left")
+                if sub:
+                    tk.Label(hf, text="   " + sub, font=(FONT, 9), fg=MUTED, bg=BG).pack(side="left")
+                lst = tk.Frame(box, bg=PANEL, padx=10, pady=6)
+                island(lst, vines=False, radius=10)
+                lst.pack(fill="x")
+                return lst
+
+            def row_(lst, title, size, biggest, btn=None, sub=""):
+                r = tk.Frame(lst, bg=PANEL, pady=4)
+                r.pack(fill="x")
+                if btn:
+                    small_button(r, btn[0], btn[1], bg=PANEL, icon=btn[2] if len(btn) > 2 else None).pack(side="right")
+                tk.Label(r, text=fmt_mb(size), font=(FONT, 10, "bold"), fg=TEXT, bg=PANEL, width=9,
+                         anchor="e").pack(side="right", padx=(0, 10))
+                g = tk.Canvas(r, width=120, height=8, bg=CARD_HI, highlightthickness=0, bd=0)
+                g.pack(side="right", padx=(0, 10))
+                g.create_rectangle(0, 0, max(2, 120 * size / max(1, biggest)), 8, fill=ACCENT, width=0)
+                tk.Label(r, text=title, font=(FONT, 10), fg=TEXT, bg=PANEL, anchor="w").pack(side="left")
+                if sub:
+                    tk.Label(r, text="   " + sub, font=(FONT, 9), fg=MUTED, bg=PANEL, anchor="w").pack(side="left")
+
+            # карты и сборки
+            lst = section_("Скачанные карты и сборки", "в каталоге останутся - скачать снова можно в любой момент")
+            if not rep_["items"]:
+                tk.Label(lst, text="Пока ничего не скачано.", font=(FONT, 10), fg=MUTED, bg=PANEL, anchor="w").pack(fill="x")
+            big = max([n for _i, n in rep_["items"]] or [1])
+            for it, n in rep_["items"]:
+                def drop(it=it):
+                    if messagebox.askyesno("Освободить место", "Убрать скачанные файлы «%s» в Корзину?\n\nВ каталоге она "
+                                           "останется. Миры в игре это не трогает." % it["title"], parent=t):
+                        run_task("Убираю «%s»" % it["title"], lambda log: remove_item(it, log=log), gone(it["title"]))
+                row_(lst, it["title"], n, big, ("Убрать", drop, "ic_delete.png"))
+            # версии игры
+            lst = section_("Версии игры", "папка versions: при игре нужная версия скачается снова")
+            if not rep_["versions"]:
+                tk.Label(lst, text="Версий в папке игры нет.", font=(FONT, 10), fg=MUTED, bg=PANEL, anchor="w").pack(fill="x")
+            big = max([x[2] for x in rep_["versions"]] or [1])
+            for v, path, n in rep_["versions"]:
+                def drop_v(v=v, path=path):
+                    if game_running():
+                        toast("Сначала закрой игру.", "warn")
+                        return
+                    if messagebox.askyesno("Освободить место", "Убрать версию «%s» в Корзину?\n\nКогда она снова "
+                                           "понадобится, Portalis или лаунчер скачает её заново." % v, parent=t):
+                        run_task("Убираю версию «%s»" % v, lambda log: recycle(path, log=log) or
+                                 (_ for _ in ()).throw(RuntimeError("Корзина не приняла папку")), gone(v))
+                row_(lst, v, n, big, ("Убрать", drop_v, "ic_delete.png"))
+            # кэш
+            lst = section_("Кэш Portalis", "скачанные архивы, установщики, значки, временные файлы")
+            if rep_["cache"]:
+                def drop_cache():
+                    if not messagebox.askyesno("Очистить кэш", "Убрать кэш Portalis (%s) в Корзину?\n\nЭто временные "
+                                               "файлы: нужное скачается снова." % fmt_mb(cache_), parent=t):
+                        return
+
+                    def work(log):
+                        bad = [name for name, p, _n in rep_["cache"] if not recycle(p, log=log)]
+                        if bad:
+                            raise RuntimeError("Корзина не приняла: %s" % ", ".join(bad))
+                    run_task("Очищаю кэш", work, gone("Кэш Portalis"))
+                row_(lst, "Всего в кэше", cache_, cache_, ("Очистить", drop_cache, "ic_delete.png"),
+                     ", ".join(x[0] for x in rep_["cache"][:4]))
+            else:
+                tk.Label(lst, text="Кэш пуст.", font=(FONT, 10), fg=MUTED, bg=PANEL, anchor="w").pack(fill="x")
+            # миры и общее - только посмотреть
+            lst = section_("Миры и файлы игры", "это не трогаем: миры - твои, библиотеки нужны всем версиям")
+            row_(lst, "Миры (saves)", rep_["saves"], max(rep_["saves"], 1),
+                 ("Открыть папку", lambda: os.makedirs(os.path.join(mc, "saves"), exist_ok=True) or
+                  os.startfile(os.path.join(mc, "saves")), "ic_folder.png"))
+            for label_, n in rep_["shared"]:
+                row_(lst, label_, n, max(rep_["saves"], n, 1))
+            t.update_idletasks()
+            try:
+                t._cv.configure(scrollregion=t._cv.bbox("all"))
+            except (tk.TclError, AttributeError):
+                pass
+
+        def work():
+            r_ = storage_report(mc=mc)
+            win.after(0, lambda: render(r_))
+        threading.Thread(target=work, daemon=True).start()
+
     # --- быстрый поиск по всему (Ctrl+K): карты, сборки, серверы, свои скины, вкладки и действия ---
     TAB_TITLES = {"maps": "Карты", "packs": "Сборки", "builder": "Конструктор", "skins": "Скины", "versions": "Версии",
                   "servers": "Серверы", "friend": "Друзья", "launchers": "Лаунчеры"}
@@ -16769,6 +17182,8 @@ def gui():
                  lambda: check_updates(manual=True)),
                 ("Папка игры", MC, ".minecraft saves", lambda: os.makedirs(MC, exist_ok=True) or os.startfile(MC)),
                 ("Папка Portalis", ROOT, "данные", lambda: os.startfile(ROOT)),
+                ("Место на диске", "что занимает место, освободить", "место диск память удалить очистить кэш",
+                 storage_window),
                 ("Своя сборка", "собрать сборку из любых модов", "моды конструктор", lambda: show("builder"))]
         if soc().ready():
             acts += [("Облако и резервные копии", "миры в облаке, копии по расписанию", "бэкап backup мир",
@@ -16914,6 +17329,7 @@ def gui():
     for key in ("<Control-k>", "<Control-K>", "<Control-Cyrillic_el>", "<Control-Cyrillic_EL>"):
         win.bind_all(key, quick_search)
     win._hooks["quick_search"] = quick_search
+    win._hooks["handle_drop"] = handle_drop
     for i, k in enumerate(TAB_ORDER, 1):
         win.bind_all("<Control-Key-%d>" % i, lambda e, k=k: show(k))
     win.bind_all("<F5>", lambda e: (state.update(installed_launchers=None, net_cache=None), show(state["tab"], animated=False)))
@@ -16982,6 +17398,7 @@ def gui():
             toast("Новое: Ctrl+K - быстрый поиск по всей программе: карты, сборки, серверы, скины и настройки.",
                   "info", ("Открыть", quick_search), 9000)
     win.after(6000, qs_tip)
+    win.after(1500, enable_drop)
     wait = max(0, int(1150 - (time.perf_counter() - splash_t0) * 1000))
     win.after(wait, reveal)
     win.mainloop()
