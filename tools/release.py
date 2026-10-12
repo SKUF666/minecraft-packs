@@ -3,6 +3,7 @@ SignPath, когда она подключена), exe из сборки -> libr
 Так выпускается ровно тот exe, что собран из открытого исходника, а не на этом компьютере.
 
     python tools/release.py --note "Что нового" [--note "..."] [--local]   (--local - собрать exe здесь, как раньше)
+    [--run ID] - не собирать заново, взять exe из уже прошедшей сборки GitHub (если скачивание сорвалось)
 """
 import os, sys, shutil, subprocess, time, json, tempfile
 sys.stdout.reconfigure(encoding='utf-8')
@@ -22,47 +23,57 @@ def main():
     notes = []
     args = sys.argv[1:]
     local = '--local' in args
+    run_id = None
     i = 0
     while i < len(args):
         if args[i] == '--note' and i + 1 < len(args):
             notes += ['--note', args[i + 1]]
+            i += 2
+        elif args[i] == '--run' and i + 1 < len(args):
+            run_id = args[i + 1]
             i += 2
         else:
             i += 1
     if local:
         run(sys.executable, os.path.join(REPO, 'tools', 'build_exe.py'))
         return run(sys.executable, os.path.join(REPO, 'tools', 'publish.py'), *notes)
-    # 1. исходники в репозиторий
-    for m in MODULES:
-        if os.path.isfile(os.path.join(LIB, m)):
-            shutil.copy2(os.path.join(LIB, m), os.path.join(REPO, 'src', m))
-    run('git', 'add', 'src')
-    if run('git', 'diff', '--cached', '--quiet', check=False).returncode:
-        run('git', 'commit', '-q', '-m', 'Исходники выпуска\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>')
-    run('git', 'push', '-q', 'origin', 'main')
-    sha = run('git', 'rev-parse', 'HEAD', capture=True).stdout.strip()
-    print('исходники на GitHub:', sha[:10])
-    # 2. сборка на GitHub
     started = time.time()
-    run('gh', 'workflow', 'run', 'build.yml', '--ref', 'main')
-    run_id = None
-    for _ in range(40):
-        time.sleep(4)
-        rows = json.loads(run('gh', 'run', 'list', '--workflow', 'build.yml', '--limit', '5', '--json',
-                              'databaseId,headSha,createdAt,event', capture=True).stdout)
-        hit = [r for r in rows if r['headSha'] == sha and r['event'] == 'workflow_dispatch']
-        if hit:
-            run_id = hit[0]['databaseId']
-            break
     if not run_id:
-        raise SystemExit('сборка на GitHub не запустилась')
-    print('сборка: https://github.com/SKUF666/minecraft-packs/actions/runs/%s' % run_id)
-    r = run('gh', 'run', 'watch', str(run_id), '--exit-status', check=False, capture=True)
-    if r.returncode:
-        raise SystemExit('сборка на GitHub не прошла - смотри ссылку выше')
+        # 1. исходники в репозиторий
+        for m in MODULES:
+            if os.path.isfile(os.path.join(LIB, m)):
+                shutil.copy2(os.path.join(LIB, m), os.path.join(REPO, 'src', m))
+        run('git', 'add', 'src')
+        if run('git', 'diff', '--cached', '--quiet', check=False).returncode:
+            run('git', 'commit', '-q', '-m', 'Исходники выпуска\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>')
+        run('git', 'push', '-q', 'origin', 'main')
+        sha = run('git', 'rev-parse', 'HEAD', capture=True).stdout.strip()
+        print('исходники на GitHub:', sha[:10])
+        # 2. сборка на GitHub
+        started = time.time()
+        run('gh', 'workflow', 'run', 'build.yml', '--ref', 'main')
+        run_id = None
+        for _ in range(40):
+            time.sleep(4)
+            rows = json.loads(run('gh', 'run', 'list', '--workflow', 'build.yml', '--limit', '5', '--json',
+                                  'databaseId,headSha,createdAt,event', capture=True).stdout)
+            hit = [r for r in rows if r['headSha'] == sha and r['event'] == 'workflow_dispatch']
+            if hit:
+                run_id = hit[0]['databaseId']
+                break
+        if not run_id:
+            raise SystemExit('сборка на GitHub не запустилась')
+        print('сборка: https://github.com/SKUF666/minecraft-packs/actions/runs/%s' % run_id)
+        r = run('gh', 'run', 'watch', str(run_id), '--exit-status', check=False, capture=True)
+        if r.returncode:
+            raise SystemExit('сборка на GitHub не прошла - смотри ссылку выше')
     # 3. exe из сборки
     out = tempfile.mkdtemp(prefix='portalis-ci-')
-    run('gh', 'run', 'download', str(run_id), '-n', 'Portalis', '-D', out)
+    for attempt in range(4):  # скачивание артефакта иногда срывается - повторяем
+        if run('gh', 'run', 'download', str(run_id), '-n', 'Portalis', '-D', out, check=False).returncode == 0:
+            break
+        print('скачать exe не вышло, ещё раз...')
+        time.sleep(5 * (attempt + 1))
     exe = os.path.join(out, 'Portalis.exe')
     if not os.path.isfile(exe) or os.path.getsize(exe) < 5 << 20:
         raise SystemExit('в сборке нет Portalis.exe')
