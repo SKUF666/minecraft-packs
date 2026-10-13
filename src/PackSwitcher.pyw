@@ -203,6 +203,46 @@ def tr(text):
     return out
 
 
+def install_after_guard():
+    """Таймеры after() виджета снимаются вместе с виджетом.
+    Иначе Tcl-таймер переживает удалённую команду, а имя команды (адрес функции + имя) достаётся новому обработчику:
+    старый таймер вызывает чужой обработчик без события - случайные «missing 1 required positional argument: 'e'»."""
+    import tkinter
+    if getattr(tkinter.Misc, "_portalis_after", False):
+        return
+    tkinter.Misc._portalis_after = True
+    orig_after, orig_destroy = tkinter.Misc.after, tkinter.BaseWidget.destroy
+
+    def after(self, ms, func=None, *args):
+        if func is None:
+            return orig_after(self, ms)
+        box = []
+
+        def run(*a):
+            pend = self.__dict__.get("_p_afters")
+            if pend is not None and box:
+                pend.discard(box[0])
+            return func(*a)
+        try:
+            run.__name__ = getattr(func, "__name__", "cb")
+        except (AttributeError, TypeError):
+            pass
+        aid = orig_after(self, ms, run, *args)
+        box.append(aid)
+        self.__dict__.setdefault("_p_afters", set()).add(aid)
+        return aid
+
+    def destroy(self):
+        for aid in list(self.__dict__.get("_p_afters", ())):
+            try:
+                self.after_cancel(aid)
+            except Exception:
+                pass
+        orig_destroy(self)
+    tkinter.Misc.after = after
+    tkinter.BaseWidget.destroy = destroy
+
+
 def install_tr():
     """Все надписи tkinter (text=..., заголовки окон) проходят через tr()."""
     import tkinter
@@ -7854,6 +7894,7 @@ def gui():
     tidy_old_name()
     load_lang(load_settings().get("lang") or system_lang())
     install_tr()
+    install_after_guard()
     apply_style(load_settings().get("style"))
     apply_theme(load_settings().get("theme"))
     win = tk.Tk()
@@ -10867,7 +10908,7 @@ def gui():
                 small_button(row, "Изменить", lambda p=p: edit_user_pack(p), bg=CARD, icon="ic_settings.png").pack(side="left")
                 if mod_upd_for(p):
                     small_button(row, "Обновить моды", lambda p=p: update_mods_now(p), bg=CARD,
-                                 icon="tab_update.png").pack(side="left", padx=4)
+                                 icon="ic_wrench.png").pack(side="left", padx=4)
                 small_button(row, "Удалить", drop, bg=CARD, icon="ic_delete.png").pack(side="left", padx=4)
             clickable(c, lambda p=p: open_pack(p))
 
@@ -12276,7 +12317,7 @@ def gui():
     def build_versions():
         vv = versions_state()
         vh_ = section("Версии игры", 0, "любая версия Minecraft — без лаунчера")
-        small_button(vh_, "Место на диске", storage_window, bg=BG, icon="ic_folder.png").pack(side="right")
+        small_button(vh_, "Место на диске", storage_window, bg=BG, icon="ic_disk.png").pack(side="right")
         hero(1, "versions_wide.png", "Любая версия — одним нажатием",
              "Portalis скачает игру, загрузчик модов, звуки и нужную Java прямо в папку игры. "
              "Потом её увидит любой лаунчер, даже без интернета.")
@@ -13006,7 +13047,7 @@ def gui():
             box.pack(fill="x")
             hd = tk.Frame(box, bg=PANEL)
             hd.pack(fill="x")
-            tk.Label(hd, image=art("ic_crown.png", 22, 22), bg=PANEL).pack(side="left")
+            tk.Label(hd, image=art("ic_chart_24.png", 24, 24), bg=PANEL).pack(side="left")
             tk.Label(hd, text="  Популярно у игроков Portalis", font=(FONT, 13, "bold"), fg=TEXT, bg=PANEL).pack(side="left")
             cols = tk.Frame(box, bg=PANEL)
             cols.pack(fill="x", pady=(8, 0))
@@ -15342,11 +15383,11 @@ def gui():
         fr_.pack(fill="x", pady=(0, 6))
         top_ = tk.Frame(fr_, bg=PANEL)
         top_.pack(fill="x")
-        tk.Label(top_, text="🎤", font=(FONT, 12), fg=TEXT, bg=PANEL).pack(side="left")
+        tk.Label(top_, image=art("ic_headset_24.png", 24, 24), bg=PANEL).pack(side="left")
         tk.Label(top_, text=" Голос пати", font=(FONT, 10, "bold"), fg=TEXT, bg=PANEL).pack(side="left")
         if vc is None:
             tk.Label(top_, text="   говорите голосом, пока играете", font=(FONT, 9), fg=MUTED, bg=PANEL).pack(side="left")
-            big_button(top_, "Подключиться", lambda: voice_start(party), icon="ic_invite.png").pack(side="right")
+            big_button(top_, "Подключиться", lambda: voice_start(party), icon="ic_mic.png").pack(side="right")
             return
         small_button(top_, "Отключиться", lambda: (voice_stop(), soc_render()), bg=PANEL).pack(side="right")
         st_ = load_settings()
@@ -15360,7 +15401,7 @@ def gui():
             save_settings(st2)
             vc.set_mic(not mic_on)
             soc_render()
-        chip(ctl, "Микрофон: вкл" if mic_on else "Микрофон: выкл", mic_on, flip_mic).pack(side="left")
+        chip(ctl, "Микрофон: вкл" if mic_on else "Микрофон: выкл", mic_on, flip_mic, icon="ic_mic.png" if mic_on else "ic_mic_off.png").pack(side="left")
         ptt = bool(st_.get("voice_ptt"))
 
         def flip_ptt():
@@ -15493,7 +15534,7 @@ def gui():
         fr_.pack(fill="x", pady=(0, 6))
         top_ = tk.Frame(fr_, bg=PANEL)
         top_.pack(fill="x")
-        tk.Label(top_, image=art("tab_maps.png", 20, 20), bg=PANEL).pack(side="left")
+        tk.Label(top_, image=art("ic_world_sync_24.png", 24, 24), bg=PANEL).pack(side="left")
         tk.Label(top_, text="  Общий мир пати", font=(FONT, 10, "bold"), fg=TEXT, bg=PANEL).pack(side="left")
         host_nick = next((m.get("nick") for m in soc_data().get("members") or [] if m.get("id") == host), "?")
         tk.Label(top_, text="   хозяин: %s" % ("ты" if me_host else host_nick), font=(FONT, 9), fg=MUTED,
@@ -16124,9 +16165,39 @@ def gui():
             big_button(nr, "Сохранить плащ", save, icon="ic_cape.png").pack(side="right")
         fill_panel()
 
-    def skin3d_view(parent, png, slim=None, cape=None, size=(220, 300), bg=PANEL, st=None, controls=True):
+    _stage_cache = {}
+    STAGE_TOP = 650 / 900.0  # где на картинке-подставке верх травяного блока (доля высоты)
+
+    def stage_bg(w, h):
+        """Подставка под 3D-скин: сцена с травяным блоком (веб-ChatGPT), обрезанная под окошко. -> (RGBA, y ног)"""
+        hit = _stage_cache.get((w, h))
+        if hit is None:
+            src = PILImage.open(os.path.join(ART, "skin_stage.jpg")).convert("RGBA")
+            sw, sh = src.size
+            if w / float(h) >= sw / float(sh):  # окошко шире картинки - режем по высоте, блок оставляем внизу
+                ch = int(sw * h / float(w))
+                y0 = int(min(max(0, STAGE_TOP * sh - 0.8 * ch), sh - ch))
+                box, top = (0, y0, sw, y0 + ch), (STAGE_TOP * sh - y0) / ch
+            else:
+                cw = int(sh * w / float(h))
+                x0 = (sw - cw) // 2
+                box, top = (x0, 0, x0 + cw, sh), STAGE_TOP
+            im = src.crop(box).resize((w, h), PILImage.LANCZOS)
+            fy = int(top * h)  # мягкая размытая тень под ногами
+            sh_ = PILImage.new("L", (w, h), 0)
+            rx, ry = int(w * 0.17), max(3, int(h * 0.022))
+            ImageDraw.Draw(sh_).ellipse((w // 2 - rx, fy - ry, w // 2 + rx, fy + ry), fill=110)
+            sh_ = sh_.filter(ImageFilter.GaussianBlur(max(2, h * 0.014)))
+            im.alpha_composite(PILImage.merge("RGBA", (sh_.point(lambda v: 0),) * 3 + (sh_,)))
+            hit = _stage_cache[(w, h)] = (im, fy)
+        return hit
+
+    def skin3d_view(parent, png, slim=None, cape=None, size=(220, 300), bg=PANEL, st=None, controls=True, stage=True):
         """Скин в 3D: тяни мышью - персонаж поворачивается, колесо - ближе/дальше, двойной щелчок - как было.
-        Под ним - плащ / элитры / шаг. st - словарь, где помнить поворот между перерисовками вкладки."""
+        Под ним - плащ / элитры / шаг. st - словарь, где помнить поворот между перерисовками вкладки.
+        stage - персонаж стоит на травяном блоке на фоне вечернего леса (ноги всегда на блоке, как ни крути)."""
+        if stage and not os.path.isfile(os.path.join(ART, "skin_stage.jpg")):
+            stage = False
         fr = tk.Frame(parent, bg=bg)
         if skin3d is None:
             tk.Label(fr, image=pil_photo(render_skin(png, slim, 5)), bg=bg).pack()
@@ -16145,9 +16216,19 @@ def gui():
         def draw(ss=2):
             job["id"] = None
             try:
-                im = skin3d.render(png, yaw=v["yaw"], pitch=v["pitch"], size=size, slim=slim,
+                csize = (size[0], int(size[1] * 0.8)) if stage else size
+                im = skin3d.render(png, yaw=v["yaw"], pitch=v["pitch"], size=csize, slim=slim,
                                    cape=cape if v["cape"] or v["elytra"] else None, elytra=bool(cape) and v["elytra"],
                                    pose="walk" if v["walk"] else "stand", ss=ss, zoom=v["zoom"])
+                if stage:
+                    base, fy = stage_bg(*size)
+                    base = base.copy()
+                    bb = im.getchannel("A").getbbox()
+                    dy = fy - (bb[3] if bb else csize[1]) + int(size[1] * 0.012)
+                    layer = PILImage.new("RGBA", size, (0, 0, 0, 0))
+                    layer.paste(im, (0, dy), im)
+                    base.alpha_composite(layer)
+                    im = base
             except Exception:
                 lb.configure(image=pil_photo(render_skin(png, slim, 5)), cursor="")
                 return
@@ -17005,23 +17086,32 @@ def gui():
                             shell32.DragQueryFileW(wp, i, buf, ln + 1)
                             out.append(buf.value)
                         shell32.DragFinish(wp)
-                        win.after(10, lambda: handle_drop(out))
-                    except Exception:
-                        log_error("перетаскивание")
+                        drops.extend(out)  # только в очередь: отсюда (изнутри цикла событий Tk) звать Tcl нельзя -
+                    except Exception:      # tkinter теряет своё состояние и программа падает
+                        pass
                     return 0
                 return comctl32.DefSubclassProc(h, msg, wp, lp_)
+            drops = []
+
+            def poll_drops():
+                if drops:
+                    got = drops[:]
+                    del drops[:]
+                    handle_drop(got)
+                win.after(250, poll_drops)
             cb = PROC(proc)
             state["drop_proc"] = cb  # держим ссылку: иначе обработчик соберёт сборщик мусора
             comctl32.SetWindowSubclass.argtypes = [wintypes.HWND, PROC, ctypes.c_size_t, ctypes.c_size_t]
             if comctl32.SetWindowSubclass(hwnd, cb, 0x50D, 0):
                 shell32.DragAcceptFiles(hwnd, True)
+                poll_drops()
         except Exception:
             log_error("перетаскивание: подключение")
 
     # --- «Место на диске»: что занимает место и что можно убрать в Корзину ---
     def storage_window():
         t, body = detail_window("Место на диске", full=True)
-        window_header(body, "tab_versions_64.png" if os.path.isfile(os.path.join(ART, "tab_versions_64.png"))
+        window_header(body, "ic_disk_64.png" if os.path.isfile(os.path.join(ART, "ic_disk_64.png"))
                       else "tab_versions.png", "Место на диске",
                       "что занимает место и что можно освободить: убранное уходит в Корзину").pack(fill="x")
         box = tk.Frame(body, bg=BG)
