@@ -50,7 +50,9 @@ def patched(self, *a):
     def typ(text):
         en = [w for w in walk(tops()[-1]) if isinstance(w, tk.Entry)][0]
         en.delete(0, 'end'); en.insert(0, text)
+        en.focus_force(); self.update()
         en.event_generate('<KeyRelease>', keysym='space')
+        print('   фокус в поле поиска:', self.focus_get() is en)
         self.update()
         rows = [w.cget('text').strip() for w in walk(tops()[-1]) if isinstance(w, tk.Label) and
                 str(w.cget('font')).find('bold') >= 0 and w.cget('text').startswith('  ')]

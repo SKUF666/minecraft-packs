@@ -148,7 +148,7 @@ class Member:
     __slots__ = ("ws", "room", "slot", "uid", "nick", "muted", "speaking",
                  "last_audio", "audio", "control", "wake", "loopback",
                  "rate_t", "rate_n", "rx", "dropped_rate", "dropped_slow",
-                 "sender")
+                 "sender", "token")
 
     def __init__(self, ws: ServerConnection, room: "Room", slot: int, uid: str,
                  nick: str, muted: bool, loopback: bool):
@@ -166,6 +166,7 @@ class Member:
         self.dropped_rate = 0
         self.dropped_slow = 0
         self.sender: asyncio.Task | None = None
+        self.token = ""
 
     def push_audio(self, data: bytes) -> None:
         if len(self.audio) == SEND_QUEUE:   # медленный клиент: старый кадр выбрасываем
@@ -299,6 +300,7 @@ async def handler(ws: ServerConnection) -> None:
     loopback = bool(hello.get("loopback")) and ALLOW_LOOPBACK
     me = Member(ws, room, slot, uid, clean_nick(hello.get("nick")),
                 bool(hello.get("muted")), loopback)
+    me.token = token
     room.members[slot] = me
     me.push_control(json.dumps({"type": "welcome", "slot": slot, "party": party,
                                 "uid": uid, "loopback": loopback}))
@@ -406,6 +408,30 @@ async def speaking_watch() -> None:
                 room.broadcast_roster()
 
 
+RECHECK_EVERY = 60.0
+
+
+async def member_recheck() -> None:
+    """Раз в минуту: участник всё ещё в пати? Вышел или выгнали - отключаем (4003).
+    Если токен уже истёк или Supabase не отвечает - не выкидываем: проверить нельзя, а не «не участник»."""
+    if FAKE_AUTH:
+        return
+    loop = asyncio.get_running_loop()
+    while True:
+        await asyncio.sleep(RECHECK_EVERY)
+        for party, room in list(rooms.items()):
+            for m in list(room.members.values()):
+                try:
+                    await loop.run_in_executor(None, _check_blocking, m.token, party)
+                except AuthError as e:
+                    if e.close_code == 4003:
+                        _auth_cache.pop((m.token, party), None)
+                        log.info("kick uid=%s party=%s: left the party", m.uid[:8], party[:8])
+                        asyncio.ensure_future(m.ws.close(4003, "not a party member"))
+                except Exception:
+                    pass
+
+
 async def stats_log() -> None:
     while True:
         await asyncio.sleep(60)
@@ -436,7 +462,8 @@ async def main() -> None:
             asyncio.get_running_loop().add_signal_handler(
                 sig, lambda: stop.done() or stop.set_result(None))
 
-    bg = [asyncio.create_task(speaking_watch()), asyncio.create_task(stats_log())]
+    bg = [asyncio.create_task(speaking_watch()), asyncio.create_task(stats_log()),
+          asyncio.create_task(member_recheck())]
     async with serve(
         handler, HOST, PORT,
         process_request=process_request,
