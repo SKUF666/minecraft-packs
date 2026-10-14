@@ -56,6 +56,7 @@ ERR_SERVER = "Сервер голоса недоступен"
 ERR_NOT_MEMBER = "Ты не в этой пати"
 ERR_AUTH = "Не удалось войти в голосовой чат — перезайди в аккаунт"
 ERR_FULL = "В голосовом чате уже 12 человек"
+ERR_REPLACED = "Ты подключился к голосу с другого компьютера - здесь голос выключен"
 ERR_LIB = "Не установлен модуль websocket-client"
 ERR_MIC_SILENT = ("Микрофон молчит — проверь, что он подключён, не выключен "
                   "и разрешён в «Параметры → Конфиденциальность → Микрофон»")
@@ -576,7 +577,7 @@ class VoiceClient:
 
     def _close_code_error(self, data: bytes):
         code = int.from_bytes(data[:2], "big") if len(data) >= 2 else 0
-        return {4001: ERR_AUTH, 4003: ERR_NOT_MEMBER, 4009: ERR_FULL}.get(code)
+        return {4000: ERR_REPLACED, 4001: ERR_AUTH, 4003: ERR_NOT_MEMBER, 4009: ERR_FULL}.get(code)
 
     def _on_text(self, text: str):
         try:

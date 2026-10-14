@@ -28,6 +28,7 @@ import http.server
 import zipfile
 import hashlib
 import random
+import zlib
 import math
 import ctypes
 import ctypes.wintypes
@@ -203,6 +204,22 @@ def tr(text):
     return out
 
 
+def _with_flag(fn, st, key="busy"):
+    """fn(), а флаг st[key] снимается и при ошибке (иначе опрос встанет навсегда)."""
+    try:
+        return fn()
+    except Exception:
+        st[key] = False
+        raise
+
+
+def _quiet(fn, *a):
+    try:
+        return fn(*a)
+    except Exception:
+        return None
+
+
 def install_after_guard():
     """Таймеры after() виджета снимаются вместе с виджетом.
     Иначе Tcl-таймер переживает удалённую команду, а имя команды (адрес функции + имя) достаётся новому обработчику:
@@ -263,6 +280,20 @@ def install_tr():
     def wm_title(self, string=None):
         return orig_title(self, tr(string) if string else string)
     tkinter.Wm.wm_title = tkinter.Wm.title = wm_title
+    import tkinter.filedialog as _fd
+    for name_ in ("askopenfilename", "askopenfilenames", "asksaveasfilename", "askdirectory"):
+        orig_ = getattr(_fd, name_, None)
+        if orig_ is None or getattr(orig_, "_portalis_tr", False):
+            continue
+
+        def wrap(*a, _orig=orig_, **kw):
+            if "title" in kw:
+                kw["title"] = tr(kw["title"])
+            if "filetypes" in kw:
+                kw["filetypes"] = [(tr(lbl), pat) for lbl, pat in kw["filetypes"]]
+            return _orig(*a, **kw)
+        wrap._portalis_tr = True
+        setattr(_fd, name_, wrap)
     tkinter.Misc._portalis_tr = True
 SINGLE_FILE = os.path.abspath(ROOT) != os.path.abspath(APP_DIR)
 os.makedirs(ROOT, exist_ok=True)
@@ -505,7 +536,8 @@ def set_tlauncher_version(version):
             done = True
     if not done:
         lines.append("login.version.game=" + version)
-    shutil.copy2(TL_PROPS, TL_PROPS + ".switcher.bak")
+    if not os.path.exists(TL_PROPS + ".switcher.bak"):
+        shutil.copy2(TL_PROPS, TL_PROPS + ".switcher.bak")
     with open(TL_PROPS, "w", encoding="utf-8", newline="\n") as fh:
         fh.write("\n".join(lines) + "\n")
     return True
@@ -552,12 +584,17 @@ def ensure_vanilla(version, log=print):
     raw = _download(entry["url"])
     info = json.loads(raw)
     os.makedirs(vdir, exist_ok=True)
-    if not os.path.isfile(vjar):
-        jar = _download(info["downloads"]["client"]["url"])
-        with open(vjar, "wb") as fh:
+    cl = info["downloads"]["client"]
+    if not (os.path.isfile(vjar) and os.path.getsize(vjar) == cl.get("size", -1)):
+        jar = _download(cl["url"])
+        if cl.get("sha1") and hashlib.sha1(jar).hexdigest() != cl["sha1"]:
+            raise RuntimeError("клиент Minecraft %s скачался с ошибкой - попробуй ещё раз" % version)
+        with open(vjar + ".part", "wb") as fh:
             fh.write(jar)
-    with open(vjson, "wb") as fh:
+        os.replace(vjar + ".part", vjar)
+    with open(vjson + ".part", "wb") as fh:
         fh.write(raw)
+    os.replace(vjson + ".part", vjson)
     log("Minecraft %s установлен, остальное TLauncher докачает при запуске" % version)
     return True
 
@@ -1000,13 +1037,18 @@ class Social:
 
     def _save(self, sess):
         self.session = sess or {}
-        st = load_settings()
+        soc_ = {}
         if sess:
-            st["social"] = {k: sess.get(k) for k in ("access_token", "refresh_token", "expires_at", "user")}
-            st["social"]["user"] = {"id": (sess.get("user") or {}).get("id")}
-        else:
-            st.pop("social", None)
-        save_settings(st)
+            soc_ = {k: sess.get(k) for k in ("access_token", "refresh_token", "expires_at", "user")}
+            soc_["user"] = {"id": (sess.get("user") or {}).get("id")}
+        with _SETTINGS_LOCK:
+            _SOCIAL_NOW[0] = soc_
+            st = load_settings()
+            if soc_:
+                st["social"] = soc_
+            else:
+                st.pop("social", None)
+            save_settings(st)
 
     def _auth(self, path, body):
         j = _http_json("POST", self.cfg["url"] + "/auth/v1/" + path, {"apikey": self.cfg["key"]}, body)
@@ -1436,11 +1478,31 @@ class Social:
         self.rest("DELETE", "party_proposals", {"id": "eq.%d" % prop_id})
 
     def merge_lobby(self, pid, **fields):
-        """Добавить/поменять поля лобби пати, не трогая остальные (карта пати, общий мир...)."""
+        """Добавить/поменять поля лобби пати, не трогая остальные (карта пати, общий мир...).
+        На сервере с шагом 9 - одной командой (без гонок), иначе - прочитать и записать."""
+        try:
+            r = self.rest("POST", "rpc/party_lobby_merge", body={"p": pid, "patch": fields})
+            return r if isinstance(r, dict) else fields
+        except SocialError as e:
+            if e.code not in (400, 404):
+                raise
         cur = (self.party(pid) or {}).get("lobby") or {}
         cur.update(fields)
         self.rest("PATCH", "parties", {"id": "eq." + pid}, {"lobby": cur})
         return cur
+
+    def take_host(self, pid, expected):
+        """Стать хозяином пати, если хозяин всё ещё expected. -> False, если кто-то успел раньше."""
+        try:
+            return bool(self.rest("POST", "rpc/party_take_host", body={"p": pid, "expected": expected}))
+        except SocialError as e:
+            if e.code not in (400, 404):
+                raise
+        cur = (self.party(pid) or {})
+        if ((cur.get("lobby") or {}).get("host") or cur.get("owner")) != expected:
+            return False
+        self.merge_lobby(pid, host=self.uid)
+        return True
 
     def set_lobby(self, pid, lobby):
         """Карта пати (выбирает хозяин): {map, title, version, pack}."""
@@ -1741,9 +1803,7 @@ def _html_text(h):
     h = re.sub(r"(?i)<li[^>]*>", "\n• ", h)
     h = re.sub(r"(?i)<br\s*/?>|</p>|</li>|</div>|</h\d>", "\n", h)
     h = re.sub(r"<[^>]+>", "", h)
-    for a, b in (("&nbsp;", " "), ("&quot;", '"'), ("&laquo;", "«"), ("&raquo;", "»"), ("&mdash;", "—"),
-                 ("&ndash;", "–"), ("&#039;", "'"), ("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">")):
-        h = h.replace(a, b)
+    h = _html.unescape(h).replace("\xa0", " ")
     lines = [re.sub(r"[ \t]+", " ", x).strip() for x in h.splitlines()]
     out = []
     for x in lines:
@@ -1894,20 +1954,22 @@ def _tr_key(text, target, source):
 def _tr_load(cache_path):
     if not cache_path:
         return
-    with _tr_lock:
-        if cache_path in _tr_disk:
-            return
-        _tr_disk[cache_path] = {}
-    try:
-        with open(cache_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, ValueError):
-        return
-    if isinstance(data, dict):
+    with _tr_save_lock:  # пока читаем, никто не пишет почти пустой снимок
         with _tr_lock:
-            _tr_disk[cache_path].update(data)
-            for k, v in data.items():
+            if cache_path in _tr_disk:
+                return
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = {}
+        with _tr_lock:
+            _tr_disk[cache_path] = dict(data) if isinstance(data, dict) else {}
+            for k, v in _tr_disk[cache_path].items():
                 _tr_cache.setdefault(k, v)
+
+
+_tr_save_lock = threading.Lock()
 
 
 def _tr_save(cache_path):
@@ -1916,12 +1978,13 @@ def _tr_save(cache_path):
     try:
         folder = os.path.dirname(os.path.abspath(cache_path))
         os.makedirs(folder, exist_ok=True)
-        with _tr_lock:
-            snapshot = dict(_tr_disk.get(cache_path, {}))
-        tmp = cache_path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(snapshot, f, ensure_ascii=False)
-        os.replace(tmp, cache_path)
+        with _tr_save_lock:
+            with _tr_lock:
+                snapshot = dict(_tr_disk.get(cache_path, {}))
+            tmp = "%s.%d.tmp" % (cache_path, threading.get_ident())
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, ensure_ascii=False)
+            os.replace(tmp, cache_path)
     except OSError:
         pass
 
@@ -2352,6 +2415,8 @@ def mm_list(page=1, cat=None, version=None, sort=None, query=None):
     srt = MM_SORTS.get(sort, "newest")
     slug = MM_CATS.get(cat) or (cat if cat in MM_SLUGS else None)
     kw = MM_KW.get(cat)
+    if cat and not slug and not kw:
+        return [], False
     query = (query or "").strip() or None
     if page == 1:
         maps, total = _mm_search_page(query or kw, slug, version, srt)
@@ -2507,6 +2572,8 @@ def web_maps_page(wm):
                 x["desc"] = d
         return pg, items, nxt
     todo = [x for x in srcs if x not in done and time.time() - _WM_DOWN.get(x, 0) > 600]
+    if not todo and not wm.get("pending") and not done:
+        raise RuntimeError("каталоги карт не отвечают - проверь интернет и нажми F5")
     pending = wm.setdefault("pending", {})  # каталоги, не успевшие к прошлой порции: их ответ войдёт в эту
     futs = [(src, pending.pop(src, None) or
              _WM_THREADS.setdefault(src, concurrent.futures.ThreadPoolExecutor(1)).submit(one, src)) for src in todo]
@@ -2545,7 +2612,7 @@ def mi_pick_download(info, want=None):
     if not maps:
         return None, []
     pick = next((d for d in maps if want and want in d["versions"]), maps[0])
-    gv = (pick["versions"] or info["versions"] or [None])[0]
+    gv = want if want and want in (pick["versions"] or []) else (pick["versions"] or info["versions"] or [None])[0]
     rps = [d for d in info["downloads"] if d["kind"] == "rp" and (not d["versions"] or not gv or gv in d["versions"])]
     return dict(pick, gv=gv), rps[:1]
 
@@ -2592,11 +2659,19 @@ def web_image(url, size, key=None):
     key = key or hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
     p = os.path.join(_web_dir("img"), "%s_%dx%d.png" % (key, size[0], size[1]))
     if os.path.isfile(p):
-        return PILImage.open(p).convert("RGBA")
+        try:
+            return PILImage.open(p).convert("RGBA")
+        except Exception:
+            try:
+                os.remove(p)  # недописанный файл нашего же кэша
+            except OSError:
+                pass
     im = PILImage.open(io.BytesIO(web_get(url, 30, 3, {"Referer": MI + "/"} if "minecraft-inside" in url else None))
                        ).convert("RGBA")
     im.thumbnail(size, PILImage.LANCZOS)
-    im.save(p)
+    tmp = "%s.%d.tmp" % (p, threading.get_ident())
+    im.save(tmp, "PNG")
+    os.replace(tmp, p)
     return im
 
 
@@ -2605,10 +2680,10 @@ def _extract_archive(path, dst):
     if zipfile.is_zipfile(lp(path)):
         with zipfile.ZipFile(lp(path)) as z:
             for info in z.infolist():
-                name = zip_member_name(info).replace("\\", "/")
-                if info.is_dir() or name.startswith("/") or ".." in name.split("/"):
+                parts = safe_rel(zip_member_name(info))
+                if info.is_dir() or not parts:
                     continue
-                out = os.path.join(dst, *name.split("/"))
+                out = os.path.join(dst, *parts)
                 os.makedirs(os.path.dirname(lp(out)), exist_ok=True)
                 with z.open(info) as src, open(lp(out), "wb") as fh:
                     shutil.copyfileobj(src, fh)
@@ -2858,9 +2933,9 @@ def classify_drop(path):
         if w % 64 == 0 and h == w:
             return "skin"
         if w % 64 == 0 and h * 2 == w:  # 64x32: старый скин или плащ - у скина есть руки справа внизу
-            k = w // 64
-            arms = im.convert("RGBA").crop((44 * k, 16 * k, 56 * k, 32 * k)).getextrema()[3][1]
-            return "skin" if arms > 0 else "cape"
+            k = w // 64  # у скина есть ноги слева внизу, у плаща (даже с элитрами) там пусто
+            legs = im.convert("RGBA").crop((0, 20 * k, 16 * k, 32 * k)).getextrema()[3][1]
+            return "skin" if legs > 0 else "cape"
         if w % 22 == 0 and h * 22 >= w * 17 * 0.9:
             return "cape"
         return None
@@ -2936,7 +3011,8 @@ import socket
 VPN_KINDS = (("Hamachi", "hamachi"), ("Radmin VPN", "radmin"), ("ZeroTier", "zerotier"))
 LAN_KIND = "Одна Wi-Fi сеть"
 NET_KINDS = ["Hamachi", "Radmin VPN", "ZeroTier", LAN_KIND]
-FRIEND_SERVER = "Игра друга (Hamachi)"
+FRIEND_SERVER = "Игра друга (Portalis)"  # по любой сети: Hamachi, Radmin VPN, ZeroTier или Wi-Fi
+OLD_FRIEND_SERVERS = ("Игра друга (Hamachi)",)
 
 
 def local_ipv4():
@@ -3043,8 +3119,16 @@ def ping_server(host, port, timeout=6):
     """Запрос статуса, как в списке серверов игры. Возвращает версию и онлайн или бросает ошибку."""
     t0 = time.time()
     s = socket.create_connection((host, port), timeout=timeout)
+    try:
+        return _ping_on(s, host, port, timeout, t0)
+    finally:
+        s.close()
+
+
+def _ping_on(s, host, port, timeout, t0):
     s.settimeout(timeout)
-    hs = _vi(0) + _vi(767) + _vi(len(host)) + host.encode() + struct.pack(">H", port) + _vi(1)
+    hb = host.encode("utf-8")
+    hs = _vi(0) + _vi(767) + _vi(len(hb)) + hb + struct.pack(">H", port) + _vi(1)
     s.sendall(_vi(len(hs)) + hs + _vi(1) + b"\x00")
 
     def rvi():
@@ -3065,7 +3149,6 @@ def ping_server(host, port, timeout=6):
         if not chunk:
             break
         data += chunk
-    s.close()
     i = 0
     while data[i] & 0x80:
         i += 1
@@ -3242,6 +3325,8 @@ def _motd_text(d):
 
 def resolve_srv(host):
     """Адрес из DNS-записи _minecraft._tcp, если сервер сидит не на стандартном порту."""
+    if not re.match(r"^[A-Za-z0-9.-]{1,253}$", host or ""):
+        return None
     try:
         out = subprocess.run(["powershell", "-NoProfile", "-Command", PS_UTF8,
                               "Resolve-DnsName -Type SRV _minecraft._tcp.%s -ErrorAction Stop | "
@@ -3276,14 +3361,18 @@ def add_server_entry(name, ip):
     if lst is None:
         lst = ("list", 10, [])
         root[1].append(("servers", 9, lst))
-    if any(any(k == "ip" and v.lower().replace(":25565", "") == ip.lower() for k, _t, v in e[1]) for e in lst[2]):
+    norm = lambda x: str(x).strip().lower()[:-6] if str(x).strip().lower().endswith(":25565") else str(x).strip().lower()
+    if any(any(k == "ip" and norm(v) == norm(ip) for k, _t, v in e[1]) for e in lst[2]):
         return False
     lst[2].append(("compound", [("ip", 8, ip), ("name", 8, name), ("acceptTextures", 1, 1), ("hideAddress", 1, 0)]))
     out = io.BytesIO(); out.write(b"\x0a"); b = rname.encode(); out.write(struct.pack(">H", len(b))); out.write(b)
     _nbt_w(out, 10, root)
     os.makedirs(MC, exist_ok=True)
-    with open(SERVERS_DAT, "wb") as fh:
+    if os.path.isfile(SERVERS_DAT) and not os.path.exists(SERVERS_DAT + ".switcher.bak"):
+        shutil.copy2(SERVERS_DAT, SERVERS_DAT + ".switcher.bak")
+    with open(SERVERS_DAT + ".tmp", "wb") as fh:
         fh.write(out.getvalue())
+    os.replace(SERVERS_DAT + ".tmp", SERVERS_DAT)
     return True
 
 
@@ -3407,7 +3496,7 @@ def set_friend_server(address, name=FRIEND_SERVER):
     if lst is None:
         lst = ("list", 10, [])
         root[1].append(("servers", 9, lst))
-    keep = [s for s in lst[2] if not any(k == "name" and v == name for k, _t, v in s[1])]
+    keep = [s for s in lst[2] if not any(k == "name" and (v == name or v in OLD_FRIEND_SERVERS) for k, _t, v in s[1])]
     entry = ("compound", [("ip", 8, address), ("name", 8, name), ("acceptTextures", 1, 1), ("hideAddress", 1, 0)])
     lst[2][:] = [entry] + keep
     os.makedirs(MC, exist_ok=True)
@@ -3435,7 +3524,7 @@ def join_friend(text, packs=None, log=print):
         else:
             log("Сборка «%s» уже включена" % pack_name)
     elif tl:
-        if not tl.lower().startswith(("fabric", "forge")):
+        if MC_VERSION_RE.match(tl):
             ensure_vanilla(tl, log)
         ok, hint = select_version(tl, "игра друга", log)
         if hint:
@@ -3455,20 +3544,36 @@ LAUNCHERS_DIR = os.path.join(ROOT, "Лаунчеры")
 _START_APPS = {"list": None}
 
 
+_SETTINGS_LOCK = threading.RLock()
+_SOCIAL_NOW = [None]  # последняя сессия входа от Social: None - не трогать, {} - вышел, иначе - она
+
+
 def load_settings():
-    try:
-        with open(SETTINGS, encoding="utf-8") as fh:
-            return json.load(fh)
-    except Exception:
-        return {}
+    with _SETTINGS_LOCK:
+        try:
+            with open(SETTINGS, encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception:
+            return {}
 
 
 def save_settings(data):
-    try:
-        with open(SETTINGS, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, ensure_ascii=False, indent=1)
-    except Exception:
-        pass
+    """Запись целиком через временный файл (полусохранённого файла не бывает). Сессию входа берём самую свежую:
+    иначе окно, прочитавшее настройки до обновления токена, вернуло бы старый токен - и вход бы слетал."""
+    with _SETTINGS_LOCK:
+        d = dict(data)
+        if _SOCIAL_NOW[0] is not None:
+            if _SOCIAL_NOW[0]:
+                d["social"] = _SOCIAL_NOW[0]
+            else:
+                d.pop("social", None)
+        tmp = SETTINGS + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(d, fh, ensure_ascii=False, indent=1)
+            os.replace(tmp, SETTINGS)
+        except Exception:
+            pass
 
 
 def load_launchers():
@@ -3616,11 +3721,16 @@ def set_launcher_profile(version, title):
     except OSError:
         pass
     for path in files:
-        try:
-            with open(path, encoding="utf-8") as fh:
-                data = json.load(fh)
-        except Exception:
+        if os.path.isfile(path):
+            try:
+                with open(path, encoding="utf-8-sig") as fh:
+                    data = json.load(fh)
+            except Exception:
+                continue  # файл занят лаунчером или испорчен - лучше без профиля, чем стереть чужие профили
+        else:
             data = {"profiles": {}, "settings": {}, "version": 3}
+        if not isinstance(data, dict):
+            continue
         if os.path.isfile(path) and not os.path.exists(path + ".switcher.bak"):
             shutil.copy2(path, path + ".switcher.bak")
         prof = data.setdefault("profiles", {})
@@ -3628,8 +3738,9 @@ def set_launcher_profile(version, title):
         prof["portalis"] = {"name": "%s: %s" % (APP_NAME, title)[:60], "type": "custom",
                             "created": old.get("created", now), "lastUsed": now, "icon": icon, "lastVersionId": version}
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
+        with open(path + ".tmp", "w", encoding="utf-8") as fh:
             json.dump(data, fh, ensure_ascii=False, indent=2)
+        os.replace(path + ".tmp", path)
     return True
 
 
@@ -3847,7 +3958,12 @@ def total_ram_mb():
 def direct_java(version):
     """javaw.exe для версии (компонент Java из описания версии), или None - тогда её надо скачать."""
     comp = mc_launch.java_component(version, MC) if mc_launch else "java-runtime-delta"
-    return find_game_java(comp) or (mc_launch.find_javaw(comp, MC) if mc_launch else None), comp
+    j = find_game_java(comp)
+    if not j and mc_launch:
+        c = mc_launch.find_javaw(comp, MC)
+        if c and not os.path.abspath(c).lower().startswith(os.path.abspath(os.path.join(MC, "runtime")).lower()):
+            j = c  # Java другого лаунчера; своя папка runtime без отметки «докачано» - не берём
+    return j, comp
 
 
 def open_launcher():
@@ -3900,8 +4016,9 @@ def export_mrpack(m=None, pack=None, log=print):
             urls[base + "/" + k] = u
     mc_ver = pack["minecraft"] if pack else m["version"]
     deps = {"minecraft": mc_ver}
-    if pack and pack.get("loader") in ("Fabric", "Forge") and pack.get("loader_version"):
-        deps["fabric-loader" if pack["loader"] == "Fabric" else "forge"] = pack["loader_version"]
+    mr_dep = {"Fabric": "fabric-loader", "Forge": "forge", "NeoForge": "neoforge", "Quilt": "quilt-loader"}
+    if pack and pack.get("loader") in mr_dep and pack.get("loader_version"):
+        deps[mr_dep[pack["loader"]]] = pack["loader_version"]
     parts = [x for x in ((m or {}).get("title"), pack and pack["name"].rsplit(" (", 1)[0]) if x]
     title = " + ".join(dict.fromkeys(parts)) or mc_ver
     name = "%s - %s" % (APP_NAME, title)
@@ -4033,7 +4150,7 @@ def backups_dir():
     return os.path.join(docs, "Minecraft - копии миров")
 
 
-def backup_world(m, log=print):
+def backup_world_local(m, log=print):
     """Копия сохранения карты в zip в «Документы\\Minecraft - копии миров»."""
     src = os.path.join(SAVES, m["save"])
     if not os.path.isdir(src):
@@ -4141,8 +4258,12 @@ def swap_exe_after_exit(new, target, start=True):
     """Когда программа закроется: переписать target содержимым new (файл остаётся тем же - значок на рабочем
     столе и ярлыки не пропадают) и, если start, запустить. Делает это скрытый PowerShell."""
     q = lambda s: "'" + s.replace("'", "''") + "'"
-    ps = ("$n=%s;$t=%s;$ok=$false;for($i=0;$i -lt 160;$i++){try{[IO.File]::Copy($n,$t,$true);$ok=$true;break}"
-          "catch{Start-Sleep -Milliseconds 400}};if($ok){Remove-Item -LiteralPath $n -Force -EA 0};"
+    ps = ("$n=%s;$t=%s;$b=$t+'.bak';$ok=$false;$L=(Get-Item -LiteralPath $n).Length;"
+          "for($i=0;$i -lt 160;$i++){try{if(-not(Test-Path -LiteralPath $b)){[IO.File]::Copy($t,$b,$true)};"
+          "[IO.File]::Copy($n,$t,$true);if((Get-Item -LiteralPath $t).Length -eq $L){$ok=$true;break}}"
+          "catch{Start-Sleep -Milliseconds 400}};"
+          "if($ok){Remove-Item -LiteralPath $n -Force -EA 0;Remove-Item -LiteralPath $b -Force -EA 0}"
+          "elseif(Test-Path -LiteralPath $b){try{[IO.File]::Copy($b,$t,$true)}catch{}};"
           "if(%s){Start-Process -FilePath $t -WorkingDirectory %s}") % (
         q(new), q(target), "$true" if start else "$false", q(os.path.dirname(target)))
     enc = base64.b64encode(ps.encode("utf-16-le")).decode("ascii")
@@ -4706,7 +4827,9 @@ def plan_update(remote, root=ROOT, log=print, extra_items=()):
 def plan_download(remote, item_ids, root=ROOT, log=print):
     """Скачать карты и сборки item_ids. Если вышла новая версия, заодно обновить всё остальное."""
     local = load_manifest_at(root)
-    if local.get("version") != remote.get("version") or not local.get("items"):
+    if local.get("items") and vtuple(remote.get("version")) < vtuple(local.get("version")):
+        remote = local  # GitHub ещё отдаёт прошлую опись: качаем по своей, ничего не откатывая
+    if update_available(remote, local):
         plan = plan_update(remote, root, log, item_ids)
         plan["with_update"] = True
         return plan
@@ -4862,9 +4985,11 @@ def _recycle_once(path):
             _fields_ = [("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT), ("pFrom", wintypes.LPCWSTR),
                         ("pTo", wintypes.LPCWSTR), ("fFlags", ctypes.c_uint16), ("fAnyOperationsAborted", wintypes.BOOL),
                         ("hNameMappings", ctypes.c_void_p), ("lpszProgressTitle", wintypes.LPCWSTR)]
-        op = SHFILEOPSTRUCTW(None, 3, os.path.abspath(path) + "\0\0", None, 0x0040 | 0x0010 | 0x0004 | 0x0400, False,
-                             None, None)
-        return ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+        # 0x4000 FOF_WANTNUKEWARNING: если в Корзину не влезает (или она выключена), Windows спросит, а не сотрёт молча
+        op = SHFILEOPSTRUCTW(None, 3, os.path.abspath(path) + "\0\0", None,
+                             0x0040 | 0x0010 | 0x0004 | 0x0400 | 0x4000, False, None, None)
+        code = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+        return code or (1223 if op.fAnyOperationsAborted else 0)
     except Exception as e:
         return str(e)
 
@@ -5105,12 +5230,23 @@ def dir_size(path):
             return os.path.getsize(path)
     except OSError:
         return 0
-    for d, _dirs, fs in os.walk(lp(path)):
-        for f in fs:
-            try:
-                total += os.path.getsize(os.path.join(d, f))
-            except OSError:
-                pass
+    stack = [lp(path)]
+    while stack:
+        try:
+            it = os.scandir(stack.pop())
+        except OSError:
+            continue
+        with it:
+            for e in it:
+                try:
+                    if e.is_symlink() or (hasattr(e, "is_junction") and e.is_junction()):
+                        continue
+                    if e.is_dir(follow_symlinks=False):
+                        stack.append(e.path)
+                    else:
+                        total += e.stat(follow_symlinks=False).st_size
+                except OSError:
+                    pass
     return total
 
 
@@ -5126,10 +5262,22 @@ def storage_report(root=ROOT, mc=None):
             if n:
                 rep_["items"].append((it, n))
     vdir = os.path.join(mc, "versions")
+    rep_["vinfo"] = {}
     for v in _listdir(vdir):
         p = os.path.join(vdir, v)
         if os.path.isdir(p):
             rep_["versions"].append((v, p, dir_size(p)))
+            data = [x for x in ("saves", "mods", "config", "resourcepacks", "options.txt") if os.path.exists(os.path.join(p, x))]
+            parent = None
+            try:
+                with open(os.path.join(p, v + ".json"), encoding="utf-8") as fh:
+                    parent = json.load(fh).get("inheritsFrom")
+            except Exception:
+                pass
+            rep_["vinfo"][v] = {"data": data, "parent": parent, "needed_by": []}
+    for v, inf in rep_["vinfo"].items():
+        if inf["parent"] in rep_["vinfo"]:
+            rep_["vinfo"][inf["parent"]]["needed_by"].append(v)
     upd = os.path.join(root, "_update")
     for name in _listdir(upd):
         p = os.path.join(upd, name)
@@ -5399,6 +5547,8 @@ def cf_maps(page=1, cat=None, version=None, sort=None, query=None, size=20):
         params["gameVersion"] = version
     if cat in CF_MAP_CATS:
         params["categoryId"] = CF_MAP_CATS[cat]
+    elif cat:
+        return [], False
     r = cf_get("mods/search", params)
     out = []
     for m in r.get("data", []):
@@ -5479,7 +5629,7 @@ def import_cfpack(src, name=None, log=print, progress=None, cancel=None, icon=No
                 blocked.append("%s (%s)" % (title or f["fileName"], "https://www.curseforge.com/minecraft/mc-mods/%d" % f["modId"]))
         if files and icon:
             files[0]["icon"] = icon
-        name = name or man.get("name") or os.path.splitext(os.path.basename(src))[0]
+        name = free_pack_name(name or man.get("name") or os.path.splitext(os.path.basename(src))[0], gv, loader)
         log("Модпак «%s»: Minecraft %s, %s %s, файлов %d" % (name, gv, LOADER_TITLES[loader], lv, len(files)))
         folder = save_build(name, gv, loader, files, [], "Модпак с CurseForge.", False, log, progress, cancel, lv or None)
         ov = (man.get("overrides") or "overrides").strip("/") + "/"
@@ -5487,9 +5637,10 @@ def import_cfpack(src, name=None, log=print, progress=None, cancel=None, icon=No
         for zi in z.infolist():
             if zi.filename.startswith(ov) and not zi.is_dir():
                 rel = zi.filename[len(ov):]
-                if ".." in rel or rel.startswith(("saves/", "versions/")) or rel in META_NAMES:
+                parts = safe_rel(rel)
+                if not parts or parts[0] in ("saves", "versions") or rel in META_NAMES:
                     continue
-                out = os.path.join(folder, *rel.split("/"))
+                out = os.path.join(folder, *parts)
                 os.makedirs(os.path.dirname(lp(out)), exist_ok=True)
                 with z.open(zi) as fi, open(lp(out), "wb") as fo:
                     shutil.copyfileobj(fi, fo)
@@ -5639,7 +5790,11 @@ def loader_version(loader, gv):
     if loader == "neoforge":
         vs = json.loads(_get("https://maven.neoforged.net/api/maven/versions/releases/net/neoforged/neoforge").decode("utf-8"))["versions"]
         parts = gv.split(".")
-        pre = ".".join(parts[1:]) + "." if parts[0] == "1" else gv + "."  # 1.21.1 -> 21.1.x, 26.1.2 -> 26.1.2.x
+        if parts[0] == "1":  # 1.21.1 -> 21.1.x, 1.21 -> 21.0.x
+            rest = parts[1:] + (["0"] if len(parts) == 2 else [])
+        else:  # 26.1.2 -> 26.1.2.x, 26.1 -> 26.1.0.x
+            rest = parts + (["0"] if len(parts) == 2 else [])
+        pre = ".".join(rest) + "."
         cand = [v for v in vs if v.startswith(pre)]
         stable = [v for v in cand if "beta" not in v and "alpha" not in v]
         if not (stable or cand):
@@ -5941,7 +6096,8 @@ def apply_version(plan, log=print, progress=None, cancel=None, threads=12):
         t, e = errors[0]
         raise RuntimeError("не скачалось файлов: %d (например %s: %s)" % (len(errors), os.path.basename(t[1]), e))
     off = java_dirs(plan["java"])[0]
-    if os.path.isdir(off) and os.path.isfile(os.path.join(off, "bin", "javaw.exe")):
+    if os.path.isdir(off) and os.path.isfile(os.path.join(off, "bin", "javaw.exe")) and \
+            any(str(t[1]).lower().startswith(off.lower()) for t in tasks):  # отметка - только если Java качали сейчас
         open(os.path.join(off, ".portalis-ok"), "w").close()
     for path, data in plan["writes"].items():
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -5995,6 +6151,9 @@ def run_loader_installer(plan, log=print, cancel=None):
             p.kill()
             raise RuntimeError("установщик работал дольше 20 минут")
     code = p.wait()
+    if code != 0:
+        raise RuntimeError("установщик %s не справился (код %s): %s" % (
+            LOADER_TITLES[plan["loader"]], code, " | ".join(tail[-3:])))
     vdir = os.path.join(MC, "versions", plan["id"])
     if not os.path.isfile(os.path.join(vdir, plan["id"] + ".json")):
         new = sorted(set(_listdir(os.path.join(MC, "versions"))) - before)
@@ -6084,6 +6243,23 @@ def installed_versions():
     return out
 
 
+def safe_rel(rel):
+    """Путь из архива или описи модпака -> список частей, если он безопасен (внутри папки), иначе None.
+    Отсекает «..», абсолютные пути и буквы дисков («D:x», «C:\\...»): иначе архив пишет куда угодно."""
+    parts = [p for p in re.split(r"[\\/]+", rel or "") if p not in ("", ".")]
+    if not parts or any(p == ".." or ":" in p for p in parts) or re.match(r"^[\\/]", rel or ""):
+        return None
+    return parts
+
+
+def safe_world_name(name):
+    """Имя папки мира (в том числе пришедшее с сервера) -> безопасное имя внутри saves или ошибка."""
+    n = (name or "").strip()
+    if not n or n in (".", "..") or re.search(r'[\\/:*?"<>|]', n) or n.endswith("."):
+        raise RuntimeError("недопустимое имя мира: %r" % (name,))
+    return n
+
+
 def _safe_name(name):
     name = re.sub(r'[\\/:*?"<>|]', "", name).strip().rstrip(".")
     return name[:60] or "Моя сборка"
@@ -6102,6 +6278,17 @@ def _cover_from_icon(url, folder):
         return True
     except Exception:
         return False
+
+
+def free_pack_name(name, gv, loader):
+    """Название сборки, которого ещё нет в библиотеке для этой версии: «Имя», «Имя 2», «Имя 3»..."""
+    base = _safe_name(name)
+    vdir = "%s %s" % (LOADER_TITLES[loader], gv)
+    taken = {p.get("name", "").rsplit(" (", 1)[0] for p in find_packs() if p["version_dir"] == vdir}
+    cand, i = base, 2
+    while cand in taken:
+        cand, i = "%s %d" % (base, i), i + 1
+    return cand
 
 
 def save_build(name, gv, loader, files, selection, description="", replace=False, log=print, progress=None, cancel=None,
@@ -6232,16 +6419,18 @@ def import_mrpack(src, name=None, log=print, progress=None, cancel=None, icon=No
         for f in idx.get("files", []):
             if (f.get("env") or {}).get("client") == "unsupported":
                 continue
-            path = f["path"].replace("\\", "/")
-            top, _, fn = path.partition("/")
-            if top not in MRPACK_TYPES or "/" in fn or ".." in path or not f.get("downloads"):
+            parts = safe_rel(f.get("path", ""))
+            if not parts or len(parts) != 2 or not f.get("downloads"):
+                continue
+            top, fn = parts
+            if top not in MRPACK_TYPES:
                 continue
             files.append({"type": MRPACK_TYPES[top], "title": os.path.splitext(fn)[0], "file": fn,
                           "url": f["downloads"][0], "sha1": (f.get("hashes") or {}).get("sha1"),
                           "size": f.get("fileSize") or 0, "version": "", "desc": "", "picked": False})
         if files and icon:
             files[0]["icon"] = icon
-        name = name or idx.get("name") or os.path.splitext(os.path.basename(src))[0]
+        name = free_pack_name(name or idx.get("name") or os.path.splitext(os.path.basename(src))[0], gv, loader)
         log("Модпак «%s»: Minecraft %s, %s %s, файлов %d" % (name, gv, LOADER_TITLES[loader], lv, len(files)))
         folder = save_build(name, gv, loader, files, [], idx.get("summary") or "Модпак с Modrinth.", False, log, progress,
                             cancel, lv)
@@ -6250,9 +6439,10 @@ def import_mrpack(src, name=None, log=print, progress=None, cancel=None, icon=No
             for pre in ("overrides/", "client-overrides/"):
                 if zi.filename.startswith(pre) and not zi.is_dir():
                     rel = zi.filename[len(pre):]
-                    if ".." in rel or rel.startswith(("saves/", "versions/")) or rel in META_NAMES:
+                    parts = safe_rel(rel)
+                    if not parts or parts[0] in ("saves", "versions") or rel in META_NAMES:
                         continue
-                    out = os.path.join(folder, *rel.split("/"))
+                    out = os.path.join(folder, *parts)
                     os.makedirs(os.path.dirname(lp(out)), exist_ok=True)
                     with z.open(zi) as fi, open(lp(out), "wb") as fo:
                         shutil.copyfileobj(fi, fo)
@@ -6285,13 +6475,18 @@ def mod_updates(pack, log=print):
     def one(it):
         fn, pid, vid = it
         try:
-            vs = mr_get("project/%s/version" % pid, {"game_versions": json.dumps([gv]), "loaders": json.dumps([loader])})
+            vs = mr_get("project/%s/version" % pid, {"game_versions": json.dumps([gv]),
+                                                       "loaders": json.dumps(_loaders_for(loader, "mod"))})
         except Exception:
             return None
-        ids = [v["id"] for v in vs]
-        if vid in ids and ids.index(vid) > 0:
-            cur = vs[ids.index(vid)]
-            return fn, cur.get("version_number", ""), vs[0].get("version_number", "")
+        cur = next((v for v in vs or [] if v.get("id") == vid), None)
+        if not cur:
+            return None
+        rank = {"release": 0, "beta": 1, "alpha": 2}
+        best = sorted(sorted(vs, key=lambda v: v.get("date_published", ""), reverse=True),
+                      key=lambda v: rank.get(v.get("version_type"), 3))[0]  # так же, как pick_version
+        if best["id"] != vid and best.get("date_published", "") > cur.get("date_published", ""):
+            return fn, cur.get("version_number", ""), best.get("version_number", "")
         return None
     log("Проверяю %d модов на Modrinth" % len(items))
     with concurrent.futures.ThreadPoolExecutor(8) as ex:
@@ -6453,7 +6648,7 @@ def world_restore(zip_path, title, log=print):
     dst = os.path.join(SAVES, name)
     with zipfile.ZipFile(lp(zip_path)) as z:
         for zi in z.infolist():
-            if ".." in zi.filename or zi.filename.startswith("/"):
+            if safe_rel(zi.filename) is None:
                 continue
             z.extract(zi, lp(dst))
     log("Мир «%s» восстановлен в saves\\%s" % (title, name))
@@ -6500,7 +6695,23 @@ def backup_world(c, world, keep=5, log=print):
 def world_rollback(zip_path, world, log=print):
     """Откат мира к копии: нынешний мир не удаляется - он переименовывается в «<мир> (до отката ДД.ММ ЧЧ-ММ)»,
     а копия встаёт на его место под тем же именем (так её находит игра и лаунчер)."""
+    world = safe_world_name(world)
     cur = os.path.join(SAVES, world)
+    tmp = os.path.join(SAVES, ".portalis-%s-%d" % (time.strftime("%Y%m%d%H%M%S"), os.getpid()))
+    try:  # сначала распаковать и проверить копию рядом: битый архив или нехватка места не портят мир
+        with zipfile.ZipFile(lp(zip_path)) as z:
+            bad = z.testzip()
+            if bad:
+                raise RuntimeError("копия повреждена (%s)" % bad)
+            for zi in z.infolist():
+                if safe_rel(zi.filename) is None:
+                    continue
+                z.extract(zi, lp(tmp))
+        if not os.path.isfile(os.path.join(tmp, "level.dat")):
+            raise RuntimeError("в копии нет мира (level.dat)")
+    except Exception:
+        shutil.rmtree(lp(tmp), ignore_errors=True)  # своя временная папка, не мир пользователя
+        raise
     kept = None
     if os.path.exists(cur):
         kept = os.path.join(SAVES, "%s (до отката %s)" % (world, time.strftime("%d.%m %H-%M")))
@@ -6509,11 +6720,7 @@ def world_rollback(zip_path, world, log=print):
             kept = os.path.join(SAVES, "%s (до отката %s, %d)" % (world, time.strftime("%d.%m %H-%M"), i))
             i += 1
         os.replace(cur, kept)
-    with zipfile.ZipFile(lp(zip_path)) as z:
-        for zi in z.infolist():
-            if ".." in zi.filename or zi.filename.startswith("/"):
-                continue
-            z.extract(zi, lp(cur))
+    os.replace(tmp, cur)
     log("Мир «%s» вернулся к копии%s" % (world, (". Прежний сохранён как «%s»" % os.path.basename(kept)) if kept else ""))
     return kept
 
@@ -6595,7 +6802,7 @@ def skin_lookup(nick):
         if not j or "SKIN" not in j or "textures.minecraft.net" in j["SKIN"]["url"]:
             return None  # Ely.by для незнакомых ников отдаёт скины Mojang - их покажет источник Mojang
         skin = _get(j["SKIN"]["url"], 20, 2, SKIN_UA)
-        cape = _get(j["CAPE"]["url"], 20, 2, SKIN_UA) if j.get("CAPE") else None
+        cape = _quiet(_get, j["CAPE"]["url"], 20, 2, SKIN_UA) if j.get("CAPE") else None
         return {"source": "Ely.by", "skin": skin, "cape": cape,
                 "slim": (j["SKIN"].get("metadata") or {}).get("model") == "slim"}
 
@@ -6610,7 +6817,7 @@ def skin_lookup(nick):
         if "SKIN" not in tex:
             return None
         skin = _get(tex["SKIN"]["url"].replace("http://", "https://"), 20, 2, SKIN_UA)
-        cape = _get(tex["CAPE"]["url"].replace("http://", "https://"), 20, 2, SKIN_UA) if tex.get("CAPE") else None
+        cape = _quiet(_get, tex["CAPE"]["url"].replace("http://", "https://"), 20, 2, SKIN_UA) if tex.get("CAPE") else None
         return {"source": "Mojang (лицензия)", "skin": skin, "cape": cape,
                 "slim": (tex["SKIN"].get("metadata") or {}).get("model") == "slim"}
 
@@ -6689,8 +6896,7 @@ def render_skin(png, slim=None, scale=6):
     out = PILImage.new("RGBA", (36 * k, 32 * k), (0, 0, 0, 0))
     out.alpha_composite(a, (0, 0))
     out.alpha_composite(b, (20 * k, 0))
-    z = max(1, scale // k)
-    return out.resize((out.width * z, out.height * z), PILImage.NEAREST)
+    return out.resize((36 * scale, 32 * scale), PILImage.NEAREST if k <= scale else PILImage.BOX)
 
 
 def render_cape(png, scale=6):
@@ -6701,8 +6907,22 @@ def render_cape(png, scale=6):
     else:  # HD-плащи TLauncher: только развёртка 22x17 в масштабе
         k = max(1, im.width // 22)
     c = im.crop((1 * k, 1 * k, 11 * k, 17 * k))
-    z = max(1, scale // k)
-    return c.resize((c.width * z, c.height * z), PILImage.NEAREST)
+    return c.resize((10 * scale, 16 * scale), PILImage.NEAREST if k <= scale else PILImage.BOX)
+
+
+def cape_standard_png(src):
+    """Плащ в обычной раскладке 64x32 (или кратной) - её понимают CustomSkinLoader и игра.
+    HD-плащ TLauncher (только развёртка 22x17 в масштабе) кладётся на холст 64k x 32k. -> PNG (bytes)."""
+    im = PILImage.open(src).convert("RGBA")
+    w, h = im.size
+    if w % 22 == 0 and h % 17 == 0 and w // 22 == h // 17 and w * 2 != h * 4:
+        k = w // 22
+        new = PILImage.new("RGBA", (64 * k, 32 * k), (0, 0, 0, 0))
+        new.paste(im, (0, 0))
+        im = new
+    buf = io.BytesIO()
+    im.save(buf, "PNG")
+    return buf.getvalue()
 
 
 def make_cape(c1, c2, pattern="полосы", emblem=None):
@@ -6986,8 +7206,10 @@ def delete_my_skin(fn):
     e = meta.pop(fn, {})
     for f in (fn, e.get("cape")):
         if f and os.path.isfile(os.path.join(SKINS_DIR, f)):
-            if not recycle(os.path.join(SKINS_DIR, f), tries=1):
-                os.remove(os.path.join(SKINS_DIR, f))
+            if not recycle(os.path.join(SKINS_DIR, f), tries=2):
+                old = os.path.join(SKINS_DIR, "_Старое")  # нет Корзины (флешка) - в папку «_Старое», не насовсем
+                os.makedirs(old, exist_ok=True)
+                os.replace(os.path.join(SKINS_DIR, f), os.path.join(old, "%s_%s" % (time.strftime("%Y%m%d%H%M%S"), f)))
     _skins_meta_save(meta)
 
 
@@ -7003,9 +7225,16 @@ def install_offline_skin(nick, skin_file, cape_file=None, log=print):
     """Скин (и плащ) для ника без интернета: файлы в CustomSkinLoader\\LocalSkin, локальные - первыми в списке."""
     base = os.path.join(MC, "CustomSkinLoader")
     for sub, src in (("skins", skin_file), ("capes", cape_file)):
+        dst = os.path.join(base, "LocalSkin", sub, nick + ".png")
         if src:
-            os.makedirs(os.path.join(base, "LocalSkin", sub), exist_ok=True)
-            shutil.copy2(src, os.path.join(base, "LocalSkin", sub, nick + ".png"))
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            if sub == "capes":
+                with open(dst, "wb") as fh:
+                    fh.write(cape_standard_png(src))
+            else:
+                shutil.copy2(src, dst)
+        elif sub == "capes" and os.path.isfile(dst):  # «без плаща»: прежний плащ этого ника больше не показываем
+            os.replace(dst, dst + ".off")
     cfg_path = os.path.join(base, "CustomSkinLoader.json")
     try:
         with open(cfg_path, encoding="utf-8") as fh:
@@ -7694,7 +7923,7 @@ def make_cape2(o):
     o = dict(CAPE_DEFAULT, **(o or {}))
     c1, c2, c3 = _rgb(o["c1"]), _rgb(o["c2"]), _rgb(o["c3"])
     sw = max(1, int(o.get("width") or 2))
-    rnd = random.Random(hash((o["c1"], o["c2"], o["pattern"])) & 0xffff)
+    rnd = random.Random(zlib.crc32(("%s|%s|%s" % (o["c1"], o["c2"], o["pattern"])).encode("utf-8")) & 0xffff)
     stars = {(rnd.randint(0, 9), rnd.randint(0, 15)) for _ in range(9)}
     noise = {(x, y): rnd.random() for x in range(24) for y in range(22)}
 
@@ -7977,6 +8206,14 @@ def gui():
                 w_, h_ = min(w_, ww - 40), min(h_, wh - 40)
                 self.place(relx=0.5, rely=0.5, anchor="center", width=w_, height=h_)
             self.lift()
+            if not getattr(self, "_focused", False):  # фокус - один раз при первом показе и если он не внутри уже
+                self._focused = True
+                try:
+                    f_ = self.focus_get()
+                    if f_ is None or not str(f_).startswith(str(self)):
+                        self.focus_set()
+                except (tk.TclError, KeyError):
+                    pass
 
         def _request_close(self):
             if self._close_cb:
@@ -8064,12 +8301,13 @@ def gui():
         """Esc закрывает верхнее «окно» внутри программы (если ввод не в поле)."""
         if not InPage.stack:
             return
+        top_ = InPage.stack[-1]
         try:
-            if isinstance(win.focus_get(), tk.Entry) or isinstance(win.focus_get(), tk.Text):
-                return
+            f_ = win.focus_get()
+            if isinstance(f_, (tk.Entry, tk.Text)) and str(f_).startswith(str(top_)):
+                return  # Esc в поле этого окна - его забирает поле (очистить поиск и т. п.)
         except Exception:
             pass
-        top_ = InPage.stack[-1]
         if top_._esc and top_.winfo_exists():
             top_._request_close()
             return "break"
@@ -8454,8 +8692,9 @@ def gui():
             first = i == len(buttons) - 1
             (big_button(row, label, lambda v=val: done(v)) if first else
              small_button(row, label, lambda v=val: done(v), bg=CARD)).pack(side="right", padx=(8, 0))
-        t.bind("<Return>", lambda ev: done(buttons[0][1]))
-        t.bind("<Escape>", lambda ev: done(buttons[-1][1] if e is None else None))
+        for w_ in (t,) + ((e,) if e is not None else ()):  # Enter/Esc и из поля ввода; дальше Esc не идёт
+            w_.bind("<Return>", lambda ev: (done(buttons[0][1]), "break")[1])
+            w_.bind("<Escape>", lambda ev: (done(buttons[-1][1] if e is None else None), "break")[1])
         t.protocol("WM_DELETE_WINDOW", lambda: done(buttons[-1][1] if e is None else None))
         t.update_idletasks()
         W, H = max(460, t.winfo_reqwidth()), t.winfo_reqheight()
@@ -9104,8 +9343,19 @@ def gui():
         if game_running():
             toast("Minecraft уже запущен.", "info")
             return True
-        java, comp = direct_java(version)
         sp = version_spec(version) or (None, None, None)
+
+        def repair(why):
+            if sp[0]:
+                toast("%s - докачаю." % why, "warn", ms=6000)
+                version_dialog(sp[0], sp[1] or "vanilla", sp[2])
+            else:
+                toast("%s. Скачай её заново на вкладке «Версии»." % why, "warn", ("Версии", lambda: show("versions")), 9000)
+            return False
+        try:
+            java, comp = direct_java(version)
+        except mc_launch.MissingFilesError as e:
+            return repair("У версии %s не хватает файлов (%d)" % (version, len(e.missing)))
         if not java:
             toast("Для этой версии нужна Java «%s» - скачаю её вместе с версией." % comp, "info", ms=6000)
             if sp[0]:
@@ -9115,10 +9365,7 @@ def gui():
             p_ = mc_launch.launch(version, MC, st_["direct_nick"], java, int(st_.get("direct_ram") or 4096),
                                   log=lambda *a: None)
         except mc_launch.MissingFilesError as e:
-            toast("У версии %s не хватает файлов (%d) - докачаю." % (version, len(e.missing)), "warn", ms=6000)
-            if sp[0]:
-                version_dialog(sp[0], sp[1] or "vanilla", sp[2])
-            return False
+            return repair("У версии %s не хватает файлов (%d)" % (version, len(e.missing)))
         except Exception as e:
             toast("Не получилось запустить игру: %s" % str(e)[:140], "err", ms=9000)
             return False
@@ -10108,7 +10355,7 @@ def gui():
                     if path and messagebox.askyesno("Копия готова", "\n".join(logs) + "\n\nОткрыть папку с копиями?",
                                                     parent=t if t.winfo_exists() else win):
                         os.startfile(os.path.dirname(path))
-                run_task("Делаю копию мира «%s»" % m["title"], lambda log: backup_world(m, log), after)
+                run_task("Делаю копию мира «%s»" % m["title"], lambda log: backup_world_local(m, log), after)
             small_button(row, "Резервная копия", do_backup, bg=BG, icon="ic_backup.png").pack(side="right")
         reviews_section(t, body, map_key(m))
         auto_wrap(body)
@@ -10479,7 +10726,9 @@ def gui():
         cap.pack(side="top")
         v.bind("<Left>", lambda e: (st.update(i=st["i"] - 1), draw()))
         v.bind("<Right>", lambda e: (st.update(i=st["i"] + 1), draw()))
-        v.bind("<Escape>", lambda e: v.destroy())
+        v.bind("<Escape>", lambda e: (v.destroy(), "break")[1])
+        pic._clear_text = True
+        v.after(50, lambda: v.winfo_exists() and v.focus_set())
 
         def load():
             try:
@@ -10502,7 +10751,7 @@ def gui():
     def wm_query(more=False):
         wm = state["wm"]
         if not more:
-            wm.update(items=[], page=0, next=True, err=None, pages={}, done=[])
+            wm.update(items=[], page=0, next=True, err=None, pages={}, done=[], pending={})
         wm["qid"] += 1
         qid = wm["qid"]
         wm["loading"] = True
@@ -10544,7 +10793,8 @@ def gui():
                 if qid == wm["qid"]:
                     wm["err"] = str(e)[:120]
                     wm["next"] = False
-            wm["loading"] = False
+            if qid == wm["qid"]:
+                wm["loading"] = False
 
             def redraw():
                 if qid != wm["qid"] or state["tab"] != "maps" or state.get("maps_src") != "web":
@@ -10584,7 +10834,8 @@ def gui():
             wm["q"] = v
             if state.get("_wq"):
                 win.after_cancel(state["_wq"])
-            state["_wq"] = win.after(600, lambda: (state.update(focus_wm=True), wm_query(), show("maps", animated=False)))
+            state["_wq"] = win.after(600, lambda: state["tab"] == "maps" and state.get("maps_src") == "web" and (
+                state.update(focus_wm=True), wm_query(), show("maps", animated=False)))
         e.bind("<KeyRelease>", typed)
         e.bind("<Escape>", lambda ev: (e.delete(0, "end"), typed()))
         if state.pop("focus_wm", None):
@@ -11430,6 +11681,12 @@ def gui():
         keep - куда сложить картинку (у отдельного окна свой список, иначе - список вкладки)."""
         if keep is not None:
             widget._keep = keep
+        widget._want = key  # виджет ждёт именно эту картинку (раньше заказанные - не подставлять)
+        if len(pic_cache) > 500:  # в памяти - последние картинки; остальное возьмётся с диска
+            for k_ in list(pic_cache)[:150]:
+                if k_ not in pic_wait:
+                    pic_cache.pop(k_, None)
+                    pic_busy.discard(k_)
         if key in pic_cache:
             if pic_cache[key] is not None:
                 widget.configure(image=pil_photo(pic_cache[key], keep))
@@ -11449,6 +11706,8 @@ def gui():
                     pic_cache[key] = producer()
                     return
                 except Exception:
+                    if i == 2 or not pic_wait.get(key):
+                        break
                     time.sleep(1.0 + i)
             pic_failed[key] = time.time()
             pic_cache[key] = None
@@ -11461,8 +11720,10 @@ def gui():
         for key in [k for k in pic_wait if k in pic_cache]:
             for w in pic_wait.pop(key):
                 try:
-                    if w.winfo_exists() and pic_cache[key] is not None:
+                    if w.winfo_exists() and pic_cache[key] is not None and getattr(w, "_want", key) == key:
                         w.configure(image=pil_photo(pic_cache[key], getattr(w, "_keep", None)))
+                        if getattr(w, "_clear_text", False):
+                            w.configure(text="")
                 except tk.TclError:
                     pass
         if pic_wait:
@@ -11503,7 +11764,10 @@ def gui():
             key = ("hero", img, w, h, BG)
             ph = _isl_cache.get(key)
             if ph is None:
-                ph = _isl_cache[key] = ImageTk.PhotoImage(hero_pil(img, w, h, BG, 14, True, hash(img) % 9))
+                for k_ in [k_ for k_ in _isl_cache if isinstance(k_, tuple) and k_[:2] == ("hero", img)]:
+                    _isl_cache.pop(k_, None)  # прежние ширины этой картинки больше не нужны
+                ph = _isl_cache[key] = ImageTk.PhotoImage(hero_pil(img, w, h, BG, 14, True,
+                                                                   zlib.crc32(img.encode("utf-8")) % 9))
             st["ph"] = ph
             hc.itemconfigure(hid, image=ph)
         hc.bind("<Configure>", lambda e: hc.after(30, paint))
@@ -12163,6 +12427,7 @@ def gui():
             return
         packs = [p for p in find_packs() if p.get("user") and p.get("mr_files")]
         if not packs:
+            win.after(6 * 3600 * 1000, auto_mod_check)
             return
 
         def work():
@@ -13921,6 +14186,7 @@ def gui():
         if not c.logged_in() or d["loading"]:
             return
         d["loading"] = True
+        sel0 = d.get("sel")
 
         def fetch():
             r = {"me": c.me(), "friends": c.friends(), "feed": c.feed()}
@@ -13929,7 +14195,7 @@ def gui():
                 r["public"] = c.public_parties()  # None - на сервере ещё нет открытых пати
             except Exception:
                 r["public"] = d.get("public")
-            sel = d.get("sel")
+            sel = sel0
             if r["parties"] and sel not in [x["id"] for x in r["parties"]]:
                 sel = r["parties"][0]["id"]
             r["sel"] = sel if r["parties"] else None
@@ -13943,9 +14209,13 @@ def gui():
 
         def done(r):
             d["loading"] = False
+            if d.get("sel") != sel0:  # пока грузили, игрок выбрал другую пати - его выбор главнее
+                for k_ in ("sel", "party", "members", "proposals"):
+                    r.pop(k_, None)
+                win.after(10, soc_refresh)
             changed = any(json.dumps(d.get(k), sort_keys=True, default=str) != json.dumps(r[k], sort_keys=True, default=str)
                           for k in r)
-            if r["sel"] != d.get("sel"):
+            if "sel" in r and r["sel"] != d.get("sel"):
                 d.update(msgs=[], last=0)
             old = {k: d.get(k) for k in ("loaded", "friends", "invites", "parties", "proposals", "sel")}
             d.update(r, loaded=True, err=None)
@@ -14475,7 +14745,7 @@ def gui():
                     lobby = {"kind": "map", "map": m["id"], "title": m["title"], "version": m["version"],
                              "pack": m.get("recommended")}
                     menu.add_command(label="  %s  (%s)  " % (m["title"], m["version"]), command=lambda lobby=lobby: soc_bg(
-                        lambda: (c.set_lobby(d["sel"], lobby), c.send("Карта пати: %s" % lobby["title"], pid=d["sel"])),
+                        lambda: (c.merge_lobby(d["sel"], **lobby), c.send("Карта пати: %s" % lobby["title"], pid=d["sel"])),
                         lambda r: soc_refresh()))
                 menu.tk_popup(cb_.winfo_rootx(), cb_.winfo_rooty() + cb_.winfo_height())
             cb_ = small_button(lr, "Выбрать карту" if not lob.get("title") else "Сменить карту", choose_map, bg=PANEL,
@@ -14576,7 +14846,7 @@ def gui():
             if own:
                 def accept(pr=pr):
                     lobby = lobby_from(pr)
-                    soc_bg(lambda: (c.set_lobby(d["sel"], lobby), c.send("Выбрано: %s" % pr["title"], pid=d["sel"]),
+                    soc_bg(lambda: (c.merge_lobby(d["sel"], **lobby), c.send("Выбрано: %s" % pr["title"], pid=d["sel"]),
                                     c.delete_proposal(pr["id"])), lambda r: soc_refresh())
                 small_button(rw, "Выбрать", accept, bg=PANEL, icon="ic_check.png").pack(side="right")
         if not d.get("proposals"):
@@ -14735,7 +15005,13 @@ def gui():
         def poll():
             if not t.winfo_exists():
                 return
-            soc_bg(lambda: c.messages(to=p["id"], after=st["last"]), add, err_toast=False)
+            if not st.get("busy"):  # прошлый запрос ещё идёт (медленная связь) - новый не шлём
+                st["busy"] = True
+
+                def got(rows):
+                    st["busy"] = False
+                    add(rows)
+                soc_bg(lambda: _with_flag(lambda: c.messages(to=p["id"], after=st["last"]), st), got, err_toast=False)
             st["n"] += 1
             if st["n"] % 4 == 0:
                 chat_reacts_load(tx, st["ids"])
@@ -15299,11 +15575,9 @@ def gui():
     # --- голосовой чат пати ---
     def voice_stop():
         vc = state.pop("voice", None)
+        state.pop("voice_sig", None)
         if vc is not None:
-            try:
-                vc.stop()
-            except Exception:
-                pass
+            threading.Thread(target=lambda: _quiet(vc.stop), daemon=True).start()
 
     def voice_event(kind, data):
         """События голоса приходят из фоновых потоков - в окно передаём через after."""
@@ -15312,6 +15586,12 @@ def gui():
                 toast("Голос: %s" % data, "warn", ms=6000)
             if kind == "closed":
                 voice_stop()
+            if kind == "roster":
+                sig = [(m.get("slot"), m.get("nick"), bool(m.get("muted"))) for m in (data or [])]
+                if sig == state.get("voice_sig"):
+                    paint_speaking()
+                    return
+                state["voice_sig"] = sig
             if state.get("tab") == "friend" and kind in ("connected", "roster", "closed", "error"):
                 soc_render()
             elif kind == "speaking":
@@ -15327,7 +15607,7 @@ def gui():
         for slot, lb in list(state.get("voice_labels", {}).items()):
             try:
                 if lb.winfo_exists():
-                    talking = vc is not None and time.time() - vc.speaking.get(slot, 0) < 0.6
+                    talking = vc is not None and time.monotonic() - vc.speaking.get(slot, -9) < 0.6
                     lb.configure(fg=ACCENT_HI if talking else TEXT)
             except Exception:
                 pass
@@ -15485,7 +15765,11 @@ def gui():
         elif was and not playing and state.get("pw_session"):
             ses = state.pop("pw_session")
             w = newest_world(ses["t"])
-            if w and load_settings().get("party_world_auto", True):
+            wt = (party.get("lobby") or {}).get("world_title")
+            if w and wt and w != wt:
+                toast("Мир «%s» не ушёл в пати: мир пати - «%s». Если играли в новом мире, сохрани его кнопкой "
+                      "«Сохранить мир сейчас»." % (w, wt), "info", ms=9000)
+            elif w and load_settings().get("party_world_auto", True):
                 party_world_save(ses["pid"], w, quiet=True)
 
     def party_become_host(party):
@@ -15504,10 +15788,12 @@ def gui():
         def work(log):
             dst = os.path.join(ROOT, "_update", "cloud", "party_" + PW_NAME)
             log("Скачиваю мир пати «%s»" % title)
+            safe_world_name(title)  # имя мира пришло с сервера: только обычное имя папки внутри saves
             c.download_file("worlds", "party/%s/%s" % (party["id"], PW_NAME), dst)
+            if not c.take_host(party["id"], party_host_id(party)):  # двое сразу хозяевами не станут
+                raise RuntimeError("хозяином пати только что стал кто-то другой - обнови пати и посмотри, кто")
             world_rollback(dst, title, log)
             os.remove(lp(dst))
-            c.merge_lobby(party["id"], host=c.uid)
             me_ = d.get("me") or {}
             c.send("%s теперь хозяин и продолжает мир «%s». Ждите приглашение." % (me_.get("nick", "Игрок"), title),
                    pid=party["id"])
@@ -15694,13 +15980,18 @@ def gui():
             toast("Ник в Minecraft — от 2 до 16 латинских букв, цифр или «_».", "warn")
             return
         sk.update(nick=nick, searching=True, found=None)
+        sk["lookup_id"] = sk.get("lookup_id", 0) + 1
+        my_id = sk["lookup_id"]
         s = load_settings(); s["skin_nick"] = nick; save_settings(s)
 
         def work():
             try:
-                sk["found"] = skin_lookup(nick)
+                found = skin_lookup(nick)
             except Exception:
-                sk["found"] = []
+                found = []
+            if my_id != sk.get("lookup_id"):
+                return  # уже ищут другой ник
+            sk["found"] = found
             sk["searching"] = False
             win.after(0, lambda: state["tab"] == "skins" and show("skins", animated=False))
         threading.Thread(target=work, daemon=True).start()
@@ -16455,15 +16746,26 @@ def gui():
 
                 def drop_cape(f=f):
                     if messagebox.askyesno("Плащ", "Убрать плащ «%s» в Корзину?" % f[:-4]):
-                        recycle(os.path.join(SKINS_DIR, "Плащи", f))
+                        if not recycle(os.path.join(SKINS_DIR, "Плащи", f)):
+                            toast("Корзина не приняла плащ (на флешке её нет). Убери файл сам: «Папка скинов» → «Плащи».",
+                                  "warn", ms=8000)
                         show("skins", animated=False)
                 small_button(cell, "Убрать", drop_cape, bg=CARD, icon="ic_delete.png").pack(pady=(4, 0))
             row += 1
             _ = cf
         _ = hf
         # Стандартные скины
-        if sk["defaults"] is None:
-            sk["defaults"] = default_skins()
+        if sk["defaults"] is None and not sk.get("defaults_busy"):
+            sk["defaults_busy"] = True
+
+            def load_defaults():
+                res = default_skins()
+                sk["defaults_busy"] = False
+                sk["defaults"] = res or None  # не нашлось - попробуем снова, когда появятся версии 1.19.3+
+                if res:
+                    win.after(0, lambda: state["tab"] == "skins" and (state.update(keep_scroll=True),
+                                                                      show("skins", animated=False)))
+            threading.Thread(target=load_defaults, daemon=True).start()
         if sk["defaults"]:
             section("Стандартные скины Minecraft", row, "из файлов игры")
             row += 1
@@ -16655,8 +16957,12 @@ def gui():
                 if not quiet:
                     toast("Нет связи (%s). Проверь интернет и попробуй ещё раз." % box["err"][:80], "err", ms=7000)
                 return
-            state["remote"] = box["remote"]
-            fn(box["remote"])
+            r_ = box["remote"]
+            loc_ = load_local_manifest()
+            if loc_.get("items") and vtuple(r_.get("version")) < vtuple(loc_.get("version")):
+                r_ = loc_  # GitHub пару минут после выпуска отдаёт прошлую опись - на неё не откатываемся
+            state["remote"] = r_
+            fn(r_)
         poll()
 
     def ensure_items(ids, then, title="Скачать"):
@@ -16932,12 +17238,17 @@ def gui():
                     msg.configure(text="Готово! Программа тоже обновилась: перезапусти её.", fg=ACCENT_HI)
 
                     def restart():
+                        srv_ = state.get("psrv")
+                        if srv_ and srv_.alive() and not messagebox.askokcancel(
+                                "Сервер пати", "Сервер пати работает. Перезапустить Portalis и выключить сервер? "
+                                               "Мир сохранится."):
+                            return
                         if pending_exe():
                             swap_exe_after_exit(pending_exe(), exe_path())
-                            state["swap_started"] = True
                         else:
                             subprocess.Popen([exe_path()], cwd=APP_DIR, env=clean_env())
-                        win.destroy()
+                        state["swap_started"] = True
+                        on_close(ask=False)
                     buttons(("big", "Перезапустить программу", restart))
                     return
                 if (items or auto) and then:
@@ -16985,11 +17296,11 @@ def gui():
         if gw >= 1000 and gh >= 660 and -50 < gx < win.winfo_screenwidth() - 200 and -10 < gy < win.winfo_screenheight() - 200:
             win.geometry(g)
 
-    def on_close():
+    def on_close(ask=True):
         srv_ = state.get("psrv")
         if srv_ and srv_.alive():
-            if not messagebox.askokcancel("Сервер пати", "Сервер пати работает. Закрыть Portalis и выключить сервер? "
-                                                         "Мир сохранится."):
+            if ask and not messagebox.askokcancel("Сервер пати", "Сервер пати работает. Закрыть Portalis и выключить "
+                                                                 "сервер? Мир сохранится."):
                 return
             status.configure(text="Выключаю сервер пати...", fg=GOLD)
             win.update()
@@ -17020,6 +17331,11 @@ def gui():
 
     # --- перетащить файлы в окно: скин, плащ, карта (архив или папка мира), модпак ---
     def handle_drop(paths):
+        if len(paths) > 5:
+            toast("За раз принимаю до 5 файлов - остальные перетащи следом.", "info")
+        if state.get("busy") and any(classify_drop(p) in ("map", "mrpack", "cfpack") for p in paths[:5]):
+            toast("Подожди: программа ещё занята предыдущим делом - потом перетащи файл снова.", "warn")
+            return
         for path in paths[:5]:
             kind = classify_drop(path)
             name = os.path.splitext(os.path.basename(path.rstrip("\\/")))[0]
@@ -17094,11 +17410,15 @@ def gui():
             drops = []
 
             def poll_drops():
-                if drops:
-                    got = drops[:]
-                    del drops[:]
-                    handle_drop(got)
-                win.after(250, poll_drops)
+                try:
+                    if drops:
+                        got = drops[:]
+                        del drops[:]
+                        handle_drop(got)
+                except Exception:
+                    toast("Не получилось принять файл: %s" % log_error("перетаскивание"), "err", ms=7000)
+                finally:
+                    win.after(250, poll_drops)
             cb = PROC(proc)
             state["drop_proc"] = cb  # держим ссылку: иначе обработчик соберёт сборщик мусора
             comctl32.SetWindowSubclass.argtypes = [wintypes.HWND, PROC, ctypes.c_size_t, ctypes.c_size_t]
@@ -17209,6 +17529,14 @@ def gui():
                 tk.Label(lst, text="Версий в папке игры нет.", font=(FONT, 10), fg=MUTED, bg=PANEL, anchor="w").pack(fill="x")
             big = max([x[2] for x in rep_["versions"]] or [1])
             for v, path, n in rep_["versions"]:
+                inf = rep_.get("vinfo", {}).get(v) or {}
+                if inf.get("data"):  # у сборок TLauncher миры и моды лежат прямо в папке версии - не трогаем
+                    row_(lst, v, n, big, None, "здесь миры или моды сборки - не трогаем")
+                    continue
+                if inf.get("needed_by"):
+                    row_(lst, v, n, big, None, "нужна версиям: %s" % ", ".join(inf["needed_by"][:3]))
+                    continue
+
                 def drop_v(v=v, path=path):
                     if game_running():
                         toast("Сначала закрой игру.", "warn")
@@ -17275,7 +17603,7 @@ def gui():
                 ("Место на диске", "что занимает место, освободить", "место диск память удалить очистить кэш",
                  storage_window),
                 ("Своя сборка", "собрать сборку из любых модов", "моды конструктор", lambda: show("builder"))]
-        if soc().ready():
+        if soc().ready() and soc().logged_in():
             acts += [("Облако и резервные копии", "миры в облаке, копии по расписанию", "бэкап backup мир",
                       cloud_window),
                      ("Создать пати", "позвать друзей играть вместе", "пати друзья party", party_create_window),
@@ -17422,7 +17750,8 @@ def gui():
     win._hooks["handle_drop"] = handle_drop
     for i, k in enumerate(TAB_ORDER, 1):
         win.bind_all("<Control-Key-%d>" % i, lambda e, k=k: show(k))
-    win.bind_all("<F5>", lambda e: (state.update(installed_launchers=None, net_cache=None), show(state["tab"], animated=False)))
+    win.bind_all("<F5>", lambda e: (state.update(installed_launchers=None, net_cache=None), _WM_DOWN.clear(),
+                                    show(state["tab"], animated=False)))
     show(settings.get("tab") if settings.get("tab") in TAB_ORDER else "maps", animated=False)
 
     def reveal():

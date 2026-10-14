@@ -129,6 +129,11 @@ def normalize_skin(skin):
 def _normalize_cape(cape):
     im = _to_rgba(cape)
     w, h = im.size
+    if w % 22 == 0 and h % 17 == 0 and w // 22 == h // 17 and w * 2 != h * 4:  # HD-плащ TLauncher 22k x 17k
+        k = w // 22
+        new = Image.new("RGBA", (64 * k, 32 * k), (0, 0, 0, 0))
+        new.paste(im, (0, 0))
+        return new, float(k)
     if w * 2 != h * 4:  # odd sizes (e.g. 22x17): put on a 64x32 canvas
         new = Image.new("RGBA", (max(64, w), max(32, h)), (0, 0, 0, 0))
         new.paste(im, (0, 0))
