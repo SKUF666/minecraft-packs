@@ -127,5 +127,21 @@
   "sha1": "cb362301c154aee001bc6233fa0f86d57d1b8eb5",
   "size": 137119524,
   "browser": true
+ },
+ {
+  "id": "pc-building-simulator",
+  "name": "PC-Building-Simulator.zip",
+  "url": "https://minecraft-inside.ru/uploads/files/2026-07/PC-Building-Simulator.zip",
+  "page": "https://minecraft-inside.ru/maps/194481-pc-building-simulator.html",
+  "sha1": "42a0b30535739933edbca2180643cf892c61e562",
+  "size": 34759930
+ },
+ {
+  "id": "pc-building-simulator-rp",
+  "name": "resurspak-dlya-druga_1.zip",
+  "url": "https://minecraft-inside.ru/uploads/files/2026-07/resurspak-dlya-druga_1.zip",
+  "page": "https://minecraft-inside.ru/maps/194481-pc-building-simulator.html",
+  "sha1": "f1af6cc5fa278f02f9f99599e74bd54306bfe5c2",
+  "size": 20752819
  }
 ]
