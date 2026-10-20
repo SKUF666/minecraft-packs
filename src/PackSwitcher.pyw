@@ -885,6 +885,17 @@ def install_map(m, pack=None, fresh=False, packs=None, log=print):
         log("Карта «%s» установлена, файлов: %d" % (m["title"], n))
     else:
         log("Карта «%s» уже установлена, продолжаешь своё сохранение" % m["title"])
+    rpf = m.get("resource_pack_file")
+    if rpf and safe_rel(rpf) and os.path.isfile(os.path.join(m["path"], rpf)):
+        # ресурс-пак карты - в resourcepacks и включаем: встроенный в мир получает только хозяин,
+        # а друзья, зашедшие по сети, без него видят обычные предметы вместо комплектующих и т. п.
+        fname = _safe_name(m["title"]) + " - ресурспак.zip"
+        os.makedirs(os.path.join(MC, "resourcepacks"), exist_ok=True)
+        rp_dst = os.path.join(MC, "resourcepacks", fname)
+        if not (os.path.isfile(rp_dst) and os.path.getsize(rp_dst) == os.path.getsize(os.path.join(m["path"], rpf))):
+            shutil.copy2(os.path.join(m["path"], rpf), rp_dst)
+            log("Ресурс-пак положен в resourcepacks: %s" % fname)
+        enable_resource_pack(fname, log)
     if m.get("usercache") and os.path.isfile(os.path.join(m["path"], m["usercache"])):
         n = merge_usercache(os.path.join(m["path"], m["usercache"]))
         log("Добавлено записей в usercache.json: %d (для голов персонажей)" % n)
@@ -4054,6 +4065,10 @@ def export_mrpack(m=None, pack=None, log=print):
                 n_over += 1
             if m.get("usercache") and os.path.isfile(os.path.join(m["path"], m["usercache"])):
                 z.write(os.path.join(m["path"], m["usercache"]), "overrides/usercache.json")
+            rpf = m.get("resource_pack_file")
+            if rpf and safe_rel(rpf) and os.path.isfile(os.path.join(m["path"], rpf)):  # ресурс-пак карты - тоже
+                z.write(os.path.join(m["path"], rpf), "overrides/resourcepacks/%s - ресурспак.zip" % _safe_name(m["title"]))
+                n_over += 1
         if load_servers():
             z.writestr("overrides/servers.dat", _servers_dat_bytes())
         z.writestr("modrinth.index.json", json.dumps({
