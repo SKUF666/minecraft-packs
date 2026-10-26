@@ -2628,14 +2628,21 @@ def mi_pick_download(info, want=None):
     return dict(pick, gv=gv), rps[:1]
 
 
+class FileGone(RuntimeError):
+    """Автор удалил файл с хостинга - ни сам, ни через сервер, ни браузером его уже не скачать."""
+
+
 def direct_link(url):
-    """Прямая ссылка на файл для известных хостингов; None - качать только через браузер."""
+    """Прямая ссылка на файл для известных хостингов; None - качать только через браузер. FileGone - файла больше нет."""
+    url = _html.unescape(url)  # в ссылках со страниц бывает «&amp;»
     u = urllib.parse.urlsplit(url)
     host = u.netloc.lower().replace("www.", "")
     if host == "minecraft-inside.ru":
         return url
     if host == "dl.minecraftmaps.com" or host.endswith("forgecdn.net"):  # файлы карт лежат прямо на хранилище
         return url
+    if host == "drive.usercontent.google.com":
+        return url if "confirm=" in url else url + "&confirm=t"
     if host in ("drive.google.com", "docs.google.com"):
         m = re.search(r"/d/([\w-]{10,})", url) or re.search(r"[?&]id=([\w-]{10,})", url)
         if m:
@@ -2645,7 +2652,9 @@ def direct_link(url):
             j = json.loads(_get("https://cloud-api.yandex.net/v1/disk/public/resources/download?public_key="
                                 + urllib.parse.quote(url, safe=""), 20, 2).decode("utf-8"))
             return j.get("href")
-        except Exception:
+        except Exception as e:
+            if isinstance(e, AssetGone) or "404" in str(e):  # _get отвечает на 404 так; DiskNotFoundError - ссылка мёртвая
+                raise FileGone("автор удалил файл с Яндекс Диска")
             return None
     if host.endswith("dropbox.com"):
         return url.replace("dl=0", "dl=1") if "dl=0" in url else url + ("&" if "?" in url else "?") + "dl=1"
@@ -2657,6 +2666,185 @@ def direct_link(url):
         except Exception:
             return None
     return None
+
+
+def _is_archive(path):
+    try:
+        return zipfile.is_zipfile(lp(path)) or open(lp(path), "rb").read(4)[:2] in (b"Ra", b"7z")
+    except OSError:
+        return False
+
+
+# Хостинги, с которых сервер Portalis (функция map-proxy) скачает файл карты за игрока. minecraft-inside здесь нет:
+# серверу он показывает проверку Cloudflare (её не обходим) - его файлы качаются только с компьютера игрока.
+RELAY_HOSTS = (r"dl\.minecraftmaps\.com", r"(edge|mediafilez|media)\.forgecdn\.net",
+               r"drive\.usercontent\.google\.com", r"(drive|docs)\.google\.com", r"(disk\.yandex\.(ru|com)|yadi\.sk)",
+               r"(www\.)?dropbox\.com", r"(www\.)?mediafire\.com")
+RELAY_CHUNK = 6 << 20  # кусок за один запрос: у функции на сервере ограничено время ответа
+
+
+def relay_ok(url):
+    u = urllib.parse.urlsplit(url)
+    return u.scheme == "https" and any(re.fullmatch(rx, (u.hostname or "").lower()) for rx in RELAY_HOSTS)
+
+
+def relay_fetch(url, dst, ref=None, progress=None, cancel=None):
+    """Файл карты через сервер Portalis: функция map-proxy сама берёт его с хостинга и передаёт сюда.
+    Кусками по RELAY_CHUNK с докачкой - обрыв связи не начинает скачивание заново."""
+    sc = _social_cfg()
+    if not sc:
+        raise RuntimeError("сервер Portalis не настроен")
+    q = {"url": url}
+    if ref:
+        q["ref"] = ref
+    rurl = sc["url"].rstrip("/") + "/functions/v1/map-proxy?" + urllib.parse.urlencode(q)
+    hdr = {"apikey": sc["key"], "Authorization": "Bearer " + sc["key"], "User-Agent": MR_UA["User-Agent"]}
+    part = lp(dst) + ".relay"
+    got, total, fails = 0, None, 0
+    try:
+        with open(part, "wb") as out:
+            while total is None or got < total:
+                if cancel and cancel.is_set():
+                    raise RuntimeError("отменено")
+                want = "bytes=%d-%d" % (got, got + RELAY_CHUNK - 1)
+                start = got
+                try:
+                    with urlopen(urllib.request.Request(rurl, headers=dict(hdr, Range=want)), 120, fails) as r:
+                        if r.status == 200 and got:  # источник не умеет кусками - пришёл весь файл с начала
+                            out.seek(0)
+                            out.truncate()
+                            if progress:
+                                progress(-got)
+                            got = start = 0
+                        cr = r.headers.get("Content-Range") or ""
+                        if r.status == 206 and cr.rsplit("/", 1)[-1].isdigit():
+                            total = int(cr.rsplit("/", 1)[-1])
+                        while True:
+                            if cancel and cancel.is_set():
+                                raise RuntimeError("отменено")
+                            chunk = r.read(1 << 17)
+                            if not chunk:
+                                break
+                            out.write(chunk)
+                            got += len(chunk)
+                            if progress:
+                                progress(len(chunk))
+                        if r.status == 200 or (total is None and got - start < RELAY_CHUNK):
+                            total = got
+                    fails = 0
+                except urllib.error.HTTPError as e:
+                    if e.code == 416 and got:  # просили за концом файла - он уже целиком
+                        break
+                    try:
+                        why = json.loads(e.read()[:400]).get("error") or ""
+                    except Exception:
+                        why = ""
+                    if e.code in (400, 403, 413) or "page" in why or "not found" in why:
+                        raise RuntimeError("сервер Portalis: %s" % (why or "HTTP %d" % e.code))
+                    fails += 1
+                    if fails > 4:
+                        raise RuntimeError("сервер Portalis: %s" % (why or "HTTP %d" % e.code))
+                    time.sleep(2 * fails)
+                except (OSError, http.client.HTTPException) as e:
+                    if cancel and cancel.is_set():
+                        raise
+                    fails += 1
+                    if fails > 4:
+                        raise RuntimeError("связь с сервером Portalis рвётся: %s" % e)
+                    out.seek(got)  # докачка с того места, где оборвалось
+                    out.truncate()
+                    time.sleep(2 * fails)
+        os.replace(part, lp(dst))
+    except BaseException:
+        if progress and got:
+            progress(-got)
+        try:
+            os.remove(part)
+        except OSError:
+            pass
+        raise
+
+
+def curl_fetch(url, dst, headers=None, progress=None, cancel=None, timeout=1800):
+    """Файл через curl.exe из Windows: Cloudflare пускает его там, где не пускает Питон (по TLS-отпечатку)."""
+    if not os.path.isfile(_CURL_EXE):
+        raise RuntimeError("нет curl.exe")
+    tmp = lp(dst) + ".curl"
+    cmd = [_CURL_EXE, "-s", "-L", "--fail", "--max-time", str(int(timeout)), "-A", UA_BROWSER, "-o", tmp]
+    for k, v in (headers or {}).items():
+        if k.lower() != "user-agent":
+            cmd += ["-H", "%s: %s" % (k, v)]
+    p = subprocess.Popen(cmd + [url], creationflags=0x08000000)
+    last = 0
+    try:
+        while p.poll() is None:
+            if cancel and cancel.is_set():
+                p.kill()
+                raise RuntimeError("отменено")
+            time.sleep(0.3)
+            size = os.path.getsize(tmp) if os.path.exists(tmp) else 0
+            if progress and size > last:
+                progress(size - last)
+                last = size
+        if p.returncode:
+            raise RuntimeError("curl: код %d" % p.returncode)
+        size = os.path.getsize(tmp)
+        if progress and size > last:
+            progress(size - last)
+            last = size
+        os.replace(tmp, lp(dst))
+    except BaseException:
+        if progress and last:
+            progress(-last)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def fetch_map_file(url, dst, ref=None, progress=None, cancel=None, log=print):
+    """Файл карты (или её ресурс-пака): сам -> curl Windows (если Cloudflare не пускает) -> через сервер Portalis
+    (сайт не открывается у игрока, хостинг не отдаёт файл программе). True - скачан архив."""
+    url = _html.unescape(url)
+    try:
+        direct = direct_link(url)
+    except FileGone as e:
+        log("Файл карты больше не скачать: %s" % e)
+        raise
+    if not direct and urllib.parse.urlsplit(url).scheme in ("http", "https"):
+        direct = url  # незнакомый сайт: часто это просто ссылка на архив - пробуем как есть, не вышло - дальше
+    hdr = {"User-Agent": UA_BROWSER}
+    if direct and "minecraft-inside.ru" in direct and ref:  # Google Диск с Referer показывает «проверку на вирусы»
+        hdr["Referer"] = ref
+    ways = []
+    if direct:
+        ways.append(("напрямую", lambda pr: _fetch_to(direct, dst, pr, None, cancel, hdr)))
+        if os.path.isfile(_CURL_EXE):
+            ways.append(("через curl Windows", lambda pr: curl_fetch(direct, dst, hdr, pr, cancel)))
+    if relay_ok(url) and _social_cfg():
+        ways.append(("через сервер Portalis", lambda pr: relay_fetch(url, dst, ref, pr, cancel)))
+    for i, (how, fn) in enumerate(ways):
+        if i:
+            log("Пробую скачать %s" % how)
+        cnt = [0]
+
+        def pr(n):
+            cnt[0] += n
+            if progress:
+                progress(n)
+        try:
+            fn(pr)
+            if _is_archive(dst):
+                return True
+            log("Скачалось %s, но это не архив с картой (вместо файла пришла страница сайта)" % how)
+        except Exception as e:
+            if cancel and cancel.is_set():
+                raise
+            log("Не скачалось %s: %s" % (how, str(e)[:100]))
+        if progress and cnt[0]:
+            progress(-cnt[0])
+    return False
 
 
 def _web_dir(*parts):
@@ -2782,18 +2970,13 @@ def install_web_map(info, want=None, fresh=False, log=print, progress=None, canc
     work = _web_dir("maps", re.sub(r"\D", "", info["url"])[:12] or "map")
     arc = os.path.join(work, "map.bin")
     log("Скачиваю «%s»: %s" % (info["title"], dl["name"] or dl["size"]))
-    direct = direct_link(dl["url"])
-    got = False
-    if direct:
-        try:
-            hdr = {"User-Agent": UA_BROWSER}
-            if "minecraft-inside.ru" in direct:  # Google Диск с Referer показывает «проверку на вирусы» вместо файла
-                hdr["Referer"] = info["url"]
-            _fetch_to(direct, arc, progress, None, cancel, hdr)
-            got = zipfile.is_zipfile(lp(arc)) or open(lp(arc), "rb").read(4)[:2] in (b"Ra", b"7z")
-        except Exception as e:
-            log("Напрямую не скачалось (%s), открываю ссылку в браузере" % str(e)[:80])
+    try:
+        got = fetch_map_file(dl["url"], arc, info["url"], progress, cancel, log)
+    except FileGone as e:
+        raise RuntimeError("%s. Карту не скачать, пока он не выложит её снова - напиши ему в комментариях "
+                           "на странице карты." % str(e).capitalize())
     if not got:
+        log("Остался один способ - браузер: открываю ссылку на файл")
         if not browser_download:
             raise RuntimeError("файл лежит на %s - его можно скачать только через браузер"
                                % urllib.parse.urlsplit(dl["url"]).netloc)
@@ -2830,12 +3013,13 @@ def install_web_map(info, want=None, fresh=False, log=print, progress=None, canc
         log("Карта «%s» уже установлена, продолжаешь своё сохранение" % info["title"])
     for rp in rps:
         rpath = os.path.join(work, "rp.bin")
-        if not direct_link(rp["url"]):
-            log("Ресурс-пак лежит на внешнем сайте: скачай его со страницы карты, если он нужен")
+        try:
+            ok_rp = fetch_map_file(rp["url"], rpath, info["url"], None, cancel, log)
+        except FileGone:
+            ok_rp = False
+        if not ok_rp:
+            log("Ресурс-пак скачать не вышло: возьми его со страницы карты, если он нужен")
             continue
-        rd = direct_link(rp["url"])
-        _fetch_to(rd, rpath, None, None, cancel, dict({"User-Agent": UA_BROWSER},
-                                                      **({"Referer": info["url"]} if "minecraft-inside.ru" in rd else {})))
         fname = _safe_name(info["title"]) + " - ресурспак.zip"
         os.makedirs(os.path.join(MC, "resourcepacks"), exist_ok=True)
         shutil.copy2(rpath, os.path.join(MC, "resourcepacks", fname))
@@ -11407,7 +11591,9 @@ def gui():
             def poll():
                 if state.get("net_loading"):
                     win.after(300, poll)
-                elif state["tab"] == "friend":
+                elif state["tab"] == "friend" and (not c or (c.get("vpn"), c.get("lan")) != (
+                        state["net_cache"].get("vpn"), state["net_cache"].get("lan"))):  # адреса те же - вкладку не трогаем
+                    state["keep_scroll"] = True
                     show("friend", animated=False)
             win.after(300, poll)
         return c or {"vpn": {}, "lan": None, "t": 0, "loading": True}
@@ -11604,6 +11790,40 @@ def gui():
                 w.bind("<Configure>", lambda e, w=w: w.configure(wraplength=max(180, e.width - 6)), add="+")
 
     # --- вкладка «Лаунчеры» ---
+    def look_launchers(launchers=None):
+        """Какие лаунчеры стоят - в фоне (поиск по диску долгий). Запускается сразу после старта программы,
+        чтобы вкладка открылась уже готовой, а не пересобиралась у игрока на глазах."""
+        if state.get("installed_launchers") is not None or state.get("launch_look"):
+            return
+        launchers = launchers or load_launchers()
+        if not launchers:
+            return
+        box = state["launch_look"] = {}
+
+        def look():
+            found = find_installed_launchers(launchers)
+            if not state.get("deep_searched"):  # не нашлись обычным способом - ищем по диску (один раз)
+                state["deep_searched"] = True
+                miss = [x["id"] for x in launchers if x["id"] not in found]
+                try:
+                    found.update(deep_find_launchers(miss))
+                except Exception:
+                    pass
+            box["found"] = found
+        th = threading.Thread(target=look, daemon=True)
+        th.start()
+
+        def poll():
+            if th.is_alive():
+                win.after(250, poll)
+                return
+            state["installed_launchers"] = box.get("found", {})
+            state.pop("launch_look", None)
+            if state["tab"] == "launchers":
+                state["keep_scroll"] = True
+                show("launchers", animated=False)
+        poll()
+
     def build_launchers():
         launchers = load_launchers()
         section("Лаунчеры", 0, "чем запускать Minecraft: Portalis умеет работать с каждым из них")
@@ -11612,27 +11832,7 @@ def gui():
             return
         installed = state.get("installed_launchers")
         if installed is None:
-            box = {}
-            def look():
-                found = find_installed_launchers(launchers)
-                if not state.get("deep_searched"):  # не нашлись обычным способом - ищем по диску (один раз)
-                    state["deep_searched"] = True
-                    miss = [x["id"] for x in launchers if x["id"] not in found]
-                    try:
-                        found.update(deep_find_launchers(miss))
-                    except Exception:
-                        pass
-                box["found"] = found
-            th = threading.Thread(target=look, daemon=True)
-            th.start()
-
-            def poll():
-                if th.is_alive():
-                    win.after(250, poll); return
-                state["installed_launchers"] = box.get("found", {})
-                if state["tab"] == "launchers":
-                    show("launchers", animated=False)
-            poll()
+            look_launchers(launchers)
             installed = {}
         mine = chosen_launcher()
         mode = launcher_mode(mine)
@@ -14541,8 +14741,9 @@ def gui():
                 for k_ in ("sel", "party", "members", "proposals"):
                     r.pop(k_, None)
                 win.after(10, soc_refresh)
-            changed = any(json.dumps(d.get(k), sort_keys=True, default=str) != json.dumps(r[k], sort_keys=True, default=str)
-                          for k in r)
+            # перерисовываем, только если поменялось видимое: «был в сети» у друзей обновляется каждую минуту, и раньше
+            # из-за него вкладка «Друзья» пересобиралась целиком раз в 15 секунд (всё мигало и прыгало)
+            changed = any(soc_view_sig(d.get(k)) != soc_view_sig(r[k]) for k in r)
             if "sel" in r and r["sel"] != d.get("sel"):
                 d.update(msgs=[], last=0)
             old = {k: d.get(k) for k in ("loaded", "friends", "invites", "parties", "proposals", "sel")}
@@ -14562,6 +14763,19 @@ def gui():
             finally:
                 d["loading"] = False
         soc_bg(lambda: fail(fetch), done, err_toast=full)
+
+    def soc_view_sig(v):
+        """Отпечаток данных для экрана: без меток времени (*_at, last_seen), но с «в сети / не в сети»."""
+        def norm(x):
+            if isinstance(x, dict):
+                out = {k: norm(y) for k, y in x.items() if not (k.endswith("_at") and k != "created_at") and k != "last_seen"}
+                if "last_seen" in x:
+                    out["_on"] = is_online(x)
+                return out
+            if isinstance(x, (list, tuple)):
+                return [norm(y) for y in x]
+            return x
+        return json.dumps(norm(v), sort_keys=True, default=str)
 
     def soc_poll_chat():
         d = soc_data()
@@ -14636,8 +14850,24 @@ def gui():
         fr = state.get("soc_frame")
         if fr is None or not fr.winfo_exists():
             return
-        for w in fr.winfo_children():
-            w.destroy()
+        y = canvas.yview()[0]
+        frozen = win.winfo_viewable() and freeze_paint(canvas, True)  # собираем целиком и показываем одним кадром
+        try:
+            for w in fr.winfo_children():
+                w.destroy()
+            _soc_render(fr)
+            auto_wrap(fr)
+            win.update_idletasks()
+            flush_islands()
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.yview_moveto(y)
+        except tk.TclError:
+            pass
+        finally:
+            if frozen:
+                freeze_paint(canvas, False)
+
+    def _soc_render(fr):
         c, d = soc(), soc_data()
         if not c.logged_in():  # вход - только из шапки (плашка аккаунта справа вверху)
             box = tk.Frame(fr, bg=PANEL, padx=18, pady=14)
@@ -18146,6 +18376,7 @@ def gui():
                   "info", ("Открыть", quick_search), 9000)
     win.after(6000, qs_tip)
     win.after(1500, enable_drop)
+    win.after(2500, lambda: _quiet(look_launchers))
     wait = max(0, int(1150 - (time.perf_counter() - splash_t0) * 1000))
     win.after(wait, reveal)
     win.mainloop()
