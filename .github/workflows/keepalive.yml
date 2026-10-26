@@ -1,0 +1,23 @@
+# Supabase на бесплатном тарифе ставит проект на паузу после недели без запросов - тогда у всех игроков Portalis
+# перестают работать друзья, пати, чат и облако. Раз в день делаем маленький запрос к базе, чтобы проект не засыпал.
+# Ключ здесь публичный (sb_publishable, он же лежит в программе); данные защищают правила RLS в базе.
+name: Supabase keep-alive
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Supabase
+        env:
+          URL: https://ivrugnlpjngyvguabdkt.supabase.co
+          KEY: sb_publishable_CfW7F4Kz8RnP4znITUdmtw_fjfRTZ8W
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' -m 30 "$URL/rest/v1/profiles?select=id&limit=1" \
+            -H "apikey: $KEY" -H "Authorization: Bearer $KEY")
+          echo "Supabase ответил: $code"
+          test "$code" = "200"
