@@ -132,6 +132,9 @@ def archive_index(ps, archives):
     return idx
 
 
+PRIVATE_FILES = ('curseforge.json', '_settings.json', 'errors.log')
+
+
 def library_files(ps, lib):
     out = []
     for rel in ps._walk_rel(lib, ''):
@@ -140,6 +143,8 @@ def library_files(ps, lib):
             continue
         if rel == 'manifest.json' or rel.rsplit('/', 1)[-1].lower() in ('.ds_store', 'thumbs.db', 'desktop.ini'):
             continue
+        if rel.rsplit('/', 1)[-1].lower() in PRIVATE_FILES or rel.lower().endswith(('.env', '.pem', '.key')):
+            continue  # ключи и пароли в релиз не попадают никогда (ключ CurseForge живёт на сервере, cf-proxy)
         if '/natives/' in rel and '/versions/' in rel:
             continue  # лаунчер распаковывает их сам при запуске
         if top in ('Скины',):
