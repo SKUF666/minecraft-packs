@@ -7,6 +7,7 @@ SignPath, когда она подключена), exe из сборки -> libr
 """
 import os, sys, shutil, subprocess, time, json, tempfile
 sys.stdout.reconfigure(encoding='utf-8')
+sys.stderr.reconfigure(encoding='utf-8')
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LIB = os.path.join(REPO, 'library')
 MODULES = ('PackSwitcher.pyw', 'mc_launch.py', 'skin_maker.py', 'mod_doctor.py', 'portalis_voice.py', 'skin3d.py')
@@ -32,8 +33,10 @@ def main():
         elif args[i] == '--run' and i + 1 < len(args):
             run_id = args[i + 1]
             i += 2
-        else:
+        elif args[i] == '--local':
             i += 1
+        else:  # любой запуск - настоящий выпуск, поэтому незнакомое (и --help) не пропускаем молча
+            raise SystemExit(__doc__ if args[i] in ('-h', '--help') else 'не знаю параметр %s\n%s' % (args[i], __doc__))
     if local:
         run(sys.executable, os.path.join(REPO, 'tools', 'build_exe.py'))
         return run(sys.executable, os.path.join(REPO, 'tools', 'publish.py'), *notes)
