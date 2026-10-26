@@ -17,7 +17,7 @@ jobs:
           URL: https://ivrugnlpjngyvguabdkt.supabase.co
           KEY: sb_publishable_CfW7F4Kz8RnP4znITUdmtw_fjfRTZ8W
         run: |
-          code=$(curl -s -o /dev/null -w '%{http_code}' -m 30 "$URL/rest/v1/profiles?select=id&limit=1" \
-            -H "apikey: $KEY" -H "Authorization: Bearer $KEY")
+          # анониму таблица закрыта (так и надо): база отвечает «permission denied», но запрос до неё дошёл
+          code=$(curl -s -o /dev/null -w '%{http_code}' -m 30 "$URL/rest/v1/profiles?select=id&limit=1" -H "apikey: $KEY")
           echo "Supabase ответил: $code"
-          test "$code" = "200"
+          test "$code" = "200" -o "$code" = "401"
