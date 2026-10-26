@@ -114,6 +114,10 @@ def patched(self, *a):
 
         def stop():
             on['v'] = False
+            if os.environ.get('CHURN_SHOT'):
+                sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+                import winshot
+                winshot.shot(self, os.path.join(os.environ.get('TEMP', '.'), 'minecraft-packs-shots', 'churn_%s.png' % name))
             print('%-10s %s  по секундам: %s' % (name, dict(counts) or 'тихо', dict(sorted(secs.items()))))
             for (k, w), n in where.most_common(4):
                 print('     %4d %-9s %s' % (n, k, w))
