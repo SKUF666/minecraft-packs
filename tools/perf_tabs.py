@@ -32,12 +32,12 @@ def patched(self, *a):
     def timed(tab, n):
         t = time.perf_counter()
         c = cpu()
-        if n == 1 and os.environ.get('PROFILE') == tab:
+        if n == int(os.environ.get('PROFILE_N', '1')) and os.environ.get('PROFILE') == tab:
             import cProfile, pstats
             pr = cProfile.Profile(); pr.enable()
             hk['show'](tab, animated=False); self.update()
             pr.disable()
-            pstats.Stats(pr).sort_stats('cumulative').print_stats(45)
+            pstats.Stats(pr).sort_stats('cumulative').print_stats(int(os.environ.get('PROFILE_LINES', '45')))
             pstats.Stats(pr).sort_stats('tottime').print_stats(25)
         else:
             hk['show'](tab, animated=False)
