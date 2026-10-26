@@ -5450,25 +5450,47 @@ CF_LOADERS = {"forge": 1, "fabric": 4, "quilt": 5, "neoforge": 6}
 CF_SORT = {"downloads": 6, "relevance": 1, "updated": 3, "newest": 11}
 
 
+CF_PROXY = "proxy"  # ключа в программе нет: запросы идут через функцию cf-proxy на сервере Supabase
+
+
+def _social_cfg():
+    try:
+        with open(os.path.join(ROOT, "social.json"), encoding="utf-8-sig") as fh:
+            d = json.load(fh)
+        return d if d.get("url") and d.get("key") else None
+    except (OSError, ValueError):
+        return None
+
+
 def cf_key():
-    """Ключ CurseForge: файл curseforge.json рядом с данными ({"key": "..."}) или переменная PORTALIS_CF_KEY."""
+    """Как ходить в CurseForge: свой ключ (переменная PORTALIS_CF_KEY или curseforge.json - для разработки)
+    или CF_PROXY - через функцию-посредника на сервере, где ключ и хранится (в выпусках ключа нет)."""
     k = os.environ.get("PORTALIS_CF_KEY")
     if k:
         return k
     try:
         with open(os.path.join(ROOT, "curseforge.json"), encoding="utf-8-sig") as fh:  # Блокнот пишет и с BOM
             k = (json.load(fh).get("key") or "").strip()
-            return k if k and not k.startswith("ВСТАВЬ") else None
+            if k and not k.startswith("ВСТАВЬ"):
+                return k
     except (OSError, ValueError):
-        return None
+        pass
+    return CF_PROXY if _social_cfg() else None
 
 
 def cf_get(path, params=None, body=None):
     key = cf_key()
     if not key:
         raise RuntimeError("нет ключа CurseForge")
-    url = CF_API + path + ("?" + urllib.parse.urlencode(params) if params else "")
-    h = {"x-api-key": key, "Accept": "application/json", "User-Agent": MR_UA["User-Agent"]}
+    if key == CF_PROXY:
+        sc = _social_cfg()
+        q = dict(params or {}, path=path)
+        url = sc["url"].rstrip("/") + "/functions/v1/cf-proxy?" + urllib.parse.urlencode(q)
+        h = {"apikey": sc["key"], "Authorization": "Bearer " + sc["key"], "Accept": "application/json",
+             "User-Agent": MR_UA["User-Agent"]}
+    else:
+        url = CF_API + path + ("?" + urllib.parse.urlencode(params) if params else "")
+        h = {"x-api-key": key, "Accept": "application/json", "User-Agent": MR_UA["User-Agent"]}
     if body is not None:
         h["Content-Type"] = "application/json"
         req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), method="POST", headers=h)
@@ -7576,6 +7598,91 @@ def render_button(text, px, bold, fg, fill, icon=None, padx=14, pady=7, radius=8
                 d.text((x, cy), t, font=f, fill=_hex(fg), anchor="lm")
             x += f.getlength(t)
     return im.resize((w, h + sh), PILImage.LANCZOS)
+
+
+def _vgrad(w, h, top, bot):
+    g = PILImage.new("RGBA", (1, h))
+    for y in range(h):
+        g.putpixel((0, y), _hex(_mixc(top, bot, y / max(1, h - 1))))
+    return g.resize((w, h))
+
+
+def render_menu_row(text, px, icon, w, h, state, accent, base, fg, muted):
+    """Строка бокового меню картинкой постоянного размера: значок и надпись слева. state - normal / hover / on.
+    Размер не зависит ни от состояния, ни от жирности: при наведении и выборе ничего не сдвигается."""
+    S = 3
+    W, H = w * S, h * S
+    im = PILImage.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    r = 11 * S
+    if state == "on":
+        mask = PILImage.new("L", (W, H), 0)
+        ImageDraw.Draw(mask).rounded_rectangle((0, 0, W - 1, H - 1), r, fill=255)
+        im.paste(_vgrad(W, H, _mixc(accent, "#ffffff", 0.14), _mixc(accent, "#000000", 0.12)), (0, 0), mask)
+        d.rounded_rectangle((S, S, W - 1 - S, H - 1 - S), r - S, outline=(255, 255, 255, 40), width=S)
+    elif state == "hover":
+        d.rounded_rectangle((0, 0, W - 1, H - 1), r, fill=_hex(_mixc(base, "#ffffff", 0.07)),
+                            outline=_hex(_mixc(base, "#ffffff", 0.13)), width=S)
+    x = 14 * S
+    if icon is not None:
+        isz = int(round(h * 0.48))
+        ic = icon.convert("RGBA").resize((isz * S, isz * S), PILImage.LANCZOS)
+        if state == "normal":  # невыбранные значки чуть приглушены, под мышью - в полную силу
+            ic.putalpha(ic.getchannel("A").point(lambda v: v * 80 // 100))
+        im.alpha_composite(ic, (x, (H - ic.height) // 2))
+        x += (isz + 12) * S
+    col = "#ffffff" if state == "on" else fg if state == "hover" else muted
+    for sym, t in _text_runs(text):
+        f = ui_font(px * S, state == "on", sym)
+        d.text((x, H // 2), t, font=f, fill=_hex(col), anchor="lm")
+        x += f.getlength(t)
+    if state == "on":  # точка справа - «ты здесь»
+        cy, rr = H // 2, 3 * S
+        d.ellipse((W - 16 * S - rr, cy - rr, W - 16 * S + rr, cy + rr), fill=(255, 255, 255, 220))
+    return im.resize((w, h), PILImage.LANCZOS)
+
+
+def render_level_ring(lv, frac, color, size, bg, track, fg, caption):
+    """Кольцо уровня: дорожка, дуга опыта цветом игрока, по центру - номер уровня и подпись."""
+    S = 3
+    W = size * S
+    im = PILImage.new("RGBA", (W, W), _hex(bg))
+    d = ImageDraw.Draw(im)
+    th = max(6, size // 11) * S
+    box = (th // 2 + S, th // 2 + S, W - th // 2 - S, W - th // 2 - S)
+    d.ellipse(box, outline=_hex(track), width=th)
+    frac = max(0.0, min(1.0, frac))
+    if frac > 0.005:
+        d.arc(box, -90, -90 + 360 * frac, fill=_hex(color), width=th)
+        for ang in (-90, -90 + 360 * frac):  # скруглённые концы дуги
+            a = math.radians(ang)
+            cx = W / 2 + (box[2] - box[0]) / 2 * math.cos(a)
+            cy = W / 2 + (box[3] - box[1]) / 2 * math.sin(a)
+            d.ellipse((cx - th / 2, cy - th / 2, cx + th / 2, cy + th / 2), fill=_hex(color))
+    d.text((W / 2, W / 2 - 4 * S), str(lv), font=ui_font(int(size * 0.34) * S, True), fill=_hex(fg), anchor="mm")
+    d.text((W / 2, W / 2 + size * 0.22 * S), caption, font=ui_font(int(size * 0.12) * S, True), fill=_hex(_mixc(fg, bg, 0.4)),
+           anchor="mm")
+    return im.resize((size, size), PILImage.LANCZOS)
+
+
+def ago_text(ts):
+    """Когда написано: «только что», «5 мин назад», «3 ч назад», «вчера в 17:11», «26.10 в 17:11»."""
+    try:
+        t0 = calendar.timegm(time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S"))
+    except (ValueError, TypeError, OverflowError):
+        return local_time(ts, "%d.%m в %H:%M")
+    dt = time.time() - t0
+    if dt < 60:
+        return "только что"
+    if dt < 3600:
+        return "%d мин назад" % (dt // 60)
+    lt, now = time.localtime(t0), time.localtime()
+    if lt.tm_yday == now.tm_yday and lt.tm_year == now.tm_year:
+        return "%d ч назад" % (dt // 3600)
+    yest = time.localtime(time.time() - 86400)
+    if lt.tm_yday == yest.tm_yday and lt.tm_year == yest.tm_year:
+        return "вчера в %s" % time.strftime("%H:%M", lt)
+    return time.strftime("%d.%m в %H:%M", lt)
 
 
 def dark_titlebar(w):
@@ -13105,7 +13212,7 @@ def gui():
         ring = status_color(p) if not mine else {"dnd": "#e05a5a", "invisible": "#5c6170"}.get(p.get("presence"), "#4caf50")
         avl = tk.Label(hc, bg=BG, bd=0)
         hc.create_window(24, 165, window=avl, anchor="sw")
-        want_pic("prof:%s:%s:%d:%s" % (p.get("avatar"), ring, len(p.get("avatar") or ""), p.get("frame")),
+        want_pic("prof:%s:%s:%d:%s:%s" % (p.get("avatar"), ring, len(p.get("avatar") or ""), p.get("frame"), p.get("login")),
                  lambda: avatar_pil(p.get("avatar"), 112, p.get("login", ""), ring, p.get("frame")), avl, t._imgs)
         for dx, dy, col in ((2, 2, "#000000"), (0, 0, "white")):
             hc.create_text(156 + dx, 92 + dy, text=p.get("nick", "?"), font=(FONT, 22, "bold"), fill=col, anchor="w")
@@ -13137,18 +13244,7 @@ def gui():
         cur = {"page": page if page in [k for k, _l, _i in pages] else "overview"}
 
         def page_overview():
-            progress_block(t, body, p, ("top",))
-            if p.get("about"):
-                dsection(body, "О себе")
-                dpara(body, p["about"])
-            if p.get("favorites"):
-                dsection(body, "Любимые игры")
-                body.winfo_children()[-1].configure(image=art("ic_heart.png", 18, 18), compound="left", text=" Любимые игры")
-                fav = tk.Frame(body, bg=BG)
-                fav.pack(fill="x")
-                for g in p["favorites"][:12]:
-                    badge(fav, g, CARD_HI).pack(side="left", padx=(0, 6), pady=2)
-            progress_block(t, body, p, ("maps", "skin"))
+            profile_overview(t, body, p, lambda k: go(k))
 
         def page_friends():
             dsection(body, "Друзья")
@@ -13166,7 +13262,7 @@ def gui():
                 cell.grid(row=i // 3, column=i % 3, sticky="we", padx=(0, 10), pady=(0, 10))
                 av = tk.Label(cell, bg=CARD)
                 av.pack(side="left")
-                want_pic("pfav:%s:%s:%d" % (fp.get("avatar"), status_color(fp), len(fp.get("avatar") or "")),
+                want_pic("pfav:%s:%s:%d:%s" % (fp.get("avatar"), status_color(fp), len(fp.get("avatar") or ""), fp.get("login")),
                          lambda fp=fp: avatar_pil(fp.get("avatar"), 44, fp.get("login", ""), status_color(fp)), av, t._imgs)
                 tx = tk.Frame(cell, bg=CARD)
                 tx.pack(side="left", fill="x", expand=True, padx=(10, 0))
@@ -13192,26 +13288,34 @@ def gui():
         def page_settings():
             profile_editor(t, body, p)
 
+        rows = {}
+        mpx = int(round(11 * PT))
+        mw = max(196, int(max(text_px_width(tr(l_), mpx, True) for _k, l_, _i in pages)) + 74)
+        mh = int(round(mpx * 1.38)) + 20
+
+        def row_paint(k, hover=False):
+            lb, label, ic = rows[k]
+            state_ = "on" if k == cur["page"] else "hover" if hover else "normal"
+            key = ("mrow", label, ic, state_, mw, mh, ACCENT)
+            ph = _btn_cache.get(key)
+            if ph is None:
+                ph = _btn_cache[key] = ImageTk.PhotoImage(render_menu_row(
+                    label, mpx, icon_pil(ic), mw, mh, state_, ACCENT, PANEL, TEXT, "#c3c7d1"))
+            lb.configure(image=ph)
+
         def draw_side():
-            for w_ in side.winfo_children():
-                w_.destroy()
+            # Строки меню - картинки одного размера, каждая одним виджетом: наведение не мигает (нет детей, по которым
+            # бегает Enter/Leave), а выбор и подсветка не меняют ширину. Строятся один раз - go() только перекрашивает.
             tk.Label(side, text="Профиль", font=(FONT, 9, "bold"), fg=MUTED, bg=PANEL, anchor="w").pack(fill="x",
-                                                                                                        pady=(0, 6))
-            for k, label, ic in pages:  # строки меню во всю ширину: выбранная - цветом акцента
-                on = k == cur["page"]
-                bg_ = ACCENT if on else PANEL
-                rw = tk.Frame(side, bg=bg_, padx=12, pady=9, cursor="hand2", width=190)
-                rw.pack(fill="x", pady=(0, 4))
-                il = tk.Label(rw, image=art(ic, 20, 20), bg=bg_, cursor="hand2")
-                il.pack(side="left")
-                tl = tk.Label(rw, text="  " + label, font=(FONT, 11, "bold" if on else "normal"), fg="white" if on else TEXT,
-                              bg=bg_, anchor="w", cursor="hand2", width=14)
-                tl.pack(side="left", fill="x", expand=True)
-                for w_ in (rw, il, tl):
-                    w_.bind("<Button-1>", lambda e, k=k: go(k))
-                    if not on:
-                        w_.bind("<Enter>", lambda e, ws=(rw, il, tl): [x.configure(bg=CARD_HI) for x in ws])
-                        w_.bind("<Leave>", lambda e, ws=(rw, il, tl): [x.configure(bg=PANEL) for x in ws])
+                                                                                                        pady=(0, 8))
+            for k, label, ic in pages:
+                lb = tk.Label(side, bg=PANEL, bd=0, cursor="hand2", text=label)
+                lb.pack(anchor="w", pady=(0, 3))
+                rows[k] = (lb, tr(label), ic)
+                lb.bind("<Button-1>", lambda e, k=k: go(k))
+                lb.bind("<Enter>", lambda e, k=k: row_paint(k, True))
+                lb.bind("<Leave>", lambda e, k=k: row_paint(k, False))
+                row_paint(k)
             if not mine:
                 tk.Frame(side, bg=LINE, height=1).pack(fill="x", pady=(10, 10))
                 small_button(side, "Написать", lambda: soc_dm(p), bg=PANEL, icon="ic_mail.png").pack(fill="x")
@@ -13223,7 +13327,8 @@ def gui():
 
         def go(k):
             cur["page"] = k
-            draw_side()
+            for k_ in rows:
+                row_paint(k_, pointer_inside(rows[k_][0]))
             frozen = t.winfo_viewable() and freeze_paint(cv, True)
             try:
                 for w_ in body.winfo_children():
@@ -13240,6 +13345,7 @@ def gui():
                 if frozen:
                     freeze_paint(cv, False)
         t._go = go
+        draw_side()
         go(cur["page"])
         fade_in_window(t)
 
@@ -13371,7 +13477,7 @@ def gui():
             rw.pack(fill="x", pady=(6, 0))
             av = tk.Label(rw, bg=PANEL, cursor="hand2")
             av.pack(side="left")
-            want_pic("nowav:%s:%d" % (p.get("avatar"), len(p.get("avatar") or "")),
+            want_pic("nowav:%s:%d:%s" % (p.get("avatar"), len(p.get("avatar") or ""), p.get("login")),
                      lambda p=p: avatar_pil(p.get("avatar"), 30, p.get("login", ""), "#4caf50"), av)
             av.bind("<Button-1>", lambda e, p=p: open_profile(p))
             what = (p.get("status_detail") or "Minecraft").replace("играет: ", "")
@@ -13435,6 +13541,195 @@ def gui():
             soc_bg(lambda: c.update_profile(stats=pub), done, err_toast=False)
         else:
             state["stats_merged_once"] = True
+
+    PROFILE_RANKS = ((12, "Легенда Portalis"), (8, "Мастер карт"), (5, "Опытный игрок"), (3, "Исследователь"),
+                     (1, "Новичок"))
+
+    def icon_disc(ic, col, size=42, bg=CARD):
+        """Значок в кружке цвета col (подложка полупрозрачная - на фоне bg)."""
+        key = ("disc", ic, col, size, bg)
+        ph = _btn_cache.get(key)
+        if ph is None:
+            S = 3
+            im = PILImage.new("RGBA", (size * S, size * S), _hex(bg))
+            ImageDraw.Draw(im).ellipse((S, S, size * S - S, size * S - S), fill=_hex(_mixc(col, bg, 0.74)),
+                                       outline=_hex(_mixc(col, bg, 0.45)), width=S)
+            i_ = icon_pil(ic)
+            if i_ is not None:
+                n_ = int(size * 0.54) * S
+                i_ = i_.convert("RGBA").resize((n_, n_), PILImage.LANCZOS)
+                im.alpha_composite(i_, ((size * S - n_) // 2, (size * S - n_) // 2))
+            ph = _btn_cache[key] = ImageTk.PhotoImage(im.resize((size, size), PILImage.LANCZOS))
+        return ph
+
+    def flow_layout(fr, gap=(6, 6)):
+        """Дети fr идут строками по ширине fr и переносятся, когда не влезают (бейджи, медали)."""
+        def lay(e=None):
+            if not fr.winfo_exists():
+                return
+            W = fr.winfo_width()
+            if W < 20:
+                return
+            x = y = rowh = 0
+            for ch in fr.winfo_children():
+                w_, h_ = ch.winfo_reqwidth(), ch.winfo_reqheight()
+                if x and x + w_ > W:
+                    x, y, rowh = 0, y + rowh + gap[1], 0
+                ch.place(x=x, y=y)
+                x += w_ + gap[0]
+                rowh = max(rowh, h_)
+            if int(fr.cget("height")) != y + rowh:
+                fr.configure(height=y + rowh)
+        fr.bind("<Configure>", lay, add="+")
+        fr.after_idle(lay)
+        return fr
+
+    def pcard(parent, title=None, icon=None, link=None, bg=CARD, padx=18, pady=16):
+        """Карточка страниц профиля: островок, сверху значок, заголовок и справа ссылка (текст, команда)."""
+        cd = tk.Frame(parent, bg=bg, padx=padx, pady=pady)
+        island(cd, vines=False, radius=14)
+        if title:
+            hd = tk.Frame(cd, bg=bg)
+            hd.pack(fill="x", pady=(0, 12))
+            if icon:
+                tk.Label(hd, image=art(icon, 20, 20), bg=bg).pack(side="left", padx=(0, 9))
+            tk.Label(hd, text=title, font=(FONT, 12, "bold"), fg=TEXT, bg=bg).pack(side="left")
+            if link:
+                small_button(hd, link[0], link[1], bg=bg).pack(side="right")
+        return cd
+
+    def profile_overview(t, body, p, go):
+        """«Обзор»: карточка уровня с кольцом опыта, плитки статистики, «О себе» и любимые игры, медали,
+        последние карты; справа - скин в 3D на подставке (если игрок указал ник скина)."""
+        s_ = p.get("stats") or {}
+        if p.get("id") == soc().uid:
+            s_ = merge_stats(s_, {k: v for k, v in my_stats().items() if k != "uid"})
+        xp = stats_xp(s_)
+        lv, cur, need = level_of(xp)
+        color = p.get("color") or ACCENT
+        got = earned(s_)
+        # уровень
+        top = pcard(body)
+        top.pack(fill="x")
+        tk.Label(top, bg=CARD, image=pil_photo(render_level_ring(lv, cur / max(1, need), color, 96, CARD,
+                                                                 _mixc(LINE, CARD, 0.15), TEXT, tr("УРОВЕНЬ")), t._imgs)
+                 ).pack(side="left")
+        aw = tk.Frame(top, bg=CARD, cursor="hand2")
+        aw.pack(side="right", padx=(24, 6))
+        al = tk.Label(aw, image=icon_disc("ic_crown.png", GOLD, 50), bg=CARD, cursor="hand2")
+        al.pack()
+        an = tk.Label(aw, text="%d / %d" % (len(got), len(ACHIEVEMENTS)), font=(FONT, 13, "bold"), fg=GOLD, bg=CARD,
+                      cursor="hand2")
+        an.pack(pady=(4, 0))
+        ac = tk.Label(aw, text="достижений", font=(FONT, 9), fg=MUTED, bg=CARD, cursor="hand2")
+        ac.pack()
+        for w_ in (aw, al, an, ac):
+            w_.bind("<Button-1>", lambda e: go("ach"))
+        mid = tk.Frame(top, bg=CARD)
+        mid.pack(side="left", fill="x", expand=True, padx=(20, 0))
+        tk.Label(mid, text=next(n for m, n in PROFILE_RANKS if lv >= m), font=(FONT, 17, "bold"), fg=TEXT, bg=CARD,
+                 anchor="w").pack(fill="x")
+        tk.Label(mid, text="%d опыта за всё время" % xp, font=(FONT, 9), fg=MUTED, bg=CARD, anchor="w").pack(
+            fill="x", pady=(0, 10))
+        bar = RoundBar(mid, 10)
+        bar.pack(fill="x")
+        fill_ = bar.create_rectangle(0, 0, 0, 10, fill=color)
+        bar.bind("<Configure>", lambda e: bar.coords(fill_, 0, 0, int(e.width * cur / max(1, need)), 10), add="+")
+        tk.Label(mid, text="%d / %d  ·  ещё %d опыта до %d уровня" % (cur, need, need - cur, lv + 1), font=(FONT, 9),
+                 fg="#c3c7d1", bg=CARD, anchor="w").pack(fill="x", pady=(7, 0))
+        # плитки статистики
+        tiles = tk.Frame(body, bg=BG)
+        tiles.pack(fill="x", pady=(12, 0))
+        hours = int(s_.get("minutes", 0) or 0) / 60.0
+        n_maps, n_packs, n_fr = (int(s_.get(k, 0) or 0) for k in ("maps_n", "packs", "friends"))
+        items = [("ic_hourglass.png", "%.1f ч" % hours if hours < 10 else "%d ч" % hours, "в игре", "#e0a84c"),
+                 ("ic_compass.png", str(n_maps), plural(n_maps, "карта сыграна", "карты сыграно", "карт сыграно"), "#5aa7e0"),
+                 ("ic_wrench.png", str(n_packs), plural(n_packs, "своя сборка", "своих сборки", "своих сборок"), "#a77be0"),
+                 ("ic_invite.png", str(n_fr), plural(n_fr, "друг", "друга", "друзей"), ACCENT_HI)]
+        for i, (ic, val, cap, col) in enumerate(items):
+            tiles.grid_columnconfigure(i, weight=1, uniform="st")
+            cell = tk.Frame(tiles, bg=CARD, padx=14, pady=12)
+            island(cell, vines=False, radius=12)
+            cell.grid(row=0, column=i, sticky="we", padx=(0 if i == 0 else 10, 0))
+            tk.Label(cell, image=icon_disc(ic, col, 42), bg=CARD).pack(side="left")
+            tx = tk.Frame(cell, bg=CARD)
+            tx.pack(side="left", padx=(12, 0))
+            tk.Label(tx, text=val, font=(FONT, 16, "bold"), fg=TEXT, bg=CARD, anchor="w").pack(fill="x")
+            tk.Label(tx, text=cap, font=(FONT, 9), fg=MUTED, bg=CARD, anchor="w").pack(fill="x")
+        # ниже две колонки: слева о себе / медали / карты, справа скин
+        cols = tk.Frame(body, bg=BG)
+        cols.pack(fill="x", pady=(12, 0))
+        left = tk.Frame(cols, bg=BG)
+        if p.get("skin"):
+            right = tk.Frame(cols, bg=BG)
+            right.pack(side="right", anchor="n", padx=(12, 0))
+            sc = pcard(right, "Скин", "ic_mannequin.png", padx=14, pady=14)
+            sc.pack()
+            hold = tk.Label(sc, text="Загружаю скин...", font=(FONT, 9), fg=MUTED, bg=CARD, width=26, height=12)
+            hold.pack()
+            snick = tk.Label(sc, text=p["skin"], font=(FONT, 10, "bold"), fg=TEXT, bg=CARD)
+            snick.pack(pady=(8, 0))
+
+            def got_skin(found):
+                if not hold.winfo_exists():
+                    return
+                if not found:
+                    hold.configure(text="Скин не нашёлся")
+                    return
+                hold.destroy()
+                skin3d_view(sc, found[0]["skin"], found[0].get("slim"), None, size=(210, 270), bg=CARD,
+                            controls=False).pack(before=snick)
+
+            def find_skin(nick=p["skin"]):
+                try:
+                    return skin_lookup(nick)
+                except Exception:
+                    return None
+            soc_bg(find_skin, got_skin, err_toast=False)
+        left.pack(side="left", fill="both", expand=True, anchor="n")
+        if p.get("about") or p.get("favorites"):
+            ab = pcard(left, "О себе", "ic_tag.png")
+            ab.pack(fill="x", pady=(0, 12))
+            if p.get("about"):
+                tk.Label(ab, text=p["about"], font=(FONT, 11), fg="#d6d9e0", bg=CARD, justify="left", anchor="w",
+                         wraplength=600).pack(fill="x")
+            if p.get("favorites"):
+                fh = tk.Frame(ab, bg=CARD)
+                fh.pack(fill="x", pady=(14 if p.get("about") else 0, 8))
+                tk.Label(fh, image=art("ic_heart.png", 16, 16), bg=CARD).pack(side="left", padx=(0, 7))
+                tk.Label(fh, text="Любимые игры", font=(FONT, 10, "bold"), fg=MUTED, bg=CARD).pack(side="left")
+                fav = tk.Frame(ab, bg=CARD)
+                fav.pack(fill="x")
+                for g in p["favorites"][:12]:
+                    badge(fav, g, CARD_HI)
+                flow_layout(fav)
+        md = pcard(left, "Достижения", "ic_crown.png", ("Все", lambda: go("ach")))
+        md.pack(fill="x", pady=(0, 12))
+        if got:
+            mr = tk.Frame(md, bg=CARD)
+            mr.pack(fill="x")
+            for a in got[-12:]:
+                cell = tk.Frame(mr, bg=CARD)
+                try:
+                    im = PILImage.open(os.path.join(ART, "achievements", "ach_%02d.png" % a[0])).convert("RGBA").resize(
+                        (48, 48), PILImage.LANCZOS)
+                    tk.Label(cell, image=pil_photo(im, t._imgs), bg=CARD).pack()
+                except Exception:
+                    pass
+                tk.Label(cell, text=a[1], font=(FONT, 8), fg="#c3c7d1", bg=CARD, wraplength=104,
+                         justify="center").pack(pady=(3, 0))
+            flow_layout(mr, (8, 10))
+        else:
+            tk.Label(md, text="Пока ни одной медали. Сыграй первую карту - и она появится здесь.", font=(FONT, 10),
+                     fg=MUTED, bg=CARD, anchor="w", justify="left", wraplength=600).pack(fill="x")
+        if s_.get("maps"):
+            mc = pcard(left, "Последние карты", "ic_compass.png")
+            mc.pack(fill="x", pady=(0, 12))
+            mr = tk.Frame(mc, bg=CARD)
+            mr.pack(fill="x")
+            for m in s_["maps"][:12]:
+                badge(mr, m[:28], CARD_HI)
+            flow_layout(mr)
 
     def progress_block(t, body, p, parts=("top", "ach", "maps", "skin")):
         """Уровень и опыт, статистика (top), достижения и сезон (ach), последние карты (maps), скин (skin)."""
@@ -13562,7 +13857,7 @@ def gui():
         pv.pack(side="left", padx=(0, 12))
 
         def preview():
-            want_pic("avprev:%s:%d" % (sel["avatar"], len(sel["avatar"] or "")),
+            want_pic("avprev:%s:%d:%s" % (sel["avatar"], len(sel["avatar"] or ""), p.get("login")),
                      lambda: avatar_pil(sel["avatar"], 48, p.get("login", "")), pv, t._imgs)
 
         def own_file():
@@ -13772,36 +14067,37 @@ def gui():
         small_button(row, "Сменить пароль", change_pw, bg=BG, icon="ic_lock.png").pack(side="left", padx=6)
 
     def wall_view(t, body, p):
-        """Стена: поле «напиши на стене» с аватаром, записи карточками (аватар, ник, время, текст, реакции),
-        ответы - со сдвигом и полоской цвета. Новые сверху."""
+        """Стена: шапка со счётчиком, поле «напиши на стене» с аватаром, записи карточками (аватар, ник, когда,
+        текст, реакции); ответы - внутри карточки записи, вложенными плашками. Новые сверху."""
         c = soc()
         mine = p.get("id") == c.uid
         me_ = soc_data().get("me") or {}
         hd = tk.Frame(body, bg=BG)
-        hd.pack(fill="x", pady=(4, 8))
-        tk.Label(hd, image=art("ic_mail.png", 22, 22), bg=BG).pack(side="left")
-        tk.Label(hd, text="  Стена", font=(FONT, 16, "bold"), fg=TEXT, bg=BG).pack(side="left")
-        cnt = tk.Label(hd, text="", font=(FONT, 10), fg=MUTED, bg=BG)
-        cnt.pack(side="left", padx=(10, 0))
+        hd.pack(fill="x", pady=(2, 12))
+        tk.Label(hd, image=icon_disc("ic_mail.png", ACCENT, 40, BG), bg=BG).pack(side="left")
+        ht = tk.Frame(hd, bg=BG)
+        ht.pack(side="left", padx=(12, 0))
+        tk.Label(ht, text="Стена", font=(FONT, 16, "bold"), fg=TEXT, bg=BG, anchor="w").pack(fill="x")
+        tk.Label(ht, text="Новости игрока и записи друзей" if not mine else "Твои новости и записи друзей",
+                 font=(FONT, 9), fg=MUTED, bg=BG, anchor="w").pack(fill="x")
+        cnt = tk.Frame(hd, bg=BG)
+        cnt.pack(side="right")
         # поле для записи
-        comp = tk.Frame(body, bg=CARD, padx=16, pady=14)
-        island(comp, vines=False, radius=14)
+        comp = pcard(body, padx=18, pady=16)
         comp.pack(fill="x")
         cav = tk.Label(comp, bg=CARD)
         cav.pack(side="left", anchor="n")
-        want_pic("wme:%s:%d" % (me_.get("avatar"), len(me_.get("avatar") or "")),
-                 lambda: avatar_pil(me_.get("avatar"), 44, me_.get("login", ""), ACCENT), cav, t._imgs)
+        want_pic("wme:%s:%d:%s" % (me_.get("avatar"), len(me_.get("avatar") or ""), me_.get("login")),
+                 lambda: avatar_pil(me_.get("avatar"), 46, me_.get("login", ""), ACCENT), cav, t._imgs)
         cr = tk.Frame(comp, bg=CARD)
-        cr.pack(side="left", fill="x", expand=True, padx=(12, 0))
+        cr.pack(side="left", fill="x", expand=True, padx=(14, 0))
         rl = tk.Frame(cr, bg=CARD)
-        e = REntry(cr, font=(FONT, 11), bg=CARD_HI, fg=TEXT, insertbackground=TEXT, relief="flat",
-                   highlightthickness=1, highlightbackground=LINE, highlightcolor=ACCENT)
-        e.pack(fill="x", ipady=8)
-        tip = tk.Label(cr, text=("Напиши, что у тебя нового" if mine else "Напиши что-нибудь для %s" % p.get("nick", "игрока"))
-                       + " — Enter, чтобы опубликовать", font=(FONT, 9), fg=MUTED, bg=CARD, anchor="w")
-        tip.pack(fill="x", pady=(6, 0))
-        btn_row = tk.Frame(comp, bg=CARD)
-        btn_row.pack(side="right", anchor="n", padx=(12, 0))
+        e = REntry(cr, font=(FONT, 11), bg=CARD_HI, fg=TEXT, insertbackground=TEXT)
+        e.pack(fill="x", ipady=7)
+        foot = tk.Frame(cr, bg=CARD)
+        foot.pack(fill="x", pady=(10, 0))
+        tk.Label(foot, text=(tr("Напиши, что у тебя нового") if mine else tr("Напиши что-нибудь для %s") % p.get("nick", "игрока"))
+                 + tr(" — Enter, чтобы опубликовать"), font=(FONT, 9), fg=MUTED, bg=CARD, anchor="w").pack(side="left")
         w = tk.Frame(body, bg=BG)
         w.pack(fill="x", pady=(14, 0))
         reply = {"id": None}
@@ -13813,44 +14109,48 @@ def gui():
             if i is None:
                 rl.pack_forget()
                 return
-            rl.pack(fill="x", before=e, pady=(0, 6))
+            rl.pack(fill="x", before=e, pady=(0, 8))
             tk.Label(rl, text="↪  Ответ для %s" % nick, font=(FONT, 9, "bold"), fg=ACCENT_HI, bg=CARD).pack(side="left")
             small_button(rl, "Отмена", lambda: set_reply(None, ""), bg=CARD).pack(side="left", padx=8)
             e.focus_set()
 
-        def post_card(r, depth):
+        def entry_(parent, r, depth):
+            """Одна запись или ответ внутри своей плашки: шапка (аватар, ник, когда, ✕), текст, реакции."""
             ap = r["author_profile"]
-            bg_ = CARD if not depth else PANEL
-            outer = tk.Frame(w, bg=BG)
-            outer.pack(fill="x", pady=(0, 8), padx=(56 if depth else 0, 0))
-            if depth:  # ответ: тонкая полоска слева
-                tk.Frame(outer, bg=ACCENT, width=3).pack(side="left", fill="y", padx=(0, 8))
-            card_ = tk.Frame(outer, bg=bg_, padx=14, pady=12)
-            island(card_, vines=False, radius=12)
-            card_.pack(side="left", fill="x", expand=True)
-            av = tk.Label(card_, bg=bg_, cursor="hand2")
+            bg_ = parent.cget("bg")
+            asz = 32 if depth else 44
+            head = tk.Frame(parent, bg=bg_)
+            head.pack(fill="x")
+            av = tk.Label(head, bg=bg_, cursor="hand2")
             av.pack(side="left", anchor="n")
-            want_pic("wav:%s:%d:%d" % (ap.get("avatar"), len(ap.get("avatar") or ""), 34 if depth else 44),
-                     lambda ap=ap: avatar_pil(ap.get("avatar"), 34 if depth else 44, ap.get("login", ""),
+            want_pic("wav:%s:%d:%d:%s" % (ap.get("avatar"), len(ap.get("avatar") or ""), asz, ap.get("login")),
+                     lambda ap=ap: avatar_pil(ap.get("avatar"), asz, ap.get("login", ""),
                                               status_color(ap) if ap.get("status") else None), av, t._imgs)
             av.bind("<Button-1>", lambda e_, ap=ap: ap.get("id") and open_profile(ap))
-            tx = tk.Frame(card_, bg=bg_)
-            tx.pack(side="left", fill="x", expand=True, padx=(12, 0))
-            top_ = tk.Frame(tx, bg=bg_)
-            top_.pack(fill="x")
-            tk.Label(top_, text=ap.get("nick", "игрок"), font=(FONT, 11, "bold"),
+            nm = tk.Frame(head, bg=bg_)
+            nm.pack(side="left", fill="x", expand=True, padx=(12, 0))
+            l1 = tk.Frame(nm, bg=bg_)
+            l1.pack(fill="x")
+            tk.Label(l1, text=ap.get("nick", "игрок"), font=(FONT, 11 if not depth else 10, "bold"),
                      fg=ACCENT_HI if r["author"] == c.uid else "#8fc1ff", bg=bg_).pack(side="left")
             if r["author"] == p.get("id"):
-                badge(top_, "хозяин", "#3b2f6b", "white").pack(side="left", padx=(6, 0))
-            tk.Label(top_, text=local_time(r["created_at"], "%d.%m в %H:%M"), font=(FONT, 9), fg=MUTED, bg=bg_).pack(
-                side="left", padx=(10, 0))
+                badge(l1, "владелец", _mixc(ACCENT, bg_, 0.55), "white").pack(side="left", padx=(8, 0))
+            if depth:  # у ответа время в одну строку с ником
+                tk.Label(l1, text=ago_text(r["created_at"]), font=(FONT, 9), fg=MUTED, bg=bg_).pack(side="left", padx=(10, 0))
+            else:
+                tk.Label(nm, text=ago_text(r["created_at"]), font=(FONT, 9), fg=MUTED, bg=bg_, anchor="w").pack(fill="x")
             if r["author"] == c.uid or mine:
-                small_button(top_, "✕", lambda i=r["id"]: soc_bg(lambda: c.delete_post(i), lambda x: load()),
-                             bg=bg_).pack(side="right")
-            tk.Label(tx, text=r["body"], font=(FONT, 11), fg=TEXT, bg=bg_, anchor="w", justify="left",
-                     wraplength=640).pack(fill="x", pady=(4, 0))
-            rr = tk.Frame(tx, bg=bg_)
-            rr.pack(fill="x", pady=(8, 0))
+                x_ = tk.Label(head, text="✕", font=(FONT, 11), fg=MUTED, bg=bg_, cursor="hand2", padx=4)
+                x_.pack(side="right", anchor="n")
+                x_.bind("<Enter>", lambda e_, x_=x_: x_.configure(fg="#e05a5a"))
+                x_.bind("<Leave>", lambda e_, x_=x_: x_.configure(fg=MUTED))
+                x_.bind("<Button-1>", lambda e_, i=r["id"]: soc_bg(lambda: c.delete_post(i), lambda x: load()))
+            col = tk.Frame(parent, bg=bg_)
+            col.pack(fill="x", padx=(asz + 12, 0))
+            tk.Label(col, text=r["body"], font=(FONT, 11 if not depth else 10), fg=TEXT, bg=bg_, anchor="w",
+                     justify="left", wraplength=620).pack(fill="x", pady=(6 if not depth else 2, 0))
+            rr = tk.Frame(col, bg=bg_)
+            rr.pack(fill="x", pady=(10 if not depth else 6, 0))
             for emo, users in r.get("reactions", {}).items():
                 on = c.uid in users
                 chip(rr, "%s %d" % (REACT_EMOJI.get(emo, emo), len(users)), on,
@@ -13862,6 +14162,18 @@ def gui():
                 small_button(rr, "Ответить", lambda r=r, ap=ap: set_reply(r["id"], ap.get("nick", "игрок")),
                              bg=bg_, icon="ic_mail.png").pack(side="left")
 
+        def post_card(r, kids):
+            card_ = pcard(w, padx=18, pady=14)
+            card_.pack(fill="x", pady=(0, 10))
+            entry_(card_, r, 0)
+            if kids:
+                th = tk.Frame(card_, bg=CARD)
+                th.pack(fill="x", pady=(12, 0), padx=(56, 0))
+                for k in kids:
+                    rc = pcard(th, bg=_mixc(CARD, BG, 0.5), padx=14, pady=10)
+                    rc.pack(fill="x", pady=(0, 6))
+                    entry_(rc, k, 1)
+
         def load():
             for x in w.winfo_children():
                 x.destroy()
@@ -13870,17 +14182,19 @@ def gui():
             def done(rows):
                 if not w.winfo_exists():
                     return
-                for x in w.winfo_children():
+                for x in list(w.winfo_children()) + list(cnt.winfo_children()):
                     x.destroy()
-                cnt.configure(text="%d %s" % (len(rows), plural(len(rows), "запись", "записи", "записей")) if rows else "")
+                if rows:
+                    badge(cnt, "%d %s" % (len(rows), plural(len(rows), "запись", "записи", "записей")), CARD_HI).pack()
                 if not rows:
-                    em = tk.Frame(w, bg=CARD, padx=20, pady=22)
-                    island(em, vines=False, radius=14)
+                    em = pcard(w, padx=22, pady=24)
                     em.pack(fill="x")
-                    tk.Label(em, image=art("ic_mail.png", 40, 40), bg=CARD).pack(side="left", padx=(0, 16))
-                    tk.Label(em, text=("На стене пока пусто. Расскажи друзьям, во что играешь!" if mine else
-                                       "На стене пока пусто — напиши первым!"), font=(FONT, 12), fg=TEXT, bg=CARD,
-                             anchor="w").pack(side="left")
+                    tk.Label(em, image=icon_disc("ic_mail.png", ACCENT, 56), bg=CARD).pack(side="left", padx=(0, 18))
+                    et = tk.Frame(em, bg=CARD)
+                    et.pack(side="left", fill="x", expand=True)
+                    tk.Label(et, text="На стене пока пусто", font=(FONT, 13, "bold"), fg=TEXT, bg=CARD, anchor="w").pack(fill="x")
+                    tk.Label(et, text=("Расскажи друзьям, во что играешь!" if mine else "Напиши первым!"), font=(FONT, 10),
+                             fg=MUTED, bg=CARD, anchor="w").pack(fill="x", pady=(2, 0))
                 ids = {r["id"] for r in rows}
                 kids = {}
                 for r in rows:
@@ -13888,10 +14202,9 @@ def gui():
                         kids.setdefault(r["reply_to"], []).insert(0, r)  # ответы - по порядку
                 for r in rows:
                     if r.get("reply_to") not in ids:
-                        post_card(r, 0)
-                        for k in kids.get(r["id"], []):
-                            post_card(k, 1)
+                        post_card(r, kids.get(r["id"], []))
                 auto_wrap(w)
+                flush_islands()
             soc_bg(lambda: c.wall(p["id"]), done)
 
         def post(ev=None):
@@ -13902,7 +14215,7 @@ def gui():
                 set_reply(None, "")
                 soc_bg(lambda: c.post_wall(p["id"], text, to), lambda r: load())
         e.bind("<Return>", post)
-        big_button(btn_row, "Опубликовать", post, icon="ic_invite.png").pack()
+        big_button(foot, "Опубликовать", post, icon="ic_invite.png").pack(side="right")
         load()
 
     def react_btn(parent, bg, reacts, on_pick):
@@ -14137,7 +14450,7 @@ def gui():
                 cd.pack(fill="x", pady=(0, 4))
                 av = tk.Label(cd, bg=CARD, cursor="hand2")
                 av.pack(side="left", anchor="n")
-                want_pic("revav:%s:%d" % (pr.get("avatar"), len(pr.get("avatar") or "")),
+                want_pic("revav:%s:%d:%s" % (pr.get("avatar"), len(pr.get("avatar") or ""), pr.get("login")),
                          lambda pr=pr: avatar_pil(pr.get("avatar"), 30, pr.get("login", "")), av, t._imgs)
                 av.bind("<Button-1>", lambda e, pr=pr: open_profile(pr))
                 tx = tk.Frame(cd, bg=CARD)
@@ -14416,7 +14729,7 @@ def gui():
             rw.pack(fill="x", pady=(6, 0))
             av = tk.Label(rw, bg=PANEL, cursor="hand2")
             av.pack(side="left")
-            want_pic("feedav:%s:%d" % (pr.get("avatar"), len(pr.get("avatar") or "")),
+            want_pic("feedav:%s:%d:%s" % (pr.get("avatar"), len(pr.get("avatar") or ""), pr.get("login")),
                      lambda pr=pr: avatar_pil(pr.get("avatar"), 30, pr.get("login", "")), av)
             av.bind("<Button-1>", lambda e, pr=pr: open_profile(pr))
             tk.Label(rw, image=art(icons.get(ev["kind"], "ic_bolt.png"), 18, 18), bg=PANEL).pack(side="left", padx=(8, 4))
@@ -14462,7 +14775,7 @@ def gui():
             _ = on
             av = tk.Label(row, bg=CARD, cursor="hand2")
             av.pack(side="left")
-            want_pic("fav:%s:%s:%d" % (p.get("avatar"), status_color(p), len(p.get("avatar") or "")),
+            want_pic("fav:%s:%s:%d:%s:%s" % (p.get("avatar"), status_color(p), len(p.get("avatar") or ""), p.get("login"), st),
                      lambda p=p: avatar_pil(p.get("avatar"), 28, p.get("login", ""), status_color(p) if st == "friend" else GOLD),
                      av)
             sub = status_text(p) if st == "friend" else ("хочет дружить" if st == "incoming" else "ждёт ответа")
@@ -14637,7 +14950,7 @@ def gui():
             rw.pack(fill="x", pady=(8, 0))
             av = tk.Label(rw, bg=PANEL, cursor="hand2")
             av.pack(side="left")
-            want_pic("pubav:%s:%d" % (x.get("owner_avatar"), len(x.get("owner_avatar") or "")),
+            want_pic("pubav:%s:%d:%s" % (x.get("owner_avatar"), len(x.get("owner_avatar") or ""), x.get("owner_login")),
                      lambda x=x: avatar_pil(x.get("owner_avatar"), 40, x.get("owner_login", ""), "#4caf50"), av)
             av.bind("<Button-1>", lambda e, x=x: open_profile({"id": x["owner"], "nick": x.get("owner_nick")}))
             tx = tk.Frame(rw, bg=PANEL)
@@ -14719,7 +15032,7 @@ def gui():
             one.pack(side="left", padx=(0, 10))
             av = tk.Label(one, bg=CARD, cursor="hand2")
             av.pack(side="left")
-            want_pic("pm:%s:%s:%d" % (m.get("avatar"), status_color(m), len(m.get("avatar") or "")),
+            want_pic("pm:%s:%s:%d:%s" % (m.get("avatar"), status_color(m), len(m.get("avatar") or ""), m.get("login")),
                      lambda m=m: avatar_pil(m.get("avatar"), 22, m.get("login", ""), status_color(m)), av)
             if m.get("id") == party.get("owner"):
                 tk.Label(one, image=art("ic_crown.png", 18, 18), bg=CARD).pack(side="left", padx=(3, 0))
