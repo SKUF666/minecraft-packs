@@ -6,7 +6,7 @@
 """
 import os, sys, time, tempfile, collections, traceback, importlib.machinery, importlib.util, tkinter as tk
 sys.stdout.reconfigure(encoding='utf-8')
-LIB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'library')
+LIB = os.environ.get('JANK_LIB') or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'library')
 sys.path.insert(0, LIB)
 TABS = os.environ.get('JANK_TABS', 'maps,packs,builder,skins,versions,servers,friend,launchers,profile').split(',')
 L = importlib.machinery.SourceFileLoader('ps', os.path.join(LIB, 'PackSwitcher.pyw'))
@@ -70,10 +70,30 @@ class Meter:
     def tick(self):
         if self.on:
             self.ts.append(time.perf_counter())
+            cv = getattr(self, 'cv', None)
+            if cv is not None:
+                try:
+                    self.ys.append((time.perf_counter(), cv.yview()[0] * (cv.bbox('all') or (0, 0, 0, 0))[3]))
+                except tk.TclError:
+                    pass
         self.root.after(8, self.tick)
 
+    def motion(self):
+        """Ровность прокрутки: моменты, когда страница сдвинулась, и скорость между ними."""
+        ys = getattr(self, 'ys', [])
+        moves = [(t, y) for (t, y), (_t0, y0) in zip(ys[1:], ys) if abs(y - y0) > 0.5]
+        if len(moves) < 3:
+            return ''
+        gaps = [(b[0] - a[0]) * 1000 for a, b in zip(moves, moves[1:]) if (b[0] - a[0]) < 0.4]
+        if not gaps:
+            return ''
+        steps = [abs(b[1] - a[1]) for a, b in zip(moves, moves[1:])]
+        import statistics
+        return '  | движение: сдвигов %d, между ними сред %.0f мс, макс %.0f мс, шаг сред %.0f px, макс %.0f px' % (
+            len(moves), statistics.mean(gaps), max(gaps), statistics.mean(steps), max(steps))
+
     def start(self):
-        self.ts, self.on = [time.perf_counter()], True
+        self.ts, self.on, self.ys = [time.perf_counter()], True, []
         if PROF:
             import cProfile
             self.pr = cProfile.Profile()
@@ -87,7 +107,7 @@ class Meter:
         if not d:
             return 'нет кадров'
         return 'кадров %3d, макс %5.0f мс, p95 %4.0f мс, >50мс: %d' % (len(d), d[-1], d[int(len(d) * .95)],
-                                                                       sum(x > 50 for x in d))
+                                                                       sum(x > 50 for x in d)) + self.motion()
 
     def top(self, n=12):
         if not PROF:
@@ -145,6 +165,7 @@ def patched(self, *a):
 
     def phase(tab, name, action, ms):
         def go():
+            m.cv = scroll_target()
             m.start()
             info = action()
             res[(tab, name)] = info
