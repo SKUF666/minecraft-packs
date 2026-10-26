@@ -4455,25 +4455,38 @@ def clean_env():
 
 def swap_exe_after_exit(new, target, start=True):
     """Когда программа закроется: переписать target содержимым new (файл остаётся тем же - значок на рабочем
-    столе и ярлыки не пропадают) и, если start, запустить. Делает это скрытый PowerShell."""
+    столе и ярлыки не пропадают) и, если start, запустить. Делает это скрытый PowerShell.
+    Запасная копия старой версии лежит в _update (не на рабочем столе); удаляется с повторами - сразу после
+    копирования свежий exe обычно держит антивирус, и раньше «Portalis.exe.bak» так и оставался рядом с программой."""
     q = lambda s: "'" + s.replace("'", "''") + "'"
-    ps = ("$n=%s;$t=%s;$b=$t+'.bak';$ok=$false;$L=(Get-Item -LiteralPath $n).Length;"
+    bak = os.path.join(ROOT, "_update", EXE_NAME + ".bak")
+    os.makedirs(os.path.dirname(bak), exist_ok=True)
+    ps = ("$n=%s;$t=%s;$b=%s;$ok=$false;$L=(Get-Item -LiteralPath $n).Length;"
           "for($i=0;$i -lt 160;$i++){try{if(-not(Test-Path -LiteralPath $b)){[IO.File]::Copy($t,$b,$true)};"
           "[IO.File]::Copy($n,$t,$true);if((Get-Item -LiteralPath $t).Length -eq $L){$ok=$true;break}}"
           "catch{Start-Sleep -Milliseconds 400}};"
-          "if($ok){Remove-Item -LiteralPath $n -Force -EA 0;Remove-Item -LiteralPath $b -Force -EA 0}"
-          "elseif(Test-Path -LiteralPath $b){try{[IO.File]::Copy($b,$t,$true)}catch{}};"
-          "if(%s){Start-Process -FilePath $t -WorkingDirectory %s}") % (
-        q(new), q(target), "$true" if start else "$false", q(os.path.dirname(target)))
+          "if(-not $ok -and (Test-Path -LiteralPath $b)){try{[IO.File]::Copy($b,$t,$true)}catch{}};"
+          "if(%s){Start-Process -FilePath $t -WorkingDirectory %s};"
+          "if($ok){foreach($f in @($n,$b,($t+'.bak'))){for($j=0;$j -lt 30 -and (Test-Path -LiteralPath $f);$j++){"
+          "Remove-Item -LiteralPath $f -Force -EA 0;if(Test-Path -LiteralPath $f){Start-Sleep -Milliseconds 700}}}}") % (
+        q(new), q(target), q(bak), "$true" if start else "$false", q(os.path.dirname(target)))
     enc = base64.b64encode(ps.encode("utf-16-le")).decode("ascii")
     subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-EncodedCommand", enc],
                      env=clean_env(), cwd=os.path.dirname(target), creationflags=0x08000000 | 0x00000200)
 
 
+def new_exe_path():
+    """Куда кладётся скачанная новая версия до перезапуска: служебная папка, а не рядом с программой
+    (exe часто лежит прямо на рабочем столе - там не должно появляться лишних файлов)."""
+    return os.path.join(ROOT, "_update", EXE_NAME + ".new")
+
+
 def pending_exe():
     """Новая версия программы, скачанная, но ещё не поставленная на место (Portalis.exe.new)."""
-    p = exe_path() + ".new"
-    return p if getattr(sys, "frozen", False) and os.path.isfile(p) and os.path.getsize(p) > 1000000 else None
+    for p in (new_exe_path(), exe_path() + ".new"):  # второе - так клали версии до 26.10
+        if getattr(sys, "frozen", False) and os.path.isfile(p) and os.path.getsize(p) > 1000000:
+            return p
+    return None
 
 
 def app_target():
@@ -4760,6 +4773,116 @@ def asset_url(man, name):
                                                                urllib.parse.quote(name))
 
 
+def _range_get(url, start, end, cancel=None, tick=None):
+    """Кусок файла с сервера [start, end] (включительно) или хвост (start<0: последние -start байт)."""
+    rng = "bytes=%d-" % start if end is None else "bytes=%d-%d" % (start, end)
+    last = None
+    for attempt in range(4):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "MinecraftPacks/4.0", "Range": rng})
+            with urlopen(req, 60, attempt) as r:
+                if r.status != 206:
+                    raise ValueError("сервер не отдаёт файл кусками")
+                total = int((r.headers.get("Content-Range") or "/0").rsplit("/", 1)[-1] or 0)
+                out = io.BytesIO()
+                while True:
+                    if cancel and cancel.is_set():
+                        raise RuntimeError("отменено")
+                    chunk = r.read(1 << 18)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    if tick:
+                        tick(len(chunk))
+                return out.getvalue(), total
+        except ValueError:
+            raise
+        except Exception as e:
+            if cancel and cancel.is_set():
+                raise
+            last = e
+            time.sleep(1 + attempt * 2)
+    raise RuntimeError("кусок файла не скачался: %s" % last)
+
+
+def zip_members_remote(url, names, cancel=None, tick=None, size=None):
+    """Только нужные файлы из zip на сервере, без скачивания всего архива: оглавление zip лежит в конце файла,
+    по нему - куски с самими файлами (запросы Range). -> {имя: байты}. Обновление программы так качает лишь
+    изменившееся: новый exe вместо всей части «Программа» (72 МБ), пару описаний вместо всего каталога."""
+    if not size:  # хвост «последние N байт» GitHub не отдаёт (501) - нужен размер: узнаём одним байтом
+        size = _range_get(url, 0, 0, cancel)[1]
+    total = size
+    tail, _t = _range_get(url, max(0, total - 65536), total - 1, cancel)
+    base = total - len(tail)
+    i = tail.rfind(b"PK\x05\x06")
+    if i < 0:
+        raise ValueError("не нашёл оглавление zip")
+    cd_size, cd_off = struct.unpack("<II", tail[i + 12:i + 20])
+    j = tail.rfind(b"PK\x06\x06")  # zip64
+    if j >= 0 and (cd_off == 0xFFFFFFFF or cd_size == 0xFFFFFFFF):
+        cd_size, cd_off = struct.unpack("<QQ", tail[j + 40:j + 56])
+    if cd_off >= base:
+        cd = tail[cd_off - base:cd_off - base + cd_size]
+    else:
+        cd, _t = _range_get(url, cd_off, cd_off + cd_size - 1, cancel)
+    entries, p = {}, 0
+    while p + 46 <= len(cd) and cd[p:p + 4] == b"PK\x01\x02":
+        flag, method = struct.unpack("<HH", cd[p + 8:p + 12])
+        crc, csize, usize = struct.unpack("<III", cd[p + 16:p + 28])
+        nlen, xlen, clen = struct.unpack("<HHH", cd[p + 28:p + 34])
+        off = struct.unpack("<I", cd[p + 42:p + 46])[0]
+        raw = cd[p + 46:p + 46 + nlen]
+        name = raw.decode("utf-8" if flag & 0x800 else "cp437")
+        extra = cd[p + 46 + nlen:p + 46 + nlen + xlen]
+        q = 0
+        while q + 4 <= len(extra):  # zip64: настоящие размеры и смещение - в доп. поле
+            tag, sz = struct.unpack("<HH", extra[q:q + 4])
+            if tag == 1:
+                vals = list(struct.unpack("<%dQ" % (sz // 8), extra[q + 4:q + 4 + sz - sz % 8]))
+                if usize == 0xFFFFFFFF and vals:
+                    usize = vals.pop(0)
+                if csize == 0xFFFFFFFF and vals:
+                    csize = vals.pop(0)
+                if off == 0xFFFFFFFF and vals:
+                    off = vals.pop(0)
+            q += 4 + sz
+        entries[name] = (off, csize, usize, method, crc)
+        p += 46 + nlen + xlen + clen
+    want = sorted((entries[n][0], n) for n in names if n in entries)
+    missing = [n for n in names if n not in entries]
+    if missing:
+        raise ValueError("в архиве нет %s" % missing[0])
+    # соседние файлы - одним запросом (разрыв до 256 КБ дешевле лишнего запроса)
+    groups, cur = [], None
+    for off, n in want:
+        e = entries[n]
+        end = off + 30 + len(n.encode("utf-8")) + 512 + e[1]
+        if cur and off - cur[1] < (256 << 10):
+            cur[1] = max(cur[1], end)
+            cur[2].append(n)
+        else:
+            cur = [off, end, [n]]
+            groups.append(cur)
+    out = {}
+    for start, end, ns in groups:
+        blob, _t = _range_get(url, start, min(end, total) - 1, cancel, tick)
+        for n in ns:
+            off, csize, usize, method, crc = entries[n]
+            h = off - start
+            if blob[h:h + 4] != b"PK\x03\x04":
+                raise ValueError("не тот кусок архива")
+            nl, xl = struct.unpack("<HH", blob[h + 26:h + 30])
+            data = blob[h + 30 + nl + xl:h + 30 + nl + xl + csize]
+            if method == 8:
+                data = zlib.decompressobj(-15).decompress(data)
+            elif method != 0:
+                raise ValueError("сжатие %d не поддерживается" % method)
+            if len(data) != usize or (zlib.crc32(data) & 0xFFFFFFFF) != crc:
+                raise ValueError("файл %s из архива пришёл с ошибкой" % n)
+            out[n] = data
+    return out
+
+
 def _sha1_file(path):
     h = hashlib.sha1()
     with open(lp(path), "rb") as fh:
@@ -4952,8 +5075,16 @@ def plan_size(man, plan):
             urls[s["us"]] = s.get("uz", f["z"])
         else:
             own.add(f["item"])
-    return (sum(urls.values()) + sum(archives[a]["size"] for a in arcs if a in archives)
-            + sum((manifest_item(man, i) or {}).get("own_size", 0) for i in own))
+    own_need = {}
+    for f in plan["need"]:
+        if f["src"]["t"] not in ("url", "arc", "arcfile", "zpatch"):
+            own_need[f["item"]] = own_need.get(f["item"], 0) + f["z"]
+    own_total = 0
+    for i in own:
+        full = (manifest_item(man, i) or {}).get("own_size", 0)
+        part = own_need.get(i, full)
+        own_total += part if part < 0.7 * (full or 1) else full  # так и качает download: кусками или целиком
+    return sum(urls.values()) + sum(archives[a]["size"] for a in arcs if a in archives) + own_total
 
 
 def plan_sources(man, plan):
@@ -5283,7 +5414,27 @@ def _apply_plan(man, plan, root=ROOT, log=print, progress=None, cancel=None, ask
             it = manifest_item(man, iid)
             log("Скачиваю: %s" % it["title"])
             zp = os.path.join(dl, it["own"])
-            if not (os.path.isfile(zp) and _sha1_file(zp) == it.get("own_sha1")):
+            have = os.path.isfile(zp) and _sha1_file(zp) == it.get("own_sha1")
+            if not have and sum(f["z"] for f in files) < 0.7 * (it.get("own_size") or 1):
+                # нужна только часть архива - берём из него лишь эти файлы, а не весь архив
+                got = 0
+                try:
+                    def tick_(n):
+                        nonlocal got
+                        got += n
+                        tick(n)
+                    parts = zip_members_remote(asset_url(man, it["own"]), [f["p"] for f in files], cancel, tick_,
+                                               it.get("own_size"))
+                    for f in files:
+                        put(f, parts[f["p"]])
+                    tick(max(0, sum(f["z"] for f in files) - got))  # сжатое бывает меньше - добиваем до плана
+                    continue
+                except Exception as e:
+                    if cancel and cancel.is_set():
+                        raise
+                    tick(-got)
+                    log("Кусками не вышло (%s) - скачиваю архив части целиком" % str(e)[:80])
+            if not have:
                 _fetch_to(asset_url(man, it["own"]), zp, tick, it.get("own_sha1"), cancel)
             else:
                 tick(it.get("own_size", 0))
@@ -5387,10 +5538,13 @@ def _apply_plan(man, plan, root=ROOT, log=print, progress=None, cancel=None, ask
     for f in app_files:
         target = exe_path() if os.path.abspath(root) == os.path.abspath(ROOT) else os.path.join(root, EXE_NAME)
         running = getattr(sys, "frozen", False) and os.path.abspath(sys.executable) == os.path.abspath(target)
-        if running:  # запущенный exe не трогаем: новая версия ждёт рядом и встанет на его место после закрытия
-            if os.path.exists(target + ".new"):
-                os.remove(target + ".new")
-            _move(os.path.join(stage, EXE_NAME), target + ".new")
+        if running:  # запущенный exe не трогаем: новая версия ждёт в _update и встанет на его место после закрытия
+            nx = new_exe_path()
+            os.makedirs(os.path.dirname(nx), exist_ok=True)
+            for old_new in (nx, target + ".new"):
+                if os.path.exists(old_new):
+                    os.remove(old_new)
+            _move(os.path.join(stage, EXE_NAME), nx)
             restart = True
             continue
         if os.path.exists(target + ".old"):
@@ -9335,9 +9489,13 @@ def gui():
     fit_width(canvas, inner_id)
     wheel = {}
 
+    WHEEL_STEP = 120  # пикселей за щелчок колеса
+    WHEEL_MS = 170  # за сколько доезжает до цели
+
     def on_wheel(e):
-        """Плавная прокрутка колесом. Шаги идут своим циклом, а новые щелчки колеса только сдвигают цель,
-        и между шагами окно успевает перерисоваться (иначе на Windows список «рвётся» на полосы)."""
+        """Плавная прокрутка колесом. Положение считается от времени (замедление к концу за WHEEL_MS), а не
+        «30% остатка за кадр»: скорость ровная, сколько бы ни рисовался кадр. Новые щелчки колеса сдвигают цель
+        и продолжают движение с текущего места."""
         cv = None
         try:
             w_ = e.widget if not isinstance(e.widget, str) else win.nametowidget(e.widget)
@@ -9362,9 +9520,12 @@ def gui():
             return
         key = str(cv)
         w = wheel.get(key)
+        now = time.perf_counter()
         if w is None:
-            w = wheel[key] = {"pos": cv.yview()[0] * total, "run": False}
-        w["target"] = max(0.0, min(float(total - view), w.get("target", w["pos"]) - e.delta / 120.0 * 110))
+            pos = cv.yview()[0] * total
+            w = wheel[key] = {"pos": pos, "target": pos, "run": False}
+        w["target"] = max(0.0, min(float(total - view), w["target"] - e.delta / 120.0 * WHEEL_STEP))
+        w["from"], w["t0"] = w["pos"], now
         if not w["run"]:
             w["run"] = True
             win.after(0, lambda: wheel_step(cv, key))
@@ -9376,10 +9537,13 @@ def gui():
             total = (region[3] - region[1]) if region else 0
             if not w or total <= 0:
                 raise tk.TclError
-            d = w["target"] - w["pos"]
-            w["pos"] = w["target"] if abs(d) < 1.5 else w["pos"] + d * 0.3
+            k = min(1.0, (time.perf_counter() - w["t0"]) * 1000.0 / WHEEL_MS)
+            ease = 1.0 - (1.0 - k) ** 3
+            w["pos"] = w["from"] + (w["target"] - w["from"]) * ease
+            if k >= 1.0:
+                w["pos"] = w["target"]
             cv.yview_moveto(w["pos"] / total)
-            cv.update()  # дорисовать всё до следующего шага
+            cv.update()  # дорисовать кадр до следующего шага
         except tk.TclError:
             wheel.pop(key, None)
             return
@@ -9387,7 +9551,7 @@ def gui():
             wheel.pop(key, None)
             check_more()
         else:
-            win.after(12, lambda: wheel_step(cv, key))
+            win.after(1, lambda: wheel_step(cv, key))
     win.bind_all("<MouseWheel>", on_wheel)
 
     # --- подвал ---
@@ -16712,17 +16876,26 @@ def gui():
             sk["gal_loading"] = False
 
             def redraw():
-                if not tab_is("skins"):
-                    return
-                if wheel:  # прокрутка идёт - дорисуем в паузе
+                g = state.get("gal_grid")
+                shown = state.get("tab") == "skins"
+                if shown and wheel:  # прокрутка идёт - дорисуем в паузе
                     win.after(50, redraw)
                     return
-                g = state.get("gal_grid")
                 if g is not None and g.winfo_exists():
+                    # сетка уже есть (и на спрятанной вкладке) - дописываем клетки, вкладку не пересобираем
+                    keep_more = state.get("more")
                     gallery_cells(start)
-                    flush_islands()
-                    canvas.configure(scrollregion=canvas.bbox("all"))
-                    win.after_idle(check_more)
+                    if shown:
+                        flush_islands()
+                        canvas.configure(scrollregion=canvas.bbox("all"))
+                        win.after_idle(check_more)
+                    else:  # «листай ещё» - спрятанной вкладке, у открытой - своё
+                        if "skins" in tab_cache:
+                            tab_cache["skins"]["more"] = state.get("more")
+                        state["more"] = keep_more
+                    return
+                if not tab_is("skins"):
+                    return
                 else:
                     state["keep_scroll"] = True
                     show("skins", animated=False)
@@ -18006,7 +18179,11 @@ def gui():
 
     # --- запуск: заставка, потом окно ---
     def drop_old_exe():
-        for p_ in [exe_path() + ".old"] + [os.path.join(APP_DIR, n + ".old") for n in OLD_EXE_NAMES]:
+        """Хвосты прошлых обновлений: .old, запасная копия .bak (в _update и - у старых версий - рядом с exe)."""
+        olds = [exe_path() + ".old"] + [os.path.join(APP_DIR, n + ".old") for n in OLD_EXE_NAMES]
+        if getattr(sys, "frozen", False) and not pending_exe():  # обновление встало - запасная копия больше не нужна
+            olds += [os.path.join(ROOT, "_update", EXE_NAME + ".bak"), exe_path() + ".bak"]
+        for p_ in olds:
             for _ in range(5):
                 try:
                     if os.path.exists(p_):
