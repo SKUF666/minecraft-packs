@@ -9296,10 +9296,43 @@ def gui():
     canvas.configure(yscrollcommand=on_yscroll)
     sb.pack(side="right", fill="y")
     canvas.pack(side="left", fill="both", expand=True)
-    inner = tk.Frame(canvas, bg=BG)
+    def fit_width(cv, item, pad=0):
+        """Содержимое прокручиваемой страницы - во всю ширину. Пока окно тянут за край, раскладка всех виджетов
+        (сотни на вкладке) на каждом шаге стоила 100-250 мс и окно дёргалось; теперь ширина ставится один раз,
+        когда размер устоялся. Первый показ - сразу."""
+        job = {"id": None, "w": None}
+
+        def put():
+            job["id"] = None
+            try:
+                cv.itemconfigure(item, width=max(1, job["w"] - pad))
+            except tk.TclError:
+                pass
+
+        def on(e):
+            first = job["w"] is None
+            job["w"] = e.width
+            if job["id"] is not None:
+                try:
+                    cv.after_cancel(job["id"])
+                except tk.TclError:
+                    pass
+                job["id"] = None
+            if first:
+                put()
+            else:
+                job["id"] = cv.after(90, put)
+        cv.bind("<Configure>", on, add="+")
+
+    def new_inner():
+        f = tk.Frame(canvas, bg=BG)
+        f.bind("<Configure>", lambda e: f is inner and canvas.configure(scrollregion=canvas.bbox("all")))
+        f.grid_columnconfigure(0, weight=1, uniform="c")
+        f.grid_columnconfigure(1, weight=1, uniform="c")
+        return f
+    inner = new_inner()
     inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
-    inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-    canvas.bind("<Configure>", lambda e: canvas.itemconfigure(inner_id, width=e.width))
+    fit_width(canvas, inner_id)
     wheel = {}
 
     def on_wheel(e):
@@ -10036,8 +10069,6 @@ def gui():
 
     def refresh_head():
         """Строка запуска: лаунчер · версия · сборка · последняя карта (каждое - с иконкой, нажатие ведёт на вкладку)."""
-        for w in lb_info.winfo_children():
-            w.destroy()
         c = current() or {}
         lid = chosen_launcher()
         ver = (get_tlauncher_version() if lid == "tlauncher" else
@@ -10053,6 +10084,12 @@ def gui():
             items.append(("tab_packs.png", "Сборка", c["name"].rsplit(" (", 1)[0] if c.get("name") else "без модов", "packs"))
         if last_map:
             items.append(("tab_maps.png", "Карта", last_map, "maps"))
+        if items == state.get("head_items") and lb_info.winfo_children():  # то же самое - не пересобираем строку
+            refresh_account()
+            return
+        state["head_items"] = items
+        for w in lb_info.winfo_children():
+            w.destroy()
         for icon, label, value, tab in items:
             box = tk.Frame(lb_info, bg="#1b1d23", cursor="hand2")
             box.pack(side="left", padx=(0, 18))
@@ -10068,7 +10105,8 @@ def gui():
             for w_ in (box, ic, tx, l1, l2):
                 w_.bind("<Button-1>", lambda e=None, t=tab: show(t))
                 w_.bind("<Enter>", lambda e=None, l2=l2: l2.winfo_exists() and l2.configure(fg=ACCENT_HI))
-                w_.bind("<Leave>", lambda e=None, l2=l2: l2.winfo_exists() and l2.configure(fg=TEXT))
+                w_.bind("<Leave>", lambda e=None, l2=l2, box=box: l2.winfo_exists() and not pointer_inside(box)
+                        and l2.configure(fg=TEXT))
         refresh_account()
 
     def check_more():
@@ -10084,15 +10122,54 @@ def gui():
         state["more"] = None
         fn()
 
+    # Собранные вкладки не выбрасываются: переключение на уже открытую вкладку - мгновенное (раньше каждая
+    # собиралась заново: 0.5-2 с подвисания). Вкладка пересобирается, если для неё что-то догрузилось (tab_is),
+    # если поменялись библиотека/игра/настройки (_DATA_GEN), при явном обновлении той же вкладки и раз в TAB_TTL с.
+    tab_cache = {}
+    TAB_TTL = 600
+    TAB_WIDGETS_MAX = 3500  # на всех спрятанных вкладках вместе: у Windows ограничено число окон на программу
+
+    def tab_is(key):
+        """Открыта ли сейчас вкладка key. Если нет - её сохранённая копия устарела (догрузилось новое)."""
+        if state.get("tab") == key:
+            return True
+        c = tab_cache.get(key)
+        if c is not None:
+            c["dirty"] = True
+            if os.environ.get("PORTALIS_TABLOG"):
+                import traceback as _tb
+                print("tab dirty:", key, " < ".join("%s:%d" % (f.name, f.lineno) for f in _tb.extract_stack()[-4:-1]))
+        return False
+
+    def drop_tab(key, later=True):
+        c = tab_cache.pop(key, None)
+        if c is None or c["frame"] is inner:
+            return
+        fr_ = c["frame"]
+        if later:  # удаление сотен виджетов - потом, когда новая вкладка уже показана
+            win.after(120, lambda: fr_.winfo_exists() and fr_.destroy())
+        else:
+            fr_.destroy()
+
+    def count_widgets(w):
+        n, stack = 0, [w]
+        while stack:
+            x = stack.pop()
+            n += 1
+            stack.extend(x.winfo_children())
+        return n
+
     def clear():
+        """Новая пустая страница для вкладки: старая (если была) удаляется после показа новой."""
+        nonlocal inner, images
         state["more"] = None
-        for w in inner.winfo_children():
-            w.destroy()
-        images.clear()
         _isl_seed[0] = 1000  # те же варианты рамок при каждом показе вкладки - картинки рамок берутся из кэша
+        old = inner
+        inner, images = new_inner(), []
+        canvas.itemconfigure(inner_id, window=inner, width=max(1, canvas.winfo_width()))
         canvas.yview_moveto(0)
-        inner.grid_columnconfigure(0, weight=1, uniform="c")
-        inner.grid_columnconfigure(1, weight=1, uniform="c")
+        if not any(c["frame"] is old for c in tab_cache.values()):
+            win.after(120, lambda: old.winfo_exists() and old.destroy())
 
     def empty_note(row, text):
         f = tk.Frame(inner, bg=CARD, padx=20, pady=18)
@@ -10394,7 +10471,7 @@ def gui():
         body = tk.Frame(cv, bg=BG, padx=26, pady=22)
         bid = cv.create_window((0, 0), window=body, anchor="nw")
         body.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
-        cv.bind("<Configure>", lambda e: cv.itemconfigure(bid, width=e.width))
+        fit_width(cv, bid)
         t._cv = cv
         t._imgs = []
         t.bind("<Escape>", lambda e: t.destroy())
@@ -11069,7 +11146,7 @@ def gui():
                 items = [dict(v) for k, v in sorted(favs().items(), key=lambda kv: -kv[1].get("t", 0)) if v.get("url")]
                 if qid == wm["qid"]:
                     wm.update(items=items, page=1, next=False, loading=False)
-                win.after(0, lambda: qid == wm["qid"] and state["tab"] == "maps" and show("maps", animated=False))
+                win.after(0, lambda: qid == wm["qid"] and tab_is("maps") and show("maps", animated=False))
                 return
             if wm.get("mine"):  # скачанные: из своего списка, описание и обложка - со страниц (кэш)
                 reg = sorted(web_maps_installed().items(), key=lambda kv: -kv[1].get("time", 0))
@@ -11085,7 +11162,7 @@ def gui():
                                   "author": "", "views": 0, "date": "", "ru": False})
                 if qid == wm["qid"]:
                     wm.update(items=items, page=1, next=False, loading=False)
-                win.after(0, lambda: qid == wm["qid"] and state["tab"] == "maps" and show("maps", animated=False))
+                win.after(0, lambda: qid == wm["qid"] and tab_is("maps") and show("maps", animated=False))
                 return
             try:
                 items, nxt, errs = web_maps_page(wm)
@@ -11103,12 +11180,10 @@ def gui():
                 wm["loading"] = False
 
             def redraw():
-                if qid != wm["qid"] or state["tab"] != "maps" or state.get("maps_src") != "web":
+                if qid != wm["qid"] or not tab_is("maps") or state.get("maps_src") != "web":
                     return
                 if more and state.get("wm_more") is not None and state["wm_more"].winfo_exists():
-                    wm_cards(start)
-                    auto_wrap(inner)
-                    win.after_idle(check_more)
+                    append_chunked(wm_cards, start, len(wm["items"]), "maps", lambda: win.after_idle(check_more))
                 else:
                     show("maps", animated=False)
             win.after(0, redraw)
@@ -11188,14 +11263,16 @@ def gui():
             return
         wm_cards(0)
 
-    def wm_cards(start):
+    def wm_cards(start, stop=None):
         wm = state["wm"]
         old = state.get("wm_more")
         if old is not None and old.winfo_exists():
             old.destroy()
+        made = []
         done = web_maps_installed()
-        for i, x in enumerate(wm["items"][start:], start):
+        for i, x in enumerate(wm["items"][start:stop], start):
             c = card(inner, i % 2, 2 + i // 2)
+            made.append(c)
             top = tk.Frame(c, bg=CARD)
             top.pack(fill="x")
             cv = tk.Label(top, bg=CARD_HI, image=blank(200, 105), cursor="hand2")
@@ -11230,7 +11307,9 @@ def gui():
             big_button(row, "Играть", lambda x=x: web_play(x), icon="ic_play.png").pack(side="right")
             small_button(row, "Подробнее и скриншоты", lambda x=x: open_web_map(x), bg=CARD).pack(side="right", padx=8)
             clickable(c, lambda x=x: open_web_map(x))
-        ratings_fetch([map_key(x) for x in wm["items"][start:]])
+        ratings_fetch([map_key(x) for x in wm["items"][start:stop]])
+        if stop is not None and stop < len(wm["items"]):
+            return made
         mb = tk.Frame(inner, bg=BG)
         mb.grid(row=2 + (len(wm["items"]) + 1) // 2, column=0, columnspan=2, pady=(4, 18))
         state["wm_more"] = mb
@@ -11248,6 +11327,7 @@ def gui():
                 state["more"] = more
         else:
             tk.Label(mb, text="Это все карты по такому запросу.", font=(FONT, 10), fg=MUTED, bg=BG).pack()
+        return made
 
     def web_play(x, want=None):
         if not check_game():
@@ -11591,8 +11671,8 @@ def gui():
             def poll():
                 if state.get("net_loading"):
                     win.after(300, poll)
-                elif state["tab"] == "friend" and (not c or (c.get("vpn"), c.get("lan")) != (
-                        state["net_cache"].get("vpn"), state["net_cache"].get("lan"))):  # адреса те же - вкладку не трогаем
+                elif (not c or (c.get("vpn"), c.get("lan")) != (state["net_cache"].get("vpn"), state["net_cache"].get("lan"))
+                      ) and tab_is("friend"):  # адреса те же - вкладку не трогаем
                     state["keep_scroll"] = True
                     show("friend", animated=False)
             win.after(300, poll)
@@ -11786,7 +11866,8 @@ def gui():
                             (mgr == "grid" and set("we") <= set(str(w.grid_info().get("sticky", ""))))
             except tk.TclError:
                 continue
-            if stretched:
+            if stretched and not getattr(w, "_aw", False):
+                w._aw = True
                 w.bind("<Configure>", lambda e, w=w: w.configure(wraplength=max(180, e.width - 6)), add="+")
 
     # --- вкладка «Лаунчеры» ---
@@ -11819,7 +11900,7 @@ def gui():
                 return
             state["installed_launchers"] = box.get("found", {})
             state.pop("launch_look", None)
-            if state["tab"] == "launchers":
+            if tab_is("launchers"):
                 state["keep_scroll"] = True
                 show("launchers", animated=False)
         poll()
@@ -12182,14 +12263,42 @@ def gui():
             cb["loading"] = False
 
             def redraw():
-                if qid != cb["qid"] or state["tab"] != "builder":
+                if qid != cb["qid"] or not tab_is("builder"):
                     return
                 if more and state.get("b_append"):
                     state["b_append"](offset)
                 else:
-                    show("builder", animated=False)
+                    builder_refresh_results()
             win.after(0, redraw)
         threading.Thread(target=work, daemon=True).start()
+
+    def builder_refresh_results():
+        """Пришли результаты поиска - перерисовать только их (строки 4 и ниже), шапка и фильтры остаются:
+        раньше вкладка собиралась заново целиком (~1 с), и всё дёргалось."""
+        if not tab_is("builder"):
+            return
+        if wheel:
+            win.after(50, builder_refresh_results)
+            return
+        frozen = win.winfo_viewable() and freeze_paint(canvas, True)
+        try:
+            for w in inner.grid_slaves():
+                try:
+                    if int(w.grid_info().get("row", 0)) >= 4:
+                        w.destroy()
+                except (tk.TclError, ValueError):
+                    pass
+            state["more"] = None
+            builder_results()
+            auto_wrap(inner)
+            win.update_idletasks()
+            flush_islands()
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        except tk.TclError:
+            pass
+        finally:
+            if frozen:
+                freeze_paint(canvas, False)
 
     def builder_set(**kw):
         cb = state["cb"]
@@ -12372,7 +12481,7 @@ def gui():
                         icons[pr["id"]] = pr.get("icon_url")
                 except Exception:
                     pass
-                win.after(0, lambda: state["tab"] == "builder" and cb["ptype"] == "modpack" and builder_sel_panel())
+                win.after(0, lambda: tab_is("builder") and cb["ptype"] == "modpack" and builder_sel_panel())
             threading.Thread(target=load, daemon=True).start()
         tk.Label(sel, text="Популярные сборки — в чём их фишка", font=(FONT, 13, "bold"), fg=TEXT, bg=CARD,
                  anchor="w").pack(fill="x", pady=(14, 6))
@@ -12469,10 +12578,8 @@ def gui():
         builder_cards(0)
 
     def builder_append(offset):
-        """Новая страница результатов: карточки дописываются в конец, прокрутка не прыгает."""
-        builder_cards(offset)
-        auto_wrap(inner)
-        win.after_idle(check_more)
+        """Новая страница результатов: карточки дописываются в конец частями, прокрутка не прыгает и не встаёт."""
+        append_chunked(builder_cards, offset, len(state["cb"]["results"]), "builder", lambda: win.after_idle(check_more))
     state["b_append"] = builder_append
 
     def builder_marks():
@@ -12539,13 +12646,37 @@ def gui():
             h.get("project_type", "mod"), h.get("slug") or h["project_id"])), bg=CARD, icon="ic_globe.png").pack(
             side="right", padx=6)
 
-    def builder_cards(start):
+    def append_chunked(build, start, total, key, done=None, per=4):
+        """Догрузка карточек частями: build(a, b) строит карточки [a, b) и возвращает их. Раньше 20 карточек
+        строились разом (~0.5 с), и прокрутка вставала колом на каждой новой странице."""
+        def step(a):
+            if not tab_is(key):
+                return
+            if wheel:  # колесо ещё крутит страницу - карточки достроим в паузе, а прокрутка идёт ровно
+                win.after(50, lambda: step(a))
+                return
+            b = min(total, a + per)
+            try:
+                for c_ in build(a, b) or []:
+                    auto_wrap(c_)
+                flush_islands()
+                canvas.configure(scrollregion=canvas.bbox("all"))
+            except tk.TclError:
+                return
+            if b < total:
+                win.after(25, lambda: step(b))
+            elif done:
+                done()
+        step(start)
+
+    def builder_cards(start, stop=None):
         cb = state["cb"]
         old = state.get("b_more")
         if old is not None and old.winfo_exists():
             old.destroy()
         cats = dict(MR_CATEGORIES)
-        for i, h in enumerate(cb["results"][start:], start):
+        made = []
+        for i, h in enumerate(cb["results"][start:stop], start):
             c = card(inner, i % 2, 5 + i // 2)
             top = tk.Frame(c, bg=CARD)
             top.pack(fill="x")
@@ -12571,7 +12702,10 @@ def gui():
             row.pack(fill="x", side="bottom")
             builder_card_buttons(row, h)
             state["b_rows"][h["project_id"]] = (row, h)
-        builder_translate(cb["results"][start:], cb["qid"])
+            made.append(c)
+        builder_translate(cb["results"][start:stop], cb["qid"])
+        if stop is not None and stop < len(cb["results"]):
+            return made
         last = 5 + (len(cb["results"]) + 1) // 2
         if len(cb["results"]) < cb["total"]:
             mb = tk.Frame(inner, bg=BG)
@@ -12588,6 +12722,7 @@ def gui():
                 note.configure(text="Загружаю ещё...", font=(FONT, 10, "bold"), fg=GOLD)
             else:
                 state["more"] = more
+        return made
 
     def builder_build():
         cb = state["cb"]
@@ -12769,7 +12904,7 @@ def gui():
             if n:
                 toast("Есть новые версии модов в своих сборках: %d. Обновить - на карточке сборки." % n, "info",
                       ("Сборки", lambda: show("packs")), 9000)
-                if state.get("tab") == "packs":
+                if tab_is("packs"):
                     state["keep_scroll"] = True
                     show("packs", animated=False)
             win.after(6 * 3600 * 1000, auto_mod_check)
@@ -12877,7 +13012,7 @@ def gui():
                     vv["list"] = mojang_versions()
                 except Exception as e:
                     vv["err"] = str(e)[:100]
-                win.after(0, lambda: state["tab"] == "versions" and show("versions", animated=False))
+                win.after(0, lambda: tab_is("versions") and show("versions", animated=False))
             threading.Thread(target=load, daemon=True).start()
         return vv
 
@@ -13150,7 +13285,7 @@ def gui():
                 msg.configure(text="Готово! Версия «%s» в папке игры: её видит любой лаунчер." % box["vid"], fg=ACCENT_HI)
                 toast("Версия «%s» скачана." % box["vid"], "ok")
                 ready_buttons(box["vid"])
-                if state["tab"] == "versions":
+                if tab_is("versions"):
                     show("versions", animated=False)
             poll2()
         poll()
@@ -13276,7 +13411,7 @@ def gui():
             if soc().logged_in():
                 close()
                 soc_bg(lambda: soc().me(), lambda r: (soc_data().update(me=r), refresh_account(),
-                                                       state["tab"] == "friend" and show("friend", animated=False)))
+                                                       tab_is("friend") and show("friend", animated=False)))
                 return
             if holder.get("mode") != soc_data()["mode"]:
                 holder["mode"] = soc_data()["mode"]
@@ -13435,7 +13570,7 @@ def gui():
         body = tk.Frame(cv, bg=BG, padx=4, pady=6)
         bid = cv.create_window((0, 0), window=body, anchor="nw")
         body.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
-        cv.bind("<Configure>", lambda e: cv.itemconfigure(bid, width=e.width - 18))
+        fit_width(cv, bid, 18)
         t._cv = cv
         pages = [("overview", "Обзор", "ic_bolt.png"), ("wall", "Стена", "ic_mail.png"),
                  ("ach", "Достижения", "ic_crown.png")]
@@ -16150,7 +16285,7 @@ def gui():
                     paint_speaking()
                     return
                 state["voice_sig"] = sig
-            if state.get("tab") == "friend" and kind in ("connected", "roster", "closed", "error"):
+            if tab_is("friend") and kind in ("connected", "roster", "closed", "error"):
                 soc_render()
             elif kind == "speaking":
                 paint_speaking()
@@ -16504,7 +16639,7 @@ def gui():
                     party_world_tick(playing)
                 except Exception:
                     pass
-            if state.get("tab") == "friend":
+            if state.get("tab") == "friend":  # черновик сообщения - только с открытой вкладки
                 e = state.get("soc_entry")
                 if e is not None and e.winfo_exists():
                     state["soc_draft"] = e.get()
@@ -16551,7 +16686,7 @@ def gui():
                 return  # уже ищут другой ник
             sk["found"] = found
             sk["searching"] = False
-            win.after(0, lambda: state["tab"] == "skins" and show("skins", animated=False))
+            win.after(0, lambda: tab_is("skins") and show("skins", animated=False))
         threading.Thread(target=work, daemon=True).start()
         show("skins", animated=False)
 
@@ -16577,11 +16712,16 @@ def gui():
             sk["gal_loading"] = False
 
             def redraw():
-                if state["tab"] != "skins":
+                if not tab_is("skins"):
+                    return
+                if wheel:  # прокрутка идёт - дорисуем в паузе
+                    win.after(50, redraw)
                     return
                 g = state.get("gal_grid")
-                if start and g is not None and g.winfo_exists():
+                if g is not None and g.winfo_exists():
                     gallery_cells(start)
+                    flush_islands()
+                    canvas.configure(scrollregion=canvas.bbox("all"))
                     win.after_idle(check_more)
                 else:
                     state["keep_scroll"] = True
@@ -17321,7 +17461,7 @@ def gui():
                 sk["defaults_busy"] = False
                 sk["defaults"] = res or None  # не нашлось - попробуем снова, когда появятся версии 1.19.3+
                 if res:
-                    win.after(0, lambda: state["tab"] == "skins" and (state.update(keep_scroll=True),
+                    win.after(0, lambda: tab_is("skins") and (state.update(keep_scroll=True),
                                                                       show("skins", animated=False)))
             threading.Thread(target=load_defaults, daemon=True).start()
         if sk["defaults"]:
@@ -17448,18 +17588,41 @@ def gui():
                 b.configure(fg=MUTED)
         if win.winfo_viewable():
             move_tab_line(key)
+        nonlocal inner, images
         keep = state.pop("keep_scroll", False) and prev == key
         y = canvas.yview()[0] if keep else 0
+        if prev and prev != key and prev in tab_cache and tab_cache[prev]["frame"] is inner:
+            tab_cache[prev].update(y=canvas.yview()[0], more=state.get("more"))  # уходим - запомнить место
+        hit = tab_cache.get(key)
+        reuse = (prev != key and hit is not None and not hit.get("dirty") and time.time() - hit["t"] < TAB_TTL
+                 and hit.get("gen") == _DATA_GEN[0] and hit["frame"].winfo_exists())
+        if os.environ.get("PORTALIS_TABLOG"):
+            import traceback as _tb
+            print("show:", key, "reuse" if reuse else "build", "prev=%s" % prev, "hit=%s" % (hit and {k_: v_ for k_, v_ in hit.items() if k_ in ("dirty", "t")}),
+                  " < ".join("%s:%d" % (f.name, f.lineno) for f in _tb.extract_stack()[-4:-1]))
         # Вкладка собирается целиком до первой отрисовки (вместе с рамками-островками) и показывается сразу:
         # без «въезда» сбоку и без мигания кусками - раньше от этого дёргалось всё окно.
         frozen = win.winfo_viewable() and freeze_paint(canvas, True)
         try:
-            clear()
-            {"maps": build_maps, "packs": build_packs, "servers": build_servers, "friend": build_friend,
-             "launchers": build_launchers, "builder": build_builder, "skins": build_skins,
-             "versions": build_versions}[key]()
-            canvas.coords(inner_id, 0, 0)
-            auto_wrap(inner)
+            if reuse:
+                inner, images = hit["frame"], hit["images"]
+                cw = max(1, canvas.winfo_width())
+                canvas.itemconfigure(inner_id, window=inner)
+                if abs(inner.winfo_width() - cw) > 1:  # ширина та же - раскладку не трогаем
+                    canvas.itemconfigure(inner_id, width=cw)
+                state["more"] = hit.get("more")
+                y = hit.get("y", 0)
+            else:
+                old = tab_cache.pop(key, None)
+                clear()
+                if old is not None:
+                    win.after(120, lambda f_=old["frame"]: f_.winfo_exists() and f_.destroy())
+                {"maps": build_maps, "packs": build_packs, "servers": build_servers, "friend": build_friend,
+                 "launchers": build_launchers, "builder": build_builder, "skins": build_skins,
+                 "versions": build_versions}[key]()
+                canvas.coords(inner_id, 0, 0)
+                auto_wrap(inner)
+                tab_cache[key] = {"frame": inner, "images": images, "t": time.time(), "gen": _DATA_GEN[0]}
             refresh_head()
             refresh_foot()
             try:
@@ -17472,6 +17635,21 @@ def gui():
         finally:
             if frozen:
                 freeze_paint(canvas, False)
+        if not reuse:  # слишком много виджетов на спрятанных вкладках - самые старые выбрасываем
+            def trim():
+                total, ages = 0, []
+                for k_, c_ in tab_cache.items():
+                    if c_["frame"].winfo_exists():
+                        c_["n"] = c_.get("n") or count_widgets(c_["frame"])
+                        total += c_["n"]
+                        if k_ != state.get("tab"):
+                            ages.append((c_["t"], k_))
+                for _t, k_ in sorted(ages):
+                    if total <= TAB_WIDGETS_MAX:
+                        break
+                    total -= tab_cache[k_].get("n", 0)
+                    drop_tab(k_)
+            win.after(400, trim)
 
     # --- обновления ---
     def show_update_bar(remote):
@@ -18377,9 +18555,51 @@ def gui():
     win.after(6000, qs_tip)
     win.after(1500, enable_drop)
     win.after(2500, lambda: _quiet(look_launchers))
+    win.after(3500, lambda: _quiet(net_info))  # адреса Hamachi/Radmin заранее: «Друзья» откроются сразу готовыми
     wait = max(0, int(1150 - (time.perf_counter() - splash_t0) * 1000))
     win.after(wait, reveal)
     win.mainloop()
+
+
+_DATA_GEN = [0]
+_SETTINGS_VOLATILE = {"stats", "social", "soc_last_dm", "soc_dm_init", "qs_tip", "backup", "wh", "mod_upd",
+                      "party_world_auto", "last_play"}
+_SETTINGS_SIG = [None]
+
+
+def _bump_gen(fn):
+    def wrapped(*a, **k):
+        try:
+            return fn(*a, **k)
+        finally:
+            _DATA_GEN[0] += 1
+    wrapped.__name__, wrapped.__doc__ = fn.__name__, fn.__doc__
+    return wrapped
+
+
+for _n in ("ensure_vanilla", "switch", "install_map", "enable_resource_pack", "install_web_map", "import_user_map",
+           "import_cape", "set_friend_server", "set_game_dir", "set_launcher_profile", "select_version", "remove_item",
+           "import_cfpack", "apply_version", "save_build", "import_mrpack", "world_rollback", "delete_user_pack",
+           "save_my_skin", "delete_my_skin", "install_offline_skin", "set_tlauncher_version"):
+    if callable(globals().get(_n)):
+        globals()[_n] = _bump_gen(globals()[_n])
+
+
+def _gen_save_settings(fn):
+    def wrapped(data):
+        try:
+            sig = json.dumps({k: v for k, v in data.items() if k not in _SETTINGS_VOLATILE}, sort_keys=True, default=str)
+        except Exception:
+            sig = None
+        if sig != _SETTINGS_SIG[0]:
+            _SETTINGS_SIG[0] = sig
+            _DATA_GEN[0] += 1
+        return fn(data)
+    wrapped.__name__, wrapped.__doc__ = fn.__name__, fn.__doc__
+    return wrapped
+
+
+save_settings = _gen_save_settings(save_settings)
 
 
 if __name__ == "__main__":
