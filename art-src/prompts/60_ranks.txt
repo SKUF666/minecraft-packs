@@ -1,0 +1,12 @@
+The attached image is the STYLE REFERENCE: chunky Minecraft-like pixel-art medals with saturated colors, thick dark outlines, bevel/3D shading, on a pure black background.
+
+Draw, in EXACTLY that same style, a sprite sheet of 6 player RANK EMBLEMS shaped as HERALDIC SHIELDS (pointed bottom, NOT round), arranged in a grid of 3 columns x 2 rows, evenly spaced with lots of empty pure black (#000000) space around each shield, no text, no letters, no numbers, nothing else on the sheet. Landscape 3:2 (1536x1024).
+
+Shields in order (left to right, top row then bottom row), each richer and more ornate than the previous:
+1) oak wooden planks shield with a small green sapling in the middle;
+2) cobblestone shield with a stone pickaxe in the middle;
+3) shiny iron block shield with riveted rim and an iron sword in the middle;
+4) gold block shield with ornate rim and a golden crown in the middle;
+5) diamond block shield with cyan glow, small sparkles, and a big diamond gem in the middle;
+6) dark netherite shield with purple-and-orange glowing rim, small pixel wings on both sides, and a glowing nether star in the middle.
+All 6 shields the same size and centered in their cells.

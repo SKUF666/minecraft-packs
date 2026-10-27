@@ -84,6 +84,8 @@ def patched(self, *a):
     at(200, hover_check)
     at(200, lambda: page()._cv.yview_moveto(1.0))
     at(500, lambda: shot('overview_bottom'))
+    at(300, lambda: page()._go('ach'))
+    at(1200, lambda: shot('ach'))
     at(300, lambda: page()._go('wall'))
     at(1800, lambda: shot('wall'))
     at(100, side_check)
