@@ -7947,6 +7947,69 @@ def _vgrad(w, h, top, bot):
     return g.resize((w, h))
 
 
+def render_picker(caption, value, icon, w, state, base, accent, fg, muted, primary=False, scale=1.0):
+    """Кнопка выбора («Версия игры / 26.1.2 ▾»): скруглённая плашка с мягким градиентом, значок слева, сверху мелкая
+    подпись, под ней значение жирным, справа стрелка в кружке. state - normal / hover / press. primary - залита
+    цветом акцента (главная кнопка экрана)."""
+    S = 3
+    h = int(round(46 * scale))
+    W, H = w * S, h * S
+    im = PILImage.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    r = 12 * S
+    if primary:
+        f0 = accent if state == "normal" else _mixc(accent, "#ffffff", 0.12 if state == "hover" else 0.22)
+        top, bot = _mixc(f0, "#ffffff", 0.12), _mixc(f0, "#000000", 0.14)
+        border = _mixc(f0, "#ffffff", 0.25)
+        fg_, muted_ = "#ffffff", "#e3f7e4"
+    else:
+        f0 = base if state == "normal" else _mixc(base, "#ffffff", 0.07 if state == "hover" else 0.13)
+        top, bot = _mixc(f0, "#ffffff", 0.06), _mixc(f0, "#000000", 0.10)
+        border = accent if state != "normal" else _mixc(base, "#ffffff", 0.14)
+        fg_, muted_ = fg, muted
+    mask = PILImage.new("L", (W, H), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, W - 1, H - 1), r, fill=255)
+    grad = PILImage.new("RGBA", (1, H))
+    for y in range(H):
+        grad.putpixel((0, y), _hex(_mixc(top, bot, y / max(1, H - 1))))
+    im.paste(grad.resize((W, H)), (0, 0), mask)
+    d.rounded_rectangle((0, 0, W - 1, H - 1), r, outline=_hex(border), width=S + (S if state != "normal" else 0) // 2)
+    d.rounded_rectangle((S, S, W - 1 - S, H - 1 - S), r - S, outline=(255, 255, 255, 22), width=S)
+    x = 12 * S
+    if icon is not None:
+        isz = int(round(26 * scale)) * S
+        ic = icon.convert("RGBA").resize((isz, isz), PILImage.LANCZOS)
+        im.alpha_composite(ic, (x, (H - isz) // 2))
+        x += isz + 10 * S
+    cr = 11 * S  # стрелка в кружке
+    cx, cy = W - 12 * S - cr, H // 2
+    d.ellipse((cx - cr, cy - cr, cx + cr, cy + cr), fill=_hex(_mixc(bot, "#000000", 0.25), 200) if not primary
+              else (255, 255, 255, 46))
+    a = 4 * S
+    d.polygon([(cx - a, cy - a // 2), (cx + a, cy - a // 2), (cx, cy + a // 2 + S)], fill=_hex(fg_))
+    room = cx - cr - 8 * S - x
+    f1 = ui_font(int(round(8.5 * scale * 1.333)) * S, False)
+    f2 = ui_font(int(round(11 * scale * 1.333)) * S, True)
+
+    def fit(t, f):
+        if f.getlength(t) <= room:
+            return t
+        while t and f.getlength(t + "…") > room:
+            t = t[:-1]
+        return t + "…"
+    if caption:
+        d.text((x, int(H * 0.33)), fit(caption, f1), font=f1, fill=_hex(muted_), anchor="lm")
+        yv = int(H * 0.66)
+    else:
+        yv = H // 2
+    vx = x
+    for sym, t in _text_runs(fit(value, f2)):
+        f = ui_font(int(round(11 * scale * 1.333)) * S, True, sym)
+        d.text((vx, yv), t, font=f, fill=_hex(fg_), anchor="lm")
+        vx += f.getlength(t)
+    return im.resize((w, h), PILImage.LANCZOS)
+
+
 def render_menu_row(text, px, icon, w, h, state, accent, base, fg, muted):
     """Строка бокового меню картинкой постоянного размера: значок и надпись слева. state - normal / hover / on.
     Размер не зависит ни от состояния, ни от жирности: при наведении и выборе ничего не сдвигается."""
@@ -9857,6 +9920,57 @@ def gui():
 
     _btn_cache = {}
 
+    class PickerButton(tk.Label):
+        """Кнопка выбора значения (версии, сборки, лаунчера) - картинка render_picker: подпись, значение, стрелка.
+        set(value) - сменить показанное значение. Нажатие - cmd()."""
+
+        def __init__(self, parent, caption, value, cmd, icon=None, width=230, primary=False):
+            try:
+                pbg = parent.cget("bg")
+            except Exception:
+                pbg = BG
+            tk.Label.__init__(self, parent, bd=0, highlightthickness=0, cursor="hand2", bg=pbg, padx=0, pady=0,
+                              text=tr(value))
+            self._o = dict(caption=tr(caption) if caption else "", value=tr(value), icon=icon, width=width,
+                           primary=primary)
+            self._cmd = cmd
+            self._state = "normal"
+            self._paint()
+            self.bind("<Enter>", lambda e=None: self._set("hover"))
+            self.bind("<Leave>", lambda e=None: self._set("normal"))
+            self.bind("<Button-1>", self._click)
+
+        def _paint(self):
+            o = self._o
+            base = self.cget("bg") if str(self.cget("bg")).startswith("#") else CARD
+            base = CARD_HI if base in (CARD, BG, PANEL) else _mixc(base, "#ffffff", 0.06)
+            key = ("picker", o["caption"], o["value"], o["icon"], o["width"], o["primary"], self._state, base, ACCENT)
+            ph = _btn_cache.get(key)
+            if ph is None:
+                ic = icon_pil(o["icon"]) if o["icon"] else None
+                ph = _btn_cache[key] = ImageTk.PhotoImage(render_picker(
+                    o["caption"], o["value"], ic, o["width"], self._state, base, ACCENT, TEXT, MUTED, o["primary"]))
+            try:
+                tk.Label.configure(self, image=ph)
+            except tk.TclError:
+                pass
+
+        def _set(self, state):
+            self._state = state
+            self._paint()
+
+        def _click(self, e=None):
+            self._set("press")
+            self.after(120, lambda: self.winfo_exists() and self._set("hover" if pointer_inside(self) else "normal"))
+            if self._cmd:
+                self._cmd()
+            return "break"
+
+        def set(self, value):
+            self._o["value"] = tr(value)
+            tk.Label.configure(self, text=tr(value))
+            self._paint()
+
     class PButton(tk.Label):
         """Кнопка-картинка: скруглённая, с градиентом, обводкой и плавной сменой при наведении и нажатии.
         style: primary (заливка цветом), ghost (только текст, подсветка при наведении), chip (пилюля фильтра)."""
@@ -10473,17 +10587,21 @@ def gui():
         def draw():
             for w_ in gbox.winfo_children() + body.winfo_children():
                 w_.destroy()
-            if len(groups) > 1:
-                cols = 7
+            if len(groups) > 1:  # группы - строками по 7, у каждой строки свой ряд (в общей сетке широкая
+                # «Снапшоты» раздвигала свой столбец во всех строках)
+                line = None
                 for i, (g, _items) in enumerate(groups):
-                    chip(gbox, g, i == sel["g"], lambda i=i: (sel.update(g=i), draw())).grid(
-                        row=i // cols, column=i % cols, padx=(0, 5), pady=(0, 5), sticky="w")
+                    if i % 7 == 0:
+                        line = tk.Frame(gbox, bg=CARD)
+                        line.pack(fill="x", pady=(0, 5))
+                    chip(line, g, i == sel["g"], lambda i=i: (sel.update(g=i), draw())).pack(side="left", padx=(0, 5))
             items = groups[sel["g"]][1] if groups else []
             if list_mode:
                 for v, lab in items[:40]:
                     b = PButton(body, ("✓  " if v == current else "") + lab, lambda v=v: pick(v),
                                 "primary" if v == current else "ghost", color=ACCENT if v == current else None,
                                 size=10, bold=v == current)
+                    b.configure(anchor="w")  # список - ровно по левому краю
                     b.pack(fill="x", pady=(0, 4), anchor="w")
             else:
                 cols = 5
@@ -10511,30 +10629,20 @@ def gui():
     def dropdown(parent, var, choices, bg=CARD, caption="Сборка", raw=False):
         """Выпадающий список в стиле окна: подпись со стрелкой и тёмное меню. raw - пункты как есть."""
         def short(name):
-            return name if raw or name.startswith(NO_MODS) else name.rsplit(" (", 1)[0]
-        disp = tk.StringVar(value=tr(short(var.get())) + "   ▾")
+            if raw:
+                return name
+            return NO_MODS if name.startswith(NO_MODS) else name.rsplit(" (", 1)[0]  # версия и так на значке карточки
+        icon = {"Сборка": "tab_packs.png", "Лаунчер": "tab_launchers.png"}.get(caption)
         box = tk.Frame(parent, bg=bg)
-        if caption:
-            tk.Label(box, text=caption, font=(FONT, 8), fg=MUTED, bg=bg).pack(anchor="w")
-        hold = tk.Frame(box, bg=CARD_HI, padx=12, pady=3, cursor="hand2")
-        hold.pack(anchor="w")
-        island(hold, vines=False, radius=10)
-        b = tk.Label(hold, textvariable=disp, font=(FONT, 10), bg=CARD_HI, fg=TEXT, padx=0, pady=3,
-                     anchor="w", width=25, cursor="hand2")
-        b.pack(anchor="w")
-        menu = tk.Menu(win, tearoff=0, bg=CARD_HI, fg=TEXT, activebackground=ACCENT, activeforeground="white",
-                       font=(FONT, 10), bd=0, relief="flat")
-        for ch in choices:
-            menu.add_command(label="  " + short(ch) + "  ",
-                             command=lambda ch=ch: (var.set(ch), disp.set(tr(short(ch)) + "   ▾")))
-        def open_pick(e=None):
-            pick_popup(hold, [("", [(ch, short(ch)) for ch in choices])], var.get(),
-                       lambda ch: (var.set(ch), disp.set(tr(short(ch)) + "   ▾")), caption or "Выбери", 420, True)
-            return "break"
-        b.bind("<Button-1>", open_pick)
-        hold.bind("<Button-1>", open_pick)
-        b.bind("<Enter>", lambda e: hold._isl(border=ACCENT))
-        b.bind("<Leave>", lambda e: hold._isl(border=None))
+
+        def pick(ch):
+            var.set(ch)
+            pb.set(short(ch))
+
+        def open_pick():
+            pick_popup(pb, [("", [(ch, short(ch)) for ch in choices])], var.get(), pick, caption or "Выбери", 420, True)
+        pb = PickerButton(box, caption, short(var.get()), open_pick, icon=icon, width=250 if caption else 220)
+        pb.pack(anchor="w")
         return box
 
     def option_menu(parent, var, choices):
@@ -12802,17 +12910,11 @@ def gui():
         opt.grid(row=2, column=0, columnspan=2, sticky="we", padx=(0, 14), pady=(0, 10))
         r1 = tk.Frame(opt, bg=PANEL)
         r1.pack(fill="x")
-        tk.Label(r1, text="Версия игры:", font=(FONT, 10, "bold"), fg=TEXT, bg=PANEL).pack(side="left", padx=(0, 8))
         gvar = tk.StringVar(value=cb["gv"])
-        gb = tk.Label(r1, text=cb["gv"] + "   ▾", font=(FONT, 10, "bold"), bg=CARD_HI, fg=TEXT, padx=12, pady=5,
-                      cursor="hand2")
+        gb = PickerButton(r1, "Версия игры", cb["gv"], lambda: pick_popup(
+            gb, version_groups(cb["versions"]), cb["gv"], lambda v: builder_set(gv=v), "Версия игры",
+            custom="Или впиши свою"), icon="tab_versions.png", width=190)
         gb.pack(side="left", padx=(0, 18))
-        menu = tk.Menu(win, tearoff=0, bg=CARD_HI, fg=TEXT, activebackground=ACCENT, activeforeground="white",
-                       font=(FONT, 10), bd=0)
-        for v in cb["versions"]:
-            menu.add_command(label="  " + v + "  ", command=lambda v=v: builder_set(gv=v))
-        gb.bind("<Button-1>", lambda e: (pick_popup(gb, version_groups(cb["versions"]), cb["gv"], lambda v: builder_set(gv=v),
-                                                    "Версия игры", custom="Или впиши свою"), "break")[1])
         tk.Label(r1, text="Загрузчик:", font=(FONT, 10, "bold"), fg=TEXT, bg=PANEL).pack(side="left", padx=(0, 8))
         chip_row(r1, [(k, v) for k, v in LOADER_TITLES.items()], cb["loader"], lambda v: builder_set(loader=v), PANEL)
         r1b = tk.Frame(opt, bg=PANEL)  # своя строка: в узком окне «Текстуры» уезжали за рамку
@@ -13535,15 +13637,12 @@ def gui():
         opt.grid(row=2, column=0, columnspan=2, sticky="we", padx=(0, 14), pady=(0, 14))
         r1 = tk.Frame(opt, bg=PANEL)
         r1.pack(fill="x")
-        tk.Label(r1, text="Версия игры:", font=(FONT, 10, "bold"), fg=TEXT, bg=PANEL).pack(side="left", padx=(0, 8))
-        gb = tk.Label(r1, text="%s   ▾" % vv["gv"], font=(FONT, 11, "bold"), bg=ACCENT, fg="white", padx=12, pady=5,
-                      cursor="hand2")
-        gb.pack(side="left", padx=(0, 12))
-
         def pick_gv(v):
             vv["gv"] = v
             show("versions", animated=False)
-        gb.bind("<Button-1>", lambda e: version_menu(gb, pick_gv))  # окошко выбора версии
+        gb = PickerButton(r1, "Версия игры", vv["gv"], lambda: version_menu(gb, pick_gv), icon="tab_versions.png",
+                          width=210, primary=True)  # окошко выбора версии
+        gb.pack(side="left", padx=(0, 12))
         tk.Label(r1, text="все версии — по нажатию", font=(FONT, 9), fg=MUTED, bg=PANEL).pack(side="left")
         r2 = tk.Frame(opt, bg=PANEL)
         r2.pack(fill="x", pady=(10, 0))
@@ -14407,6 +14506,7 @@ def gui():
                 fr.configure(height=y + rowh)
         fr.bind("<Configure>", lay, add="+")
         fr.after_idle(lay)
+        fr._flow = lay
         return fr
 
     def pcard(parent, title=None, icon=None, link=None, bg=CARD, padx=18, pady=16):
