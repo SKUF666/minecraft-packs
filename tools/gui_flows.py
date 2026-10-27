@@ -23,7 +23,8 @@ def walk(w):
 
 
 def click(root, text, nth=0):
-    hits = [w for w in walk(root) if isinstance(w, tk.Label) and str(w.cget('text')).strip().startswith(text)]
+    hits = [w for w in walk(root) if isinstance(w, tk.Label) and str(w.cget('text')).strip().startswith(text)
+            and w.winfo_ismapped()]  # спрятанные (сохранённые) вкладки не трогаем
     if len(hits) > nth:
         hits[nth].event_generate('<Button-1>')
         return True

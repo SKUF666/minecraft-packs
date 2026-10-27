@@ -44,7 +44,7 @@ def patched(self, *a):
 
     def open_ver():
         for x in walk(self):
-            if isinstance(x, tk.Label) and str(x.cget('text')).endswith('▾') and x.winfo_ismapped():
+            if isinstance(x, tk.Label) and (type(x).__name__ == 'PickerButton' or str(x.cget('text')).endswith('▾'))                     and x.winfo_ismapped():
                 x.event_generate('<Button-1>')
                 return print('версии: открыто')
     at(1500, open_ver)
