@@ -4,6 +4,7 @@ SignPath, когда она подключена), exe из сборки -> libr
 
     python tools/release.py --note "Что нового" [--note "..."] [--local]   (--local - собрать exe здесь, как раньше)
     [--run ID] - не собирать заново, взять exe из уже прошедшей сборки GitHub (если скачивание сорвалось)
+После выпуска в ленту программы добавляется запись «Обновление Portalis» с этими же строками (tools/news.py).
 """
 import os, sys, shutil, subprocess, time, json, tempfile
 sys.stdout.reconfigure(encoding='utf-8')
@@ -39,7 +40,8 @@ def main():
             raise SystemExit(__doc__ if args[i] in ('-h', '--help') else 'не знаю параметр %s\n%s' % (args[i], __doc__))
     if local:
         run(sys.executable, os.path.join(REPO, 'tools', 'build_exe.py'))
-        return run(sys.executable, os.path.join(REPO, 'tools', 'publish.py'), *notes)
+        run(sys.executable, os.path.join(REPO, 'tools', 'publish.py'), *notes)
+        return post_news()
     started = time.time()
     if not run_id:
         # 1. исходники в репозиторий
@@ -84,6 +86,20 @@ def main():
     print('exe из сборки GitHub: %d КБ, %d с' % (os.path.getsize(exe) // 1024, time.time() - started))
     # 4. публикация
     run(sys.executable, os.path.join(REPO, 'tools', 'publish.py'), *notes)
+    post_news()
+
+
+def post_news():
+    """Запись «Обновление Portalis» в ленту программы (news.json) - из «Что нового» только что выпущенной версии."""
+    try:
+        with open(os.path.join(LIB, 'manifest.json'), encoding='utf-8') as f:
+            man = json.load(f)
+        sys.path.insert(0, os.path.join(REPO, 'tools'))
+        import news
+        p = news.add_update(man['version'], man.get('changes') or [])
+        print('в ленте:', p['title'] if p else 'без записи (только технические изменения)')
+    except (Exception, SystemExit) as e:  # выпуск уже состоялся - запись в ленте можно добавить и потом
+        print('запись в ленту не добавилась: %s. Добавь вручную: python tools/news.py --kind update ...' % e)
 
 
 if __name__ == '__main__':

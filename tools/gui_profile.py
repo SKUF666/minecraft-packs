@@ -32,6 +32,20 @@ ps.Social.wall = lambda self, uid, limit=50: [
      'reply_to': 3, 'reactions': {}},
     {'id': 1, 'author': 'u-me', 'author_profile': ME, 'body': 'Прошёл SkyBlock полностью - все 30 заданий 🎉',
      'created_at': now, 'reply_to': None, 'reactions': {'heart': ['u-fr']}}]
+ME['links'] = [{'kind': 'youtube', 'url': 'https://youtube.com/@grisha_mc'}, {'kind': 'telegram', 'url': 'https://t.me/grisha_mc'},
+               {'kind': 'twitch', 'url': 'https://twitch.tv/grisha'}]
+_stats = {'u-me': {'followers': 12, 'following': 3, 'me': False}, 'u-fr': {'followers': 41, 'following': 7, 'me': True}}
+ps.Social.follow_stats = lambda self, u: _stats.get(u, {'followers': 0, 'following': 0, 'me': False})
+ps.Social.following = lambda self: ['u-fr']
+ps.Social.followers = lambda self, u, limit=200: [FR]
+IMG = 'https://ivrugnlpjngyvguabdkt.supabase.co/storage/v1/object/public/media/u-fr/test.jpg'
+ps.Social.post_feed = lambda self, ids, limit=40: [
+    {'id': 9, 'owner': 'u-fr', 'author': 'u-fr', 'author_profile': FR, 'body': 'Построил базу в OneBlock!', 'image': IMG,
+     'created_at': now, 'reply_to': None, 'reactions': {'fire': ['u-me']}},
+    {'id': 8, 'owner': 'u-me', 'author': 'u-me', 'author_profile': ME, 'body': 'Кто со мной в SkyBlock вечером?',
+     'created_at': now, 'reply_to': None, 'reactions': {}}]
+ps.Social.feed = lambda self, limit=30: [{'id': 1, 'user_id': 'u-fr', 'kind': 'level', 'text': 'достиг 7 уровня',
+                                          'created_at': now, 'profile': FR, 'likes': []}]
 orig = tk.Tk.mainloop
 errors = []
 
@@ -84,6 +98,11 @@ def patched(self, *a):
     at(200, hover_check)
     at(200, lambda: page()._cv.yview_moveto(1.0))
     at(500, lambda: shot('overview_bottom'))
+    at(300, lambda: page()._go('feed'))
+    at(1500, lambda: shot('feed'))
+    at(300, lambda: page()._go('settings'))
+    at(1200, lambda: page()._cv.yview_moveto(0.55))
+    at(500, lambda: shot('settings_links'))
     at(300, lambda: page()._go('ach'))
     at(1200, lambda: shot('ach'))
     at(300, lambda: page()._go('wall'))
@@ -91,6 +110,8 @@ def patched(self, *a):
     at(100, side_check)
     at(300, lambda: page()._cv.yview_moveto(1.0))
     at(600, lambda: shot('wall_bottom'))
+    at(300, lambda: (page().destroy(), hk['open_profile'](dict(FR, stats={'minutes': 50}), True, 'overview')))
+    at(1800, lambda: shot('other'))
     at(300, lambda: self.destroy())
 
     def run(i=0):
