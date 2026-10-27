@@ -20,8 +20,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.14'
+      # Загрузчик PyInstaller собираем из исходника: готовый загрузчик встречается и во вредоносных программах,
+      # и Защитник Windows по нему ошибочно удалял Portalis.exe (Trojan:Win32/Bearfoos.B!ml, 27.10.2026).
       - name: Install build tools
-        run: python -m pip install --upgrade pip pyinstaller pillow sounddevice websocket-client
+        run: |
+          python -m pip install --upgrade pip wheel pillow sounddevice websocket-client
+          $env:PYINSTALLER_COMPILE_BOOTLOADER = "1"
+          python -m pip install --no-binary pyinstaller --no-cache-dir pyinstaller
       - name: Build Portalis.exe
         run: python tools/build_exe.py --ci
       - name: Upload unsigned exe
