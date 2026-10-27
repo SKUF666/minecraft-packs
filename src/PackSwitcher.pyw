@@ -70,6 +70,7 @@ except Exception:
 VOICE_URL = "wss://voice.arch-flow.ru/ws"
 import base64
 import html as _html
+import html.parser as _html_parser
 
 # APP_DIR - где лежит сама программа. ROOT - где её данные: каталог, скачанные карты и моды, настройки.
 # Если рядом с программой лежит библиотека (папка «Карты» или manifest.json) - работаем в ней, как раньше.
@@ -6285,6 +6286,220 @@ def mojang_versions():
     return _MOJANG["list"]
 
 
+# --- официальные новости в ленте: от Portalis (обновления программы, объявления) и выпуски Minecraft ---
+NEWS_URL = "https://raw.githubusercontent.com/%s/main/news.json" % REPO  # правится tools/news.py и выпуском
+MC_NOTES = "https://launchercontent.mojang.com"  # заметки к выпускам - та же лента, что в лаунчере Mojang
+_NEWS = {}
+_NEWS_LOCK = threading.Lock()
+NEWS_KINDS = {"update": ("Обновление Portalis", "#3fb950"), "news": ("Новость", "#4c8dff"),
+              "snapshot": ("Снапшот", "#d4a72c"), "pre": ("Пре-релиз", "#b07be0"), "release": ("Релиз Minecraft", "#3fb950")}
+
+
+class _NotesHTML(_html_parser.HTMLParser):
+    """Заметки Mojang (HTML без закрывающих тегов) -> блоки [(вид, текст, уровень)]: h1/h2/h3, p, li."""
+    BLOCK = {"h1": "h1", "h2": "h2", "h3": "h3", "h4": "h3", "h5": "h3", "p": "p", "li": "li"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.blocks, self.cur, self.kind, self.depth = [], [], None, 0
+
+    def flush(self):
+        t = re.sub(r"\s+", " ", "".join(self.cur)).strip()
+        if t:
+            self.blocks.append((self.kind or ("li" if self.depth else "p"), t, max(0, self.depth - 1)))
+        self.cur = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.BLOCK:
+            self.flush()
+            self.kind = self.BLOCK[tag]
+        elif tag in ("ul", "ol"):
+            self.flush()
+            self.depth += 1
+            self.kind = None
+        elif tag == "br":
+            self.cur.append(" ")
+
+    def handle_endtag(self, tag):
+        if tag in self.BLOCK:
+            self.flush()
+            self.kind = None
+        elif tag in ("ul", "ol"):
+            self.flush()
+            self.depth = max(0, self.depth - 1)
+            self.kind = None
+
+    def handle_data(self, d):
+        self.cur.append(d)
+
+
+def mc_notes(eid, path):
+    """Заметки к выпуску Minecraft блоками (см. _NotesHTML); выпуск не меняется - кэш на диске навсегда."""
+    f = os.path.join(_web_dir("news"), "mc_%s.json" % re.sub(r"[^\w.-]", "_", eid)[:80])
+    try:
+        with open(lp(f), encoding="utf-8") as fh:
+            return [tuple(b) for b in json.load(fh)]
+    except (OSError, ValueError):
+        pass
+    d = json.loads(_get(MC_NOTES + "/v2/" + path, 20, 2).decode("utf-8"))
+    p = _NotesHTML()
+    p.feed(d.get("body") or "")
+    p.flush()
+    try:
+        with open(lp(f), "w", encoding="utf-8") as fh:
+            json.dump(p.blocks, fh, ensure_ascii=False)
+    except OSError:
+        pass
+    return p.blocks
+
+
+def mc_kind(v, typ):
+    """Вид выпуска Minecraft по номеру: release / snapshot / pre (пре-релизы и кандидаты)."""
+    if re.search(r"-(pre|rc)-?\d+$", v or "") or re.search(r" (Pre-Release|Release Candidate) ", v or ""):
+        return "pre"
+    return "release" if typ == "release" else "snapshot"
+
+
+def mc_title(v, title):
+    """«Снапшот 6 для Minecraft 26.4», «Пре-релиз 2 для Minecraft 26.3», «Minecraft 26.3»."""
+    if LANG != "ru":
+        return title or v
+    m = re.match(r"^(.+?)-(snapshot|pre|rc)-(\d+)$", v or "")
+    if m:
+        return "%s %s для Minecraft %s" % ({"snapshot": "Снапшот", "pre": "Пре-релиз", "rc": "Релиз-кандидат"}[m.group(2)],
+                                           m.group(3), m.group(1))
+    if re.match(r"^\d{2}w\d{2}[a-z]$", v or ""):
+        return "Снапшот %s" % v
+    return "Minecraft %s" % v
+
+
+def _mc_posts(days=75, limit=6):
+    """Свежие снапшоты и релизы Minecraft: вступление и главное из заметок (на языке программы), картинка."""
+    entries = json.loads(_get(MC_NOTES + "/v2/javaPatchNotes.json", 20, 2).decode("utf-8")).get("entries") or []
+    cut = time.time() - days * 86400
+    pick = []
+    for e in entries:
+        try:
+            if calendar.timegm(time.strptime(e["date"][:19], "%Y-%m-%dT%H:%M:%S")) >= cut and e.get("contentPath"):
+                pick.append(e)
+        except (KeyError, ValueError, TypeError):
+            continue
+    pick.sort(key=lambda e: e["date"], reverse=True)
+    pick = pick[:limit]
+
+    bodies = []
+    for e in pick:  # по одной: заметки маленькие и потом берутся с диска
+        try:
+            bodies.append(mc_notes(e["id"], e["contentPath"]))
+        except Exception:
+            bodies.append([])
+    posts, texts = [], []
+    for e, bl in zip(pick, bodies):
+        intro, feats, seen_h1 = [], [], False
+        for kind, t, lvl in bl:
+            if kind == "h1" or (kind == "h2" and feats):
+                if seen_h1:
+                    break
+                seen_h1 = True
+            elif kind == "p" and not seen_h1 and len(intro) < 2:
+                intro.append(t)
+            elif kind == "li" and seen_h1 and not lvl and len(feats) < 4:
+                feats.append(t)
+        text = " ".join(intro)
+        if len(text) > 360:
+            text = text[:360].rsplit(" ", 1)[0] + "…"
+        posts.append({"src": "minecraft", "id": "mc:" + e["id"], "kind": mc_kind(e.get("version"), e.get("type")),
+                      "title": mc_title(e.get("version"), e.get("title")), "text": text, "lines": feats,
+                      "image": MC_NOTES + e["image"]["url"] if (e.get("image") or {}).get("url") else None,
+                      "created_at": e["date"], "version": e.get("version"), "notes": [e["id"], e["contentPath"]]})
+        texts += [text] + feats
+    if LANG != "en" and texts:  # заметки Mojang - только на английском
+        tx = iter(translate_many(texts))
+        for p in posts:
+            p["text"] = next(tx)
+            p["lines"] = [next(tx) for _ in p["lines"]]
+    return posts
+
+
+def _portalis_posts():
+    d = json.loads(_get(NEWS_URL + "?t=%d" % (time.time() // 300), 15, 2).decode("utf-8"))
+    out = []
+    for x in (d.get("posts") or [])[:30]:
+        if not isinstance(x, dict) or not x.get("id") or not x.get("at"):
+            continue
+        en = LANG == "en"
+        img = x.get("image")
+        if img and not img.startswith("http"):  # картинка лежит рядом, в папке news репозитория
+            img = "https://raw.githubusercontent.com/%s/main/%s" % (REPO, img.lstrip("/"))
+        out.append({"src": "portalis", "id": "p:%s" % x["id"], "kind": x.get("kind") or "news",
+                    "title": (en and x.get("title_en")) or x.get("title") or "",
+                    "text": (en and x.get("text_en")) or x.get("text") or "",
+                    "lines": (en and x.get("lines_en")) or x.get("lines") or [], "image": img,
+                    "link": x.get("link"), "created_at": x["at"], "version": x.get("version")})
+    if LANG == "en":  # записи пишутся по-русски; где нет английского текста - переводим
+        todo = [(p, k) for p in out for k in ("title", "text") if p[k] and re.search("[а-яё]", p[k], re.I)]
+        todo += [(p, i) for p in out for i, ln in enumerate(p["lines"]) if re.search("[а-яё]", ln, re.I)]
+        if todo:
+            tx = translate_many([p[k] if isinstance(k, str) else p["lines"][k] for p, k in todo], "en")
+            for (p, k), v in zip(todo, tx):
+                if isinstance(k, str):
+                    p[k] = v
+                else:
+                    p["lines"] = list(p["lines"])
+                    p["lines"][k] = v
+    return out
+
+
+def _news_merge(got):
+    return sorted((got.get("portalis") or []) + (got.get("minecraft") or []), key=lambda x: x.get("created_at") or "",
+                  reverse=True)
+
+
+def official_news(force=False, ttl=900):
+    """Официальные записи для ленты, новые сверху: от Portalis (news.json в репозитории) и выпуски Minecraft.
+    Обновляются раз в 15 минут; пока обновляются - сразу отдаём прошлый раз с диска (лента открывается без ожидания),
+    нет сети - тоже прошлый раз."""
+    f = os.path.join(_web_dir("news"), "feed_%s.json" % LANG)
+    with _NEWS_LOCK:
+        if not force and _NEWS.get("items") is not None and time.time() - _NEWS.get("at", 0) < ttl:
+            return list(_NEWS["items"])
+    try:
+        with open(lp(f), encoding="utf-8") as fh:
+            old = json.load(fh)
+    except (OSError, ValueError):
+        old = {}
+    if old and not force:
+        with _NEWS_LOCK:
+            busy = _NEWS.get("busy")
+            _NEWS["busy"] = True
+            if _NEWS.get("items") is None:
+                _NEWS["items"] = _news_merge(old)
+            items = list(_NEWS["items"])
+        if not busy:
+            def bg():
+                try:
+                    official_news(True)
+                finally:
+                    _NEWS["busy"] = False
+            threading.Thread(target=bg, daemon=True).start()
+        return items
+    got = {}
+    for key, fn in (("portalis", _portalis_posts), ("minecraft", _mc_posts)):
+        try:
+            got[key] = fn()
+        except Exception:
+            got[key] = old.get(key) or []
+    try:
+        with open(lp(f), "w", encoding="utf-8") as fh:
+            json.dump(got, fh, ensure_ascii=False)
+    except OSError:
+        pass
+    items = _news_merge(got)
+    with _NEWS_LOCK:
+        _NEWS.update(items=items, at=time.time())
+    return list(items)
+
+
 def _rules_ok(rules):
     """Правила Mojang для библиотек: подходит ли файл для Windows 64-бит в обычном режиме."""
     if not rules:
@@ -9166,6 +9381,12 @@ def gui():
                 w_, h_ = min(w_, ww - 40), min(h_, wh - 40)
                 self.place(relx=0.5, rely=0.5, anchor="center", width=w_, height=h_)
             self.lift()
+            try:  # всплывающее сообщение - поверх открытой страницы, а не под ней
+                tb = toast_box.get("w")
+                if tb is not None and tb.winfo_exists():
+                    tb.lift()
+            except NameError:  # страница открылась раньше, чем появились сообщения
+                pass
             if not getattr(self, "_focused", False):  # фокус - один раз при первом показе и если он не внутри уже
                 self._focused = True
                 try:
@@ -15466,7 +15687,8 @@ def gui():
     def wall_view(t, body, p, feed=False):
         """Стена: шапка со счётчиком, поле «напиши на стене» с аватаром и картинкой, записи карточками (аватар, ник,
         когда, текст, картинка, реакции); ответы - внутри карточки записи. Новые сверху.
-        feed=True - лента: посты твои, друзей и тех, на кого подписан, плюс их достижения и уровни."""
+        feed=True - лента: посты твои, друзей и тех, на кого подписан, их достижения и уровни, а также официальные
+        записи Portalis (обновления программы, снапшоты и релизы Minecraft)."""
         c = soc()
         mine = p.get("id") == c.uid
         me_ = soc_data().get("me") or {}
@@ -15537,6 +15759,10 @@ def gui():
                     att["busy"] = False
             soc_bg(lambda: fail(lambda: c.upload_image(pim)), done)
         small_button(foot, "Картинка", pick_img, bg=CARD, icon="ic_add.png").pack(side="left")
+        flt = {"v": "all", "data": None}  # лента: всё / новости / друзья и подписки
+        frow = tk.Frame(body, bg=BG)
+        if feed:
+            frow.pack(fill="x", pady=(14, 0))
         w = tk.Frame(body, bg=BG)
         w.pack(fill="x", pady=(14, 0))
         reply = {"id": None}
@@ -15634,9 +15860,11 @@ def gui():
             def done(rows):
                 if not w.winfo_exists():
                     return
-                events = []
                 if feed:
-                    rows, events = rows
+                    flt["data"] = rows
+                    render_feed()
+                    return
+                events = []
                 for x in list(w.winfo_children()) + list(cnt.winfo_children()):
                     x.destroy()
                 if rows and not feed:
@@ -15652,17 +15880,6 @@ def gui():
                     tk.Label(et, text=("Подпишись на игроков или добавь друзей" if feed else
                                        "Расскажи друзьям, во что играешь!" if mine else "Напиши первым!"), font=(FONT, 10),
                              fg=MUTED, bg=CARD, anchor="w").pack(fill="x", pady=(2, 0))
-                if feed:  # посты и события вперемешку по времени
-                    items = [("p", r["created_at"], r) for r in rows] + [("e", ev["created_at"], ev) for ev in events]
-                    items.sort(key=lambda x: x[1], reverse=True)
-                    for kind, _ts, it in items[:60]:
-                        if kind == "p":
-                            post_card(it, [])
-                        else:
-                            event_row(it)
-                    auto_wrap(w)
-                    flush_islands()
-                    return
                 ids = {r["id"] for r in rows}
                 kids = {}
                 for r in rows:
@@ -15675,12 +15892,116 @@ def gui():
                 flush_islands()
 
             def fetch_feed():
-                d_ = soc_data()
-                ids = {c.uid} | {f["profile"]["id"] for f in d_.get("friends") or [] if f.get("state") == "friend"}
-                ids |= set(c.following())
-                ids = [i for i in ids if i]
-                return c.post_feed(ids, 40), [ev for ev in (c.feed(40) or []) if ev.get("user_id") in ids]
+                news = official_news()
+                try:
+                    d_ = soc_data()
+                    ids = {c.uid} | {f["profile"]["id"] for f in d_.get("friends") or [] if f.get("state") == "friend"}
+                    ids |= set(c.following())
+                    ids = [i for i in ids if i]
+                    return c.post_feed(ids, 40), [ev for ev in (c.feed(40) or []) if ev.get("user_id") in ids], news
+                except Exception:
+                    if not news:
+                        raise
+                    return [], [], news  # сервер не ответил - хотя бы новости
             soc_bg(fetch_feed if feed else (lambda: c.wall(p["id"])), done)
+
+        def render_feed():
+            """Лента вперемешку по времени: записи, события и официальные новости; сверху - выбор, что показывать."""
+            rows, events, news = flt["data"]
+            for x in list(w.winfo_children()) + list(frow.winfo_children()):
+                x.destroy()
+
+            def pick(v_):
+                flt["v"] = v_
+                render_feed()
+            chip_row(frow, [("all", "Всё"), ("news", "Новости"), ("people", "Друзья и подписки")], flt["v"], pick)
+            items = []
+            if flt["v"] != "news":
+                items += [("p", r["created_at"], r) for r in rows] + [("e", ev["created_at"], ev) for ev in events]
+            if flt["v"] != "people":
+                items += [("o", n["created_at"], n) for n in news]
+            items.sort(key=lambda x: (x[1] or "")[:19], reverse=True)
+            if not items:
+                em = pcard(w, padx=22, pady=24)
+                em.pack(fill="x")
+                tk.Label(em, image=icon_disc("ic_mail.png", ACCENT, 56), bg=CARD).pack(side="left", padx=(0, 18))
+                et = tk.Frame(em, bg=CARD)
+                et.pack(side="left", fill="x", expand=True)
+                tk.Label(et, text="Новостей пока нет" if flt["v"] == "news" else "В ленте пока пусто",
+                         font=(FONT, 13, "bold"), fg=TEXT, bg=CARD, anchor="w").pack(fill="x")
+                if flt["v"] != "news":
+                    tk.Label(et, text="Подпишись на игроков или добавь друзей", font=(FONT, 10), fg=MUTED, bg=CARD,
+                             anchor="w").pack(fill="x", pady=(2, 0))
+            have = set()
+            if any(k == "o" and it.get("src") == "minecraft" for k, _ts, it in items[:60]):
+                have = {v["id"] for v in _quiet(installed_versions) or []}
+            for kind, _ts, it in items[:60]:
+                if kind == "p":
+                    post_card(it, [])
+                elif kind == "o":
+                    official_card(it, have)
+                else:
+                    event_row(it)
+            auto_wrap(w)
+            flush_islands()
+
+        def official_card(it, have):
+            """Запись от Portalis: обновление программы, объявление, снапшот или релиз Minecraft."""
+            card_ = pcard(w, padx=18, pady=14)
+            card_.pack(fill="x", pady=(0, 10))
+            head = tk.Frame(card_, bg=CARD)
+            head.pack(fill="x")
+            av = tk.Label(head, bg=CARD, image=blank(44, 44))
+            av.pack(side="left", anchor="n")
+            want_pic("portalis_av:44", lambda: round_corners(PILImage.open(os.path.join(ROOT, "icon.png")).convert(
+                "RGBA").resize((44, 44), PILImage.LANCZOS), 12), av, t._imgs)
+            nm = tk.Frame(head, bg=CARD)
+            nm.pack(side="left", fill="x", expand=True, padx=(12, 0))
+            l1 = tk.Frame(nm, bg=CARD)
+            l1.pack(fill="x")
+            tk.Label(l1, text="Portalis", font=(FONT, 11, "bold"), fg=ACCENT_HI, bg=CARD).pack(side="left")
+            badge(l1, "✓ официально", _mixc(ACCENT, CARD, 0.55), "white").pack(side="left", padx=(8, 0))
+            tk.Label(nm, text=ago_text(it["created_at"]), font=(FONT, 9), fg=MUTED, bg=CARD, anchor="w").pack(fill="x")
+            kt, kc = NEWS_KINDS.get(it.get("kind"), NEWS_KINDS["news"])
+            badge(head, kt, _mixc(kc, CARD, 0.6), "white").pack(side="right", anchor="n")
+            col = tk.Frame(card_, bg=CARD)
+            col.pack(fill="x", padx=(56, 0))
+            if it.get("title"):
+                tk.Label(col, text=it["title"], font=(FONT, 13, "bold"), fg=TEXT, bg=CARD, anchor="w", justify="left",
+                         wraplength=620).pack(fill="x", pady=(8, 0))
+            if it.get("text"):
+                tk.Label(col, text=it["text"], font=(FONT, 11), fg=TEXT, bg=CARD, anchor="w", justify="left",
+                         wraplength=620).pack(fill="x", pady=(6, 0))
+            for ln in (it.get("lines") or [])[:8]:
+                tk.Label(col, text="•  " + ln, font=(FONT, 10), fg="#c3c7d1", bg=CARD, anchor="w", justify="left",
+                         wraplength=620).pack(fill="x", pady=(3, 0))
+            if it.get("image"):
+                pl = tk.Label(col, bg=CARD, cursor="hand2", bd=0, image=blank(240, 135))
+                pl.pack(anchor="w", pady=(10, 0))
+                want_pic("wallimg:%s:0" % it["image"], lambda u=it["image"]: wall_pic(u, 420, 260, CARD), pl, t._imgs)
+                pl.bind("<Button-1>", lambda e_, u=it["image"]: image_viewer(u))
+            rr = tk.Frame(col, bg=CARD)
+            rr.pack(fill="x", pady=(12, 0))
+            v = it.get("version")
+            if it.get("src") == "minecraft":
+                if it.get("notes"):
+                    small_button(rr, "Все изменения", lambda: mc_notes_page(it), bg=CARD, icon="ic_bell.png").pack(
+                        side="left")
+                if v and v in have:
+                    def choose(v=v):
+                        ok, hint = select_version(v, v)
+                        toast(hint or "Версия «%s» выбрана в лаунчере %s." % (v, launcher_title(chosen_launcher())),
+                              "ok" if ok else "info", ms=7000)
+                    big_button(rr, "Выбрать %s" % v, choose, color=CARD_HI, hover=LINE, icon="ic_check.png").pack(
+                        side="right")
+                elif v:
+                    big_button(rr, "Скачать %s" % v, lambda v=v: version_dialog(v, "vanilla", None, True),
+                               icon="ic_download.png").pack(side="right")
+            if it.get("link"):
+                small_button(rr, "Подробнее", lambda u=it["link"]: webbrowser.open(u), bg=CARD, icon="ic_globe.png").pack(
+                    side="left", padx=(8 if it.get("src") == "minecraft" else 0, 0))
+            if not rr.winfo_children():
+                rr.pack_forget()
 
         def event_row(ev):
             """Событие в ленте (достижение, уровень, карта...) - узкой строкой между постами."""
@@ -15771,6 +16092,72 @@ def gui():
             im.thumbnail((W, H), PILImage.LANCZOS)
             pic.configure(image=pil_photo(im, v._imgs), text="")
         soc_bg(load, show_)
+
+    def mc_notes_page(it):
+        """Все изменения выпуска Minecraft страницей внутри окна - в переводе на язык программы, по кнопке оригинал."""
+        t, body = detail_window(it["title"], full=True)
+        top = tk.Frame(body, bg=BG)
+        top.pack(fill="x")
+        if it.get("image"):
+            pic = tk.Label(top, bg=BG, image=blank(170, 170), cursor="hand2")
+            pic.pack(side="left", anchor="n")
+            want_pic("wallimg:%s:170" % it["image"], lambda: wall_pic(it["image"], 170, 170, BG), pic, t._imgs)
+            pic.bind("<Button-1>", lambda e_: image_viewer(it["image"]))
+        info = tk.Frame(top, bg=BG, padx=20)
+        info.pack(side="left", fill="both", expand=True)
+        tk.Label(info, text=it["title"], font=(FONT, 20, "bold"), fg=TEXT, bg=BG, anchor="w", justify="left",
+                 wraplength=520).pack(fill="x")
+        bl = tk.Frame(info, bg=BG)
+        bl.pack(fill="x", pady=(8, 0))
+        kt, kc = NEWS_KINDS.get(it.get("kind"), NEWS_KINDS["news"])
+        badge(bl, kt, _mixc(kc, BG, 0.6), "white").pack(side="left", padx=(0, 6))
+        badge(bl, local_time(it["created_at"], "%d.%m.%Y"), CARD_HI).pack(side="left")
+        row = tk.Frame(info, bg=BG)
+        row.pack(fill="x", pady=(14, 0))
+        v = it.get("version")
+        if v:
+            big_button(row, "Скачать %s" % v, lambda: version_dialog(v, "vanilla", None, True),
+                       icon="ic_download.png").pack(side="left")
+        tg = tk.Frame(row, bg=BG)
+        tg.pack(side="left", padx=(12, 0))
+        content = tk.Frame(body, bg=BG)
+        content.pack(fill="x", pady=(6, 0))
+        st = {"orig": LANG == "en", "blocks": None, "tr": None}
+        tk.Label(content, text="Загружаю изменения...", font=(FONT, 10), fg=MUTED, bg=BG, anchor="w").pack(fill="x",
+                                                                                                      pady=(16, 0))
+
+        def draw():
+            if not content.winfo_exists():
+                return
+            for x in list(content.winfo_children()) + list(tg.winfo_children()):
+                x.destroy()
+            if st["tr"]:
+                chip(tg, "Оригинал", st["orig"], lambda: (st.update(orig=not st["orig"]), draw())).pack(side="left")
+            texts = [b[1] for b in st["blocks"]] if st["orig"] or not st["tr"] else st["tr"]
+            for (kind, _t, lvl), text in zip(st["blocks"], texts):
+                if kind == "h1":
+                    dsection(content, text)
+                elif kind == "h2":
+                    tk.Label(content, text=text, font=(FONT, 12, "bold"), fg=TEXT, bg=BG, anchor="w", justify="left",
+                             wraplength=700).pack(fill="x", pady=(12, 3))
+                elif kind == "h3":
+                    tk.Label(content, text=text, font=(FONT, 11, "bold"), fg=ACCENT_HI, bg=BG, anchor="w",
+                             justify="left", wraplength=700).pack(fill="x", pady=(8, 2))
+                elif kind == "p":
+                    dpara(content, text)
+                else:
+                    tk.Label(content, text=("•  " if not lvl else "–  ") + text, font=(FONT, 10), fg="#c3c7d1", bg=BG,
+                             anchor="w", justify="left", wraplength=700).pack(fill="x", pady=1, padx=(lvl * 22, 0))
+            auto_wrap(content)
+
+        def load():
+            blocks = mc_notes(*it["notes"])
+            return blocks, (translate_many([b[1] for b in blocks]) if LANG != "en" else None)
+
+        def done(r):
+            st["blocks"], st["tr"] = r
+            draw()
+        soc_bg(load, done)
 
     def react_btn(parent, bg, reacts, on_pick):
         """Кнопка «+реакция» с меню из 6 реакций; on_pick(имя, включить)."""
@@ -19478,7 +19865,7 @@ def gui():
                   "soc_dm": soc_dm, "messagebox": messagebox, "open_server": open_server,
                   "open_my_profile": open_my_profile, "state": state,
                   "style_window": style_window, "version_menu": version_menu, "login_window": login_window, "party_create_window": party_create_window, "color_pick": color_pick,
-                  "pick_popup": pick_popup, "party_page": party_page}
+                  "pick_popup": pick_popup, "party_page": party_page, "mc_notes_page": mc_notes_page}
     # Окно открывается там же и таким же, каким его закрыли; горячие клавиши.
     g = settings.get("geometry", "")
     mg = re.match(r"^(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$", g)
@@ -20010,7 +20397,43 @@ def gui():
     win.after(6000, qs_tip)
     win.after(1500, enable_drop)
     win.after(2500, lambda: _quiet(look_launchers))
-    win.after(3500, lambda: _quiet(net_info))  # адреса Hamachi/Radmin заранее: «Друзья» откроются сразу готовыми
+    win.after(3500, lambda: _quiet(net_info))
+
+    def news_check():
+        """Новые официальные записи (снапшот, релиз, обновление Portalis) - сообщением со ссылкой на ленту.
+        Первый раз только запоминаем, что уже видели."""
+        box = {}
+
+        def work():
+            box["items"] = _quiet(official_news) or []
+
+        def poll():
+            if th.is_alive():
+                win.after(300, poll)
+                return
+            items = box.get("items")
+            if not items:
+                return
+            st_ = load_settings()
+            seen = st_.get("news_seen")
+            if seen == items[0]["id"]:
+                return
+            st_["news_seen"] = items[0]["id"]
+            save_settings(st_)
+            me_ = soc_data().get("me")
+            if not seen or not me_ or not soc().logged_in():
+                return
+            fresh = []
+            for x in items:
+                if x["id"] == seen:
+                    break
+                fresh.append(x)
+            toast(tr("Новое в ленте: %s") % tr(fresh[0]["title"]) + (tr(" и ещё %d") % (len(fresh) - 1) if len(fresh) > 1 else ""),
+                  "info", ("В ленту", lambda: open_profile(me_, page="feed")), 10000)
+        th = threading.Thread(target=work, daemon=True)
+        th.start()
+        win.after(300, poll)
+    win.after(9000, news_check)  # заранее и в фоне: лента откроется сразу с новостями  # адреса Hamachi/Radmin заранее: «Друзья» откроются сразу готовыми
     wait = max(0, int(1150 - (time.perf_counter() - splash_t0) * 1000))
     win.after(wait, reveal)
     win.mainloop()
@@ -20018,7 +20441,7 @@ def gui():
 
 _DATA_GEN = [0]
 _SETTINGS_VOLATILE = {"stats", "social", "soc_last_dm", "soc_dm_init", "qs_tip", "backup", "wh", "mod_upd",
-                      "party_world_auto", "last_play"}
+                      "party_world_auto", "last_play", "news_seen"}
 _SETTINGS_SIG = [None]
 
 
