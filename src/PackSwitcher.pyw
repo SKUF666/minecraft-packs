@@ -610,6 +610,8 @@ def jars(d):
 def n_mods(n):
     """«1 мод», «3 мода», «21 мод», «129 модов»."""
     n = int(n)
+    if LANG != "ru":  # перевод «21 мод» дал бы «21 mod»
+        return "%d %s" % (n, "mod" if n == 1 else "mods")
     w = "мод" if n % 10 == 1 and n % 100 != 11 else ("мода" if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else "модов")
     return "%d %s" % (n, w)
 
@@ -8003,6 +8005,254 @@ def render_level_ring(lv, frac, color, size, bg, track, fg, caption):
     return im.resize((size, size), PILImage.LANCZOS)
 
 
+RANKS = [  # (с какого уровня, название, цвет) - эмблемы в «Оформление/ranks/rank_N.png»
+    (1, "Новичок", "#d0a066"), (3, "Исследователь", "#b4bac2"), (5, "Опытный игрок", "#e6ebf0"),
+    (8, "Мастер карт", "#f5c842"), (12, "Герой", "#5fe8e2"), (16, "Легенда Portalis", "#c58cff")]
+XP_SOURCES = [  # как копится опыт (то же, что в stats_xp)
+    ("ic_hourglass.png", "минута в игре", 1), ("ic_compass.png", "новая карта", 40), ("ic_wrench.png", "своя сборка", 80),
+    ("ic_invite.png", "новый друг", 25), ("ic_crown.png", "своя пати", 30), ("ic_play.png", "позвать пати в свою игру", 50)]
+ACH_PROGRESS = {1: ("maps_n", 1), 2: ("maps_n", 5), 3: ("maps_n", 15), 4: ("packs", 1), 5: ("packs", 3), 6: ("friends", 3),
+                7: ("friends", 10), 8: ("parties", 1), 9: ("hosted", 1), 10: ("night", 1), 11: ("minutes", 600),
+                12: ("level", 10)}
+
+
+def rank_of(lv):
+    """Номер ранга (0..5) по уровню."""
+    return max(i for i, r in enumerate(RANKS) if lv >= r[0])
+
+
+def next_reward(lv):
+    """Ближайшая награда за уровень: (уровень, "frame"/"rank", номер, название) или None - всё открыто."""
+    out = []
+    for n, title, cond, _f in FRAMES:
+        m = re.match(r"(\d+) уровень", cond)
+        if m and int(m.group(1)) > lv:
+            out.append((int(m.group(1)), 0, "frame", n, title))
+    for i, r in enumerate(RANKS):
+        if r[0] > lv:
+            out.append((r[0], 1, "rank", i, r[1]))
+    if not out:
+        return None
+    best = min(out)
+    return best[0], best[2], best[3], best[4]
+
+
+RANK_TEX = [  # (блок щита, предмет в середине) - текстуры берутся из файла игры у игрока, в программу не кладутся
+    ("block/oak_planks", "block/oak_sapling"), ("block/cobblestone", "item/stone_pickaxe"),
+    ("block/iron_block", "item/iron_sword"), ("block/gold_block", "item/filled_map"),
+    ("block/diamond_block", "item/diamond"), ("block/netherite_block", "item/nether_star")]
+RANK_RIM = ["#8a5a2b", "#7a7f86", "#cfd5dc", "#ffd84a", "#7ff7f0", "#4a3b52"]
+_RANK_EMB = {}
+
+
+_MC_TEX = {}
+
+
+def _mc_textures(names):
+    """Текстуры 16x16 из файла клиента игры (versions/*/*.jar): {имя: PIL} или {} - игры нет. Запоминаются."""
+    key = tuple(names)
+    if key not in _MC_TEX:
+        _MC_TEX[key] = _mc_textures_read(names)
+    return {k: v.copy() for k, v in _MC_TEX[key].items()}
+
+
+def _mc_textures_read(names):
+    jars = list(_versions_jars())
+    try:
+        alt = os.path.join(os.environ.get("APPDATA", ""), ".minecraft", "versions")
+        jars += [os.path.join(alt, v, v + ".jar") for v in _listdir(alt) if os.path.isfile(os.path.join(alt, v, v + ".jar"))]
+    except Exception:
+        pass
+    for j in sorted(set(jars), reverse=True):
+        try:
+            with zipfile.ZipFile(lp(j)) as z:
+                have = set(z.namelist())
+                full = ["assets/minecraft/textures/%s.png" % n for n in names]
+                if all(f in have for f in full):
+                    return {n: PILImage.open(io.BytesIO(z.read(f))).convert("RGBA").crop((0, 0, 16, 16))
+                            for n, f in zip(names, full)}
+        except Exception:
+            continue
+    return {}
+
+
+def build_rank_emblem(i):
+    """Эмблема ранга - щит в пиксель-арте: внутри текстура блока ранга, рамка в два тона с бликом и тенью,
+    посередине предмет; у старших рангов - заклёпки, свечение, искры, крылья. 48x44 «пикселя» x4."""
+    tex = _mc_textures([n for pair in RANK_TEX for n in pair] + ["item/filled_map_markings"])
+    mk = tex.get("item/filled_map_markings")
+    if mk is not None and tex.get("item/filled_map") is not None:  # у карты в игре пометки - отдельный слой с цветом
+        tint = PILImage.new("RGBA", mk.size, _hex("#6b4a22"))
+        tint.putalpha(mk.getchannel("A"))
+        tex["item/filled_map"] = tex["item/filled_map"].copy()
+        tex["item/filled_map"].alpha_composite(tint)
+    W, H, X0, Y0 = 48, 44, 8, 3  # холст с запасом под крылья и свечение; щит 32x38 с (X0, Y0)
+    base = PILImage.new("RGBA", (W, H), (0, 0, 0, 0))
+    mask = PILImage.new("L", (W, H), 0)
+    md = ImageDraw.Draw(mask)
+    for y in range(38):
+        if y < 22:
+            a, b = (2, 29) if y == 0 else (1, 30) if y == 1 else (0, 31)
+        else:
+            k = (y - 21) * 16.0 / 17.0
+            a, b = int(round(k)), 31 - int(round(k))
+        if a <= b:
+            md.line((X0 + a, Y0 + y, X0 + b, Y0 + y), fill=255)
+    rim = _hex(RANK_RIM[i])
+    dark = _hex(_mixc(RANK_RIM[i], "#000000", 0.62))
+    fill = PILImage.new("RGBA", (W, H), (0, 0, 0, 0))
+    blk = tex.get(RANK_TEX[i][0])
+    for ty in range(0, 40, 16):
+        for tx in range(0, 32, 16):
+            if blk is not None:
+                fill.paste(blk, (X0 + tx, Y0 + ty))
+            else:
+                ImageDraw.Draw(fill).rectangle((X0 + tx, Y0 + ty, X0 + tx + 15, Y0 + ty + 15), fill=_hex(RANKS[i][2]))
+    shade = PILImage.new("RGBA", (W, H), (0, 0, 0, 0))  # объём: к низу темнее
+    sd = ImageDraw.Draw(shade)
+    for y in range(38):
+        sd.line((0, Y0 + y, W, Y0 + y), fill=(0, 0, 0, int(110 * y / 37.0)))
+    fill.alpha_composite(shade)
+    base.paste(fill, (0, 0), mask)
+    px = base.load()
+    mp = mask.load()
+    inside = lambda x, y: 0 <= x < W and 0 <= y < H and mp[x, y]
+    edge = [(x, y) for y in range(H) for x in range(W) if mp[x, y] and not all(
+        inside(x + dx, y + dy) for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)))]
+    for x, y in edge:
+        px[x, y] = dark + (255,) if False else (dark[0], dark[1], dark[2], 255)
+    ring = [(x, y) for y in range(H) for x in range(W) if mp[x, y] and (x, y) not in set(edge) and not all(
+        inside(x + dx, y + dy) and (x + dx, y + dy) not in set(edge) for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)))]
+    es = set(edge)
+    ring = [(x, y) for y in range(H) for x in range(W) if mp[x, y] and (x, y) not in es and any(
+        (x + dx, y + dy) in es for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)))]
+    ring2 = set()
+    rs = set(ring)
+    for x, y in ring:
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            if inside(x + dx, y + dy) and (x + dx, y + dy) not in es and (x + dx, y + dy) not in rs:
+                ring2.add((x + dx, y + dy))
+    cx = X0 + 15.5
+    for x, y in ring + list(ring2):  # рамка: сверху-слева светлее, снизу-справа темнее
+        k = ((x - cx) / 16.0 + (y - Y0) / 38.0) / 2.0
+        c = _mixc(RANK_RIM[i], "#ffffff", max(0.0, -k) * 0.7) if k < 0 else _mixc(RANK_RIM[i], "#000000", k * 0.55)
+        if (x, y) in ring2:
+            c = _mixc(c, "#000000", 0.18) if i != 5 else _mixc("#f2b33d", "#000000", max(0.0, k) * 0.6)
+        px[x, y] = _hex(c)
+    if i >= 2:  # заклёпки на рамке
+        for qx, qy in ((X0 + 3, Y0 + 3), (X0 + 28, Y0 + 3), (X0 + 3, Y0 + 19), (X0 + 28, Y0 + 19)):
+            px[qx, qy] = (255, 255, 255, 255)
+            px[qx + 1, qy + 1] = _hex(_mixc(RANK_RIM[i], "#000000", 0.5))
+    it = tex.get(RANK_TEX[i][1])
+    if it is not None:
+        sh = PILImage.new("RGBA", it.size, (0, 0, 0, 0))
+        sh.putalpha(it.getchannel("A").point(lambda v: v * 150 // 255))
+        base.alpha_composite(sh, (X0 + 9, Y0 + 11))
+        base.alpha_composite(it, (X0 + 8, Y0 + 10))
+    S = 4
+    big = base.resize((W * S, H * S), PILImage.NEAREST)
+    if i >= 4:  # свечение и искры
+        glow_c = "#5fe8e2" if i == 4 else "#b46cff"
+        g = PILImage.new("RGBA", big.size, (0, 0, 0, 0))
+        g.paste(PILImage.new("RGBA", big.size, _hex(glow_c, 190)), (0, 0), mask.resize(big.size, PILImage.NEAREST))
+        g = g.filter(ImageFilter.GaussianBlur(10))
+        if i == 5:
+            g2 = PILImage.new("RGBA", big.size, (0, 0, 0, 0))
+            ImageDraw.Draw(g2).ellipse((W * S // 2 - 60, H * S - 70, W * S // 2 + 60, H * S + 20), fill=_hex("#ff8a2a", 120))
+            g.alpha_composite(g2.filter(ImageFilter.GaussianBlur(18)))
+        g.alpha_composite(big)
+        big = g
+        d = ImageDraw.Draw(big)
+        for sx, sy, r in ((6, 8, 2), (41, 6, 3), (44, 30, 2), (3, 28, 2)):
+            x, y = sx * S, sy * S
+            col = (255, 255, 255, 255)
+            d.rectangle((x - S // 2, y - r * S, x + S // 2, y + r * S), fill=col)
+            d.rectangle((x - r * S, y - S // 2, x + r * S, y + S // 2), fill=col)
+    return big
+
+
+def rank_emblem_pil(i, size, gray=False):
+    """Эмблема ранга size x size (по центру, с прозрачными краями). gray - ещё не открыт: серая и бледная.
+    Своя картинка в «Оформление/ranks/rank_N.png» главнее; иначе - щит из текстур игры (build_rank_emblem)."""
+    try:
+        p_ = os.path.join(ART, "ranks", "rank_%d.png" % (i + 1))
+        cache = os.path.join(ROOT, "_update", "ranks", "rank_%d_v1.png" % (i + 1))  # собранные из игры - в кэше
+        if os.path.isfile(p_):
+            im = PILImage.open(p_).convert("RGBA")
+        elif i in _RANK_EMB:
+            im = _RANK_EMB[i].copy()
+        elif os.path.isfile(cache):
+            _RANK_EMB[i] = PILImage.open(cache).convert("RGBA")
+            im = _RANK_EMB[i].copy()
+        else:
+            _RANK_EMB[i] = build_rank_emblem(i)
+            im = _RANK_EMB[i].copy()
+            if _MC_TEX and any(_MC_TEX.values()):  # из текстур игры - сохраняем; запасной рисунок - нет
+                try:
+                    os.makedirs(os.path.dirname(cache), exist_ok=True)
+                    _RANK_EMB[i].save(cache)
+                except OSError:
+                    pass
+        im.thumbnail((size, size), PILImage.LANCZOS)
+        out = PILImage.new("RGBA", (size, size), (0, 0, 0, 0))
+        out.alpha_composite(im, ((size - im.width) // 2, (size - im.height) // 2))
+    except Exception:  # картинки нет - простой щит цвета ранга
+        S = 4
+        out = PILImage.new("RGBA", (size * S, size * S), (0, 0, 0, 0))
+        d = ImageDraw.Draw(out)
+        w = size * S
+        pts = [(w * .12, w * .1), (w * .88, w * .1), (w * .88, w * .5), (w * .5, w * .92), (w * .12, w * .5)]
+        d.polygon(pts, fill=_hex(RANKS[i][2]), outline=_hex(_mixc(RANKS[i][2], "#000000", .55)), width=S * 3)
+        out = out.resize((size, size), PILImage.LANCZOS)
+    if gray:
+        a = out.getchannel("A").point(lambda v: v * 45 // 100)
+        out = out.convert("LA").convert("RGBA")
+        out.putalpha(a)
+    return out
+
+
+def mc_number_pil(text, px, color="#80ff20"):
+    """Число как уровень опыта в Minecraft: ярко-зелёное с тёмной обводкой."""
+    f = ui_font(px, True)
+    w, h = int(f.getlength(text)) + 8, int(px * 1.35) + 8
+    im = PILImage.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    for dx in (-2, 0, 2):
+        for dy in (-2, 0, 2):
+            if dx or dy:
+                d.text((4 + dx, 3 + dy), text, font=f, fill=(12, 20, 6, 255))
+    d.text((4, 3), text, font=f, fill=_hex(color))
+    return im
+
+
+def render_xp_bar(w, h, frac, segs=18):
+    """Полоса опыта как в Minecraft: тёмная рамка, зелёная заливка с бликом, насечки-деления."""
+    w, h = max(20, int(w)), max(8, int(h))
+    im = PILImage.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    d.rectangle((0, 0, w - 1, h - 1), fill=(10, 14, 8, 255))
+    d.rectangle((2, 2, w - 3, h - 3), fill=(34, 46, 26, 255))
+    fw = int((w - 4) * max(0.0, min(1.0, frac)))
+    if fw > 0:
+        top, mid, bot = _hex("#d8ff92"), _hex("#7fe030"), _hex("#3c9612")
+        ih = h - 4
+        for y in range(ih):
+            k = y / max(1, ih - 1)
+            c = tuple(int(top[j] + (mid[j] - top[j]) * k * 2) for j in range(3)) if k < .5 else \
+                tuple(int(mid[j] + (bot[j] - mid[j]) * (k - .5) * 2) for j in range(3))
+            d.line((2, 2 + y, 1 + fw, 2 + y), fill=c + (255,))
+        d.line((2, 2, 1 + fw, 2), fill=(240, 255, 210, 255))
+    for k in range(1, segs):
+        x = 2 + round((w - 4) * k / float(segs))
+        d.line((x, 2, x, h - 3), fill=(28, 84, 10, 255) if x < 2 + fw else (16, 22, 12, 255))
+    return im
+
+
+def fmt_space(n):
+    """1564 -> «1 564» (узкий пробел между тысячами)."""
+    return "{:,}".format(int(n)).replace(",", " ")
+
+
 def ago_text(ts):
     """Когда написано: «только что», «5 мин назад», «3 ч назад», «вчера в 17:11», «26.10 в 17:11»."""
     try:
@@ -8928,7 +9178,7 @@ def gui():
         if frame:  # нарисованная рамка: отступы - не меньше толщины камня
             try:
                 ins = frame_src(frame)[1]["inset"]
-                fr.configure(padx=max(int(str(fr.cget("padx"))), ins + 8), pady=max(int(str(fr.cget("pady"))), ins + 6))
+                fr.configure(padx=max(int(str(fr.cget("padx"))), ins + 12), pady=max(int(str(fr.cget("pady"))), ins + 8))
             except Exception:
                 frame = None
         st = {"border": border, "hover": False, "key": None, "seed": _isl_seed[0] % 9, "job": None, "lb": None}
@@ -9763,6 +10013,11 @@ def gui():
         toast_box["w"] = f
         win.update_idletasks()
         bottom = foot.winfo_height() + 14
+        try:  # над строкой запуска: раньше сообщение закрывало кнопку «Играть»
+            if launch_bar.winfo_ismapped():
+                bottom = win.winfo_rooty() + win.winfo_height() - launch_bar.winfo_rooty() + 12
+        except (NameError, tk.TclError):
+            pass
 
         def place(k):
             f.place(relx=1.0, rely=1.0, x=int(-20 + (1 - k) * 440), y=-bottom, anchor="se")
@@ -10075,6 +10330,18 @@ def gui():
         if im is None:
             try:
                 im = tk.PhotoImage(file=path)
+                if os.path.basename(path).lower() in ("cover.png", "icon.png"):
+                    pim = PILImage.open(path).convert("RGBA")
+                    hist = pim.getchannel("A").histogram()
+                    if sum(hist[:128]) > 0.4 * pim.width * pim.height:  # обложка - почти одна надпись: подкладываем плитку
+                        S = 3
+                        tile = PILImage.new("RGBA", (pim.width * S, pim.height * S), (0, 0, 0, 0))
+                        ImageDraw.Draw(tile).rounded_rectangle((0, 0, pim.width * S - 1, pim.height * S - 1), 12 * S,
+                                                               fill=_hex(_mixc(CARD, "#000000", 0.35)),
+                                                               outline=_hex(_mixc(LINE, "#ffffff", 0.08)), width=S)
+                        tile = tile.resize(pim.size, PILImage.LANCZOS)
+                        tile.alpha_composite(pim)
+                        im = ImageTk.PhotoImage(tile)
             except Exception:
                 im = tk.PhotoImage(width=120, height=120)
             if len(_img_cache) > 300:
@@ -10082,6 +10349,53 @@ def gui():
             _img_cache[key] = im
         images.append(im)
         return im
+
+    def unsqueeze(row, gap=8):
+        """Строка кнопок карточки (pack: слева и справа). Если всё в одну строку не влезает, левые элементы
+        (выбор сборки, «Изменить», «Удалить») уходят строкой выше - раньше Tk просто сжимал последнюю кнопку,
+        и от неё оставался обрезанный прямоугольник. Окно стало шире - возвращаются обратно."""
+        st = {"up": None, "lefts": []}
+
+        def width_of(ws):
+            tot = 0
+            for w in ws:
+                try:
+                    px = w.pack_info().get("padx", 0)
+                except tk.TclError:
+                    px = 0
+                px = sum(int(x) for x in px) if isinstance(px, (tuple, list)) else int(px or 0) * 2
+                tot += w.winfo_reqwidth() + px
+            return tot
+
+        def lay(e=None):
+            try:
+                W = row.winfo_width()
+                if W < 30:
+                    return
+                if st["up"] is None:
+                    slaves = row.pack_slaves()
+                    lefts = [w for w in slaves if w.pack_info().get("side") == "left"]
+                    if lefts and width_of(slaves) > W - 4:
+                        st["lefts"] = [(w, dict(w.pack_info())) for w in lefts]
+                        up = st["up"] = tk.Frame(row, bg=row.cget("bg"))
+                        up.pack(side="top", fill="x", pady=(0, gap), before=slaves[0])
+                        for w, info in st["lefts"]:
+                            w.pack_forget()
+                            w.pack(in_=up, side="left", padx=info.get("padx", 0))
+                            w.lift(up)  # up создан позже - без этого он закрывает перенесённые кнопки
+                else:
+                    if width_of(row.pack_slaves()[1:]) + width_of([w for w, _i in st["lefts"]]) <= W - 4:
+                        for w, info in st["lefts"]:
+                            w.pack_forget()
+                            info.pop("in", None)
+                            w.pack(in_=row, **{k: v for k, v in info.items() if k in ("side", "padx", "pady", "fill",
+                                                                                         "anchor")})
+                        st["up"].destroy()
+                        st["up"] = None
+            except tk.TclError:
+                pass
+        row.bind("<Configure>", lay, add="+")
+        return row
 
     def card(parent, col, row):
         c = tk.Frame(parent, bg=CARD, padx=16, pady=16)
@@ -11205,6 +11519,7 @@ def gui():
                         recycle(m["path"])
                         show("maps", animated=False)
                 small_button(row, "Убрать", drop_map, bg=CARD, icon="ic_delete.png").pack(side="right")
+            unsqueeze(row)
             clickable(c, lambda m=m: open_map(m))
 
     # --- скриншоты карт: полоса превью и просмотр крупно ---
@@ -11711,6 +12026,7 @@ def gui():
                     small_button(row, "Обновить моды", lambda p=p: update_mods_now(p), bg=CARD,
                                  icon="ic_wrench.png").pack(side="left", padx=4)
                 small_button(row, "Удалить", drop, bg=CARD, icon="ic_delete.png").pack(side="left", padx=4)
+            unsqueeze(row)
             clickable(c, lambda p=p: open_pack(p))
 
     # --- вкладка «Серверы» ---
@@ -12220,10 +12536,13 @@ def gui():
             else:
                 big_button(row, "Скачать с сайта", site, color=CARD_HI, hover=LINE, icon="ic_globe.png").pack(side="right")
             small_button(row, "Сайт", site, bg=CARD, icon="ic_globe.png").pack(side="right", padx=4)
-            if x["id"] != mine:
-                small_button(row, "Сделать моим", make_mine, bg=CARD, icon="ic_check.png").pack(side="left")
-            if need_path:
-                small_button(row, "Указать путь...", set_path, bg=CARD, icon="ic_settings.png").pack(side="left", padx=4)
+            if x["id"] != mine or need_path:  # своя строка над кнопками: в узком окне три кнопки в ряд не влезали
+                row2 = tk.Frame(c, bg=CARD)
+                row2.pack(fill="x", side="bottom", pady=(8, 0), after=row)  # после row в порядке - значит выше неё
+                if x["id"] != mine:
+                    small_button(row2, "Сделать моим", make_mine, bg=CARD, icon="ic_check.png").pack(side="left")
+                if need_path:
+                    small_button(row2, "Указать путь...", set_path, bg=CARD, icon="ic_settings.png").pack(side="left", padx=4)
 
     # --- картинки из сети и превью скинов: грузятся в фоне, окно не ждёт ---
     pic_cache = {}       # ключ -> PIL-картинка (None - не удалось)
@@ -12378,6 +12697,8 @@ def gui():
 
     def plural(n, one, few, many):
         n = abs(int(n))
+        if LANG != "ru":  # «21 мод» по-русски - единственное число, а по-английски нужно «21 mods»
+            return one if n == 1 else many
         if n % 10 == 1 and n % 100 != 11:
             return one
         if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
@@ -12494,8 +12815,10 @@ def gui():
                                                     "Версия игры", custom="Или впиши свою"), "break")[1])
         tk.Label(r1, text="Загрузчик:", font=(FONT, 10, "bold"), fg=TEXT, bg=PANEL).pack(side="left", padx=(0, 8))
         chip_row(r1, [(k, v) for k, v in LOADER_TITLES.items()], cb["loader"], lambda v: builder_set(loader=v), PANEL)
-        tk.Label(r1, text="   Что ищем:", font=(FONT, 10, "bold"), fg=TEXT, bg=PANEL).pack(side="left", padx=(0, 8))
-        chip_row(r1, MR_TYPES, cb["ptype"], lambda v: builder_set(ptype=v, cat=None), PANEL)
+        r1b = tk.Frame(opt, bg=PANEL)  # своя строка: в узком окне «Текстуры» уезжали за рамку
+        r1b.pack(fill="x", pady=(10, 0))
+        tk.Label(r1b, text="Что ищем:", font=(FONT, 10, "bold"), fg=TEXT, bg=PANEL).pack(side="left", padx=(0, 8))
+        chip_row(r1b, MR_TYPES, cb["ptype"], lambda v: builder_set(ptype=v, cat=None), PANEL)
         _ = gvar
         if cf_key():
             r0 = tk.Frame(opt, bg=PANEL)
@@ -13714,7 +14037,13 @@ def gui():
         want_pic("prof:%s:%s:%d:%s:%s" % (p.get("avatar"), ring, len(p.get("avatar") or ""), p.get("frame"), p.get("login")),
                  lambda: avatar_pil(p.get("avatar"), 112, p.get("login", ""), ring, p.get("frame")), avl, t._imgs)
         for dx, dy, col in ((2, 2, "#000000"), (0, 0, "white")):
-            hc.create_text(156 + dx, 92 + dy, text=p.get("nick", "?"), font=(FONT, 22, "bold"), fill=col, anchor="w")
+            nick_id = hc.create_text(156 + dx, 92 + dy, text=p.get("nick", "?"), font=(FONT, 22, "bold"), fill=col, anchor="w")
+        try:  # плашка ранга: эмблема, уровень и название ранга его цветом
+            lv_ = profile_level(p)[0]
+            chip_ = rank_chip_pil(lv_)
+            hc.create_image(hc.bbox(nick_id)[2] + 14, 92, image=pil_photo(chip_, t._imgs), anchor="w")
+        except Exception:
+            pass
         st = ("● " + {"dnd": "не беспокоить", "invisible": "невидимка (для всех «не в сети»)"}.get(p.get("presence"), "в сети")
               if mine else "● " + status_text(p))
         hc.create_text(158, 140, text="@%s   %s" % (p.get("login", ""), st), font=(FONT, 10), fill=MUTED, anchor="w")
@@ -14041,9 +14370,6 @@ def gui():
         else:
             state["stats_merged_once"] = True
 
-    PROFILE_RANKS = ((12, "Легенда Portalis"), (8, "Мастер карт"), (5, "Опытный игрок"), (3, "Исследователь"),
-                     (1, "Новичок"))
-
     def icon_disc(ic, col, size=42, bg=CARD):
         """Значок в кружке цвета col (подложка полупрозрачная - на фоне bg)."""
         key = ("disc", ic, col, size, bg)
@@ -14097,45 +14423,147 @@ def gui():
                 small_button(hd, link[0], link[1], bg=bg).pack(side="right")
         return cd
 
-    def profile_overview(t, body, p, go):
-        """«Обзор»: карточка уровня с кольцом опыта, плитки статистики, «О себе» и любимые игры, медали,
-        последние карты; справа - скин в 3D на подставке (если игрок указал ник скина)."""
+    def profile_level(p):
+        """Уровень игрока: (уровень, опыт уровня, нужно до следующего, весь опыт, статистика)."""
         s_ = p.get("stats") or {}
         if p.get("id") == soc().uid:
             s_ = merge_stats(s_, {k: v for k, v in my_stats().items() if k != "uid"})
         xp = stats_xp(s_)
         lv, cur, need = level_of(xp)
-        color = p.get("color") or ACCENT
-        got = earned(s_)
-        # уровень
-        top = pcard(body)
-        top.pack(fill="x")
-        tk.Label(top, bg=CARD, image=pil_photo(render_level_ring(lv, cur / max(1, need), color, 96, CARD,
-                                                                 _mixc(LINE, CARD, 0.15), TEXT, tr("УРОВЕНЬ")), t._imgs)
-                 ).pack(side="left")
-        aw = tk.Frame(top, bg=CARD, cursor="hand2")
-        aw.pack(side="right", padx=(24, 6))
-        al = tk.Label(aw, image=icon_disc("ic_crown.png", GOLD, 50), bg=CARD, cursor="hand2")
-        al.pack()
-        an = tk.Label(aw, text="%d / %d" % (len(got), len(ACHIEVEMENTS)), font=(FONT, 13, "bold"), fg=GOLD, bg=CARD,
-                      cursor="hand2")
-        an.pack(pady=(4, 0))
-        ac = tk.Label(aw, text="достижений", font=(FONT, 9), fg=MUTED, bg=CARD, cursor="hand2")
-        ac.pack()
-        for w_ in (aw, al, an, ac):
-            w_.bind("<Button-1>", lambda e: go("ach"))
-        mid = tk.Frame(top, bg=CARD)
-        mid.pack(side="left", fill="x", expand=True, padx=(20, 0))
-        tk.Label(mid, text=next(n for m, n in PROFILE_RANKS if lv >= m), font=(FONT, 17, "bold"), fg=TEXT, bg=CARD,
-                 anchor="w").pack(fill="x")
-        tk.Label(mid, text="%d опыта за всё время" % xp, font=(FONT, 9), fg=MUTED, bg=CARD, anchor="w").pack(
-            fill="x", pady=(0, 10))
-        bar = RoundBar(mid, 10)
+        return lv, cur, need, xp, s_
+
+    def rank_chip_pil(lv):
+        """Плашка «эмблема · Ур. N · ранг» на полупрозрачной подложке - для шапки профиля поверх картинки."""
+        ri = rank_of(lv)
+        px = int(round(12 * PT))
+        S = 2
+        em = rank_emblem_pil(ri, 40)
+        t1, t2 = "%s %d" % (tr("Ур."), lv), tr(RANKS[ri][1])
+        f1, f2 = ui_font(px * S, True), ui_font(px * S, True)
+        w1, w2 = f1.getlength(t1) / S, f2.getlength(t2) / S
+        W, H = int(8 + 40 + 8 + w1 + 14 + w2 + 16), 46
+        im = PILImage.new("RGBA", (W * S, H * S), (0, 0, 0, 0))
+        d = ImageDraw.Draw(im)
+        d.rounded_rectangle((0, 0, W * S - 1, H * S - 1), 23 * S, fill=(12, 14, 18, 175),
+                            outline=_hex(_mixc(RANKS[ri][2], "#000000", 0.35), 220), width=2 * S)
+        x = (8 + 40 + 8) * S
+        d.text((x, H * S // 2), t1, font=f1, fill=(128, 255, 32, 255), anchor="lm")
+        x += int((w1 + 14) * S)
+        d.text((x, H * S // 2), t2, font=f2, fill=_hex(RANKS[ri][2]), anchor="lm")
+        im = im.resize((W, H), PILImage.LANCZOS)
+        im.alpha_composite(em, (8, 3))
+        return im
+
+    def level_card(t, parent, p, lv, cur, need, xp):
+        """Карточка уровня: эмблема ранга с номером уровня по-майнкрафтовски, название ранга его цветом,
+        полоса опыта как в игре и ближайшая награда (рамка аватара или следующий ранг)."""
+        ri = rank_of(lv)
+        rcol = RANKS[ri][2]
+        card_ = pcard(parent, padx=22, pady=18)
+        card_.pack(fill="x")
+        em = rank_emblem_pil(ri, 120)
+        num = mc_number_pil(str(lv), 30)
+        comp = PILImage.new("RGBA", (128, 136), _hex(CARD))
+        glow = PILImage.new("RGBA", comp.size, (0, 0, 0, 0))  # мягкое свечение цвета ранга за эмблемой
+        ImageDraw.Draw(glow).ellipse((14, 14, 114, 114), fill=_hex(rcol, 70))
+        comp.alpha_composite(glow.filter(ImageFilter.GaussianBlur(14)))
+        comp.alpha_composite(em, (4, 0))
+        comp.alpha_composite(num, ((128 - num.width) // 2, 136 - num.height))
+        tk.Label(card_, image=pil_photo(comp, t._imgs), bg=CARD).pack(side="left")
+        nx = next_reward(lv)
+        if nx:
+            rw = tk.Frame(card_, bg=CARD_HI, padx=14, pady=12)
+            island(rw, vines=False, radius=12)
+            rw.pack(side="right", padx=(18, 0))
+            tk.Label(rw, text="Следующая награда", font=(FONT, 9, "bold"), fg=MUTED, bg=CARD_HI).pack(anchor="w")
+            row_ = tk.Frame(rw, bg=CARD_HI)
+            row_.pack(anchor="w", pady=(8, 0))
+            if nx[1] == "frame":
+                im_ = avatar_pil(p.get("avatar"), 56, p.get("login", ""), None, nx[2])
+                what = "Рамка «%s»" % nx[3]
+            else:
+                im_ = rank_emblem_pil(nx[2], 56)
+                what = "Ранг «%s»" % nx[3]
+            tk.Label(row_, image=pil_photo(im_, t._imgs), bg=CARD_HI).pack(side="left")
+            tx_ = tk.Frame(row_, bg=CARD_HI)
+            tx_.pack(side="left", padx=(10, 0))
+            tk.Label(tx_, text=what, font=(FONT, 11, "bold"), fg=TEXT, bg=CARD_HI, anchor="w").pack(anchor="w")
+            tk.Label(tx_, text="на %d уровне" % nx[0], font=(FONT, 9), fg=GOLD, bg=CARD_HI, anchor="w").pack(anchor="w")
+        mid = tk.Frame(card_, bg=CARD)
+        mid.pack(side="left", fill="x", expand=True, padx=(18, 0))
+        tk.Label(mid, text=RANKS[ri][1], font=(FONT, 20, "bold"), fg=rcol, bg=CARD, anchor="w").pack(fill="x")
+        tk.Label(mid, text="Уровень %d  ·  %s опыта за всё время" % (lv, fmt_space(xp)), font=(FONT, 10), fg="#c3c7d1",
+                 bg=CARD, anchor="w").pack(fill="x", pady=(0, 12))
+        bar = tk.Label(mid, bg=CARD, bd=0)
         bar.pack(fill="x")
-        fill_ = bar.create_rectangle(0, 0, 0, 10, fill=color)
-        bar.bind("<Configure>", lambda e: bar.coords(fill_, 0, 0, int(e.width * cur / max(1, need)), 10), add="+")
-        tk.Label(mid, text="%d / %d  ·  ещё %d опыта до %d уровня" % (cur, need, need - cur, lv + 1), font=(FONT, 9),
-                 fg="#c3c7d1", bg=CARD, anchor="w").pack(fill="x", pady=(7, 0))
+        bar._bw = 0
+
+        def draw_bar(e=None):
+            w_ = bar.winfo_width()
+            if w_ < 40 or abs(w_ - bar._bw) < 3:
+                return
+            bar._bw = w_
+            bar._ph = ImageTk.PhotoImage(render_xp_bar(w_, 16, cur / float(max(1, need))))
+            bar.configure(image=bar._ph)
+        bar.bind("<Configure>", draw_bar, add="+")
+        bar.configure(image=pil_photo(render_xp_bar(360, 16, cur / float(max(1, need))), t._imgs))
+        tk.Label(mid, text="%s / %s  ·  ещё %s опыта до %d уровня" % (fmt_space(cur), fmt_space(need), fmt_space(need - cur),
+                                                                      lv + 1), font=(FONT, 9), fg=MUTED, bg=CARD,
+                 anchor="w").pack(fill="x", pady=(8, 0))
+
+    def rank_ladder(t, parent, lv):
+        """Путь рангов: пройденные - в цвете, текущий - крупнее с подписью «ты здесь», впереди - серые с уровнем."""
+        ri = rank_of(lv)
+        lc = pcard(parent, "Путь к легенде", "ic_crown.png", padx=18, pady=14)
+        lc.pack(fill="x", pady=(12, 0))
+        row_ = tk.Frame(lc, bg=CARD)
+        row_.pack(fill="x")
+        for i, (m_, title, col) in enumerate(RANKS):
+            row_.grid_columnconfigure(i, weight=1, uniform="rk")
+            cell = tk.Frame(row_, bg=CARD)
+            cell.grid(row=0, column=i, sticky="n")
+            size = 78 if i == ri else 58
+            im_ = rank_emblem_pil(i, size, gray=i > ri)
+            if i == ri:  # текущий - подсветка цветом ранга
+                halo = PILImage.new("RGBA", (size + 20, size + 20), _hex(CARD))
+                g_ = PILImage.new("RGBA", halo.size, (0, 0, 0, 0))
+                ImageDraw.Draw(g_).ellipse((8, 8, size + 12, size + 12), fill=_hex(col, 90))
+                halo.alpha_composite(g_.filter(ImageFilter.GaussianBlur(9)))
+                halo.alpha_composite(im_, (10, 10))
+                im_ = halo
+            else:
+                pad_ = PILImage.new("RGBA", (98, 98 - (78 - size) // 2), _hex(CARD))
+                pad_.alpha_composite(im_, ((98 - size) // 2, pad_.height - size))
+                im_ = pad_
+            tk.Label(cell, image=pil_photo(im_, t._imgs), bg=CARD).pack()
+            tk.Label(cell, text=title, font=(FONT, 9, "bold" if i == ri else "normal"),
+                     fg=col if i <= ri else MUTED, bg=CARD).pack()
+            tk.Label(cell, text="ты здесь" if i == ri else ("с %d уровня" % m_ if i > ri else "пройден"),
+                     font=(FONT, 8, "bold" if i == ri else "normal"), fg=ACCENT_HI if i == ri else "#7d828e",
+                     bg=CARD).pack()
+
+    def xp_sources_card(parent):
+        sc = pcard(parent, "Как копится опыт", "ic_bolt.png")
+        sc.pack(fill="x", pady=(0, 12))
+        g_ = tk.Frame(sc, bg=CARD)
+        g_.pack(fill="x")
+        for i, (ic, what, n) in enumerate(XP_SOURCES):
+            g_.grid_columnconfigure(i % 3, weight=1, uniform="xs")
+            cell = tk.Frame(g_, bg=CARD)
+            cell.grid(row=i // 3, column=i % 3, sticky="w", pady=(0, 10))
+            tk.Label(cell, image=icon_disc(ic, ACCENT, 34), bg=CARD).pack(side="left")
+            tx_ = tk.Frame(cell, bg=CARD)
+            tx_.pack(side="left", padx=(8, 0))
+            tk.Label(tx_, text="+%d" % n, font=(FONT, 11, "bold"), fg="#80ff20", bg=CARD, anchor="w").pack(anchor="w")
+            tk.Label(tx_, text=what, font=(FONT, 9), fg=MUTED, bg=CARD, anchor="w").pack(anchor="w")
+
+    def profile_overview(t, body, p, go):
+        """«Обзор»: карточка уровня с кольцом опыта, плитки статистики, «О себе» и любимые игры, медали,
+        последние карты; справа - скин в 3D на подставке (если игрок указал ник скина)."""
+        lv, cur, need, xp, s_ = profile_level(p)
+        got = earned(s_)
+        level_card(t, body, p, lv, cur, need, xp)
+        rank_ladder(t, body, lv)
         # плитки статистики
         tiles = tk.Frame(body, bg=BG)
         tiles.pack(fill="x", pady=(12, 0))
@@ -14221,6 +14649,8 @@ def gui():
         else:
             tk.Label(md, text="Пока ни одной медали. Сыграй первую карту - и она появится здесь.", font=(FONT, 10),
                      fg=MUTED, bg=CARD, anchor="w", justify="left", wraplength=600).pack(fill="x")
+        if p.get("id") == soc().uid:
+            xp_sources_card(left)
         if s_.get("maps"):
             mc = pcard(left, "Последние карты", "ic_compass.png")
             mc.pack(fill="x", pady=(0, 12))
@@ -14262,49 +14692,88 @@ def gui():
                  anchor="w").pack(fill="x", pady=(4, 0))
 
     def ach_block(t, body, p, s_, got):
-        dsection(body, "Достижения  %d из %d" % (len(got), len(ACHIEVEMENTS)))
+        """Достижения карточками: медаль, название, условие и прогресс (3 / 5) или «получено»; сверху - сколько
+        всего получено, внизу - сезонное задание."""
+        lv = level_of(stats_xp(s_))[0]
+        hd = pcard(body, padx=20, pady=16)
+        hd.pack(fill="x")
+        tk.Label(hd, image=icon_disc("ic_crown.png", GOLD, 50), bg=CARD).pack(side="left")
+        hx = tk.Frame(hd, bg=CARD)
+        hx.pack(side="left", fill="x", expand=True, padx=(16, 0))
+        tk.Label(hx, text="Получено %d из %d" % (len(got), len(ACHIEVEMENTS)), font=(FONT, 16, "bold"), fg=TEXT, bg=CARD,
+                 anchor="w").pack(fill="x")
+        tk.Label(hx, text="Медали открываются сами, пока ты играешь: карты, сборки, друзья и пати.", font=(FONT, 9),
+                 fg=MUTED, bg=CARD, anchor="w").pack(fill="x", pady=(0, 8))
+        bar = tk.Label(hx, bg=CARD, bd=0, image=pil_photo(render_xp_bar(420, 12, len(got) / float(len(ACHIEVEMENTS)),
+                                                                         len(ACHIEVEMENTS)), t._imgs))
+        bar.pack(anchor="w")
         grid = tk.Frame(body, bg=BG)
-        grid.pack(fill="x")
-        hint = tk.Label(body, text="Наведи на медаль, чтобы узнать, за что она.", font=(FONT, 9), fg=MUTED, bg=BG, anchor="w")
-        for i, (n, title, cond, _f) in enumerate(ACHIEVEMENTS):
-            cell = tk.Frame(grid, bg=BG)
-            cell.grid(row=i // 6, column=i % 6, padx=(0, 14), pady=(0, 8))
-            path = os.path.join(ART, "achievements", "ach_%02d.png" % n)
+        grid.pack(fill="x", pady=(12, 0))
+        for c_ in range(3):
+            grid.grid_columnconfigure(c_, weight=1, uniform="ach")
+        order = sorted(ACHIEVEMENTS, key=lambda a: (a[0] not in got, a[0]))  # полученные - первыми
+        for i, (n, title, cond, _f) in enumerate(order):
+            ok = n in got
+            cell = tk.Frame(grid, bg=CARD if ok else PANEL, padx=12, pady=12)
+            island(cell, vines=False, radius=12, border=_mixc(GOLD, CARD, 0.35) if ok else None)
+            cell.grid(row=i // 3, column=i % 3, sticky="nsew", padx=(0 if i % 3 == 0 else 10, 0), pady=(0, 10))
+            bg_ = cell.cget("bg")
             try:
-                im = PILImage.open(path).convert("RGBA").resize((52, 52), PILImage.LANCZOS)
-                if n not in got:
+                im = PILImage.open(os.path.join(ART, "achievements", "ach_%02d.png" % n)).convert("RGBA").resize(
+                    (52, 52), PILImage.LANCZOS)
+                if not ok:
                     g = im.convert("LA").convert("RGBA")
-                    g.putalpha(im.getchannel("A").point(lambda v: v * 45 // 100))
+                    g.putalpha(im.getchannel("A").point(lambda v: v * 40 // 100))
                     im = g
-                lb = tk.Label(cell, image=pil_photo(im, t._imgs), bg=BG)
+                tk.Label(cell, image=pil_photo(im, t._imgs), bg=bg_).pack(side="left", anchor="n")
             except Exception:
-                lb = tk.Label(cell, text="?", bg=BG, fg=MUTED)
-            lb.pack()
-            tk.Label(cell, text=title, font=(FONT, 8, "bold" if n in got else "normal"), fg=TEXT if n in got else MUTED,
-                     bg=BG).pack()
-            for w_ in (cell, lb):
-                w_.bind("<Enter>", lambda e, title=title, cond=cond, ok=n in got: hint.configure(
-                    text="%s: %s%s" % (title, cond, "  ✓ получено" if ok else ""), fg=ACCENT_HI if ok else GOLD))
-        hint.pack(fill="x")
+                pass
+            tx = tk.Frame(cell, bg=bg_)
+            tx.pack(side="left", fill="x", expand=True, padx=(10, 0))
+            tk.Label(tx, text=title, font=(FONT, 11, "bold"), fg=TEXT if ok else "#c3c7d1", bg=bg_, anchor="w").pack(fill="x")
+            tk.Label(tx, text=cond, font=(FONT, 9), fg=MUTED, bg=bg_, anchor="w", justify="left",
+                     wraplength=200).pack(fill="x")
+            key, goal = ACH_PROGRESS.get(n, (None, 1))
+            have = lv if key == "level" else (1 if key == "night" and s_.get("night") else int(s_.get(key, 0) or 0))
+            if key == "minutes":
+                have, goal = have // 60, goal // 60
+            if ok:
+                tk.Label(tx, text="✓ получено", font=(FONT, 9, "bold"), fg=ACCENT_HI, bg=bg_, anchor="w").pack(
+                    fill="x", pady=(6, 0))
+            else:
+                pr = tk.Frame(tx, bg=bg_)
+                pr.pack(fill="x", pady=(6, 0))
+                tk.Label(pr, bg=bg_, bd=0, image=pil_photo(render_xp_bar(120, 8, min(1.0, have / float(max(1, goal))),
+                                                                         max(1, min(goal, 10))), t._imgs)).pack(side="left")
+                tk.Label(pr, text="  %d / %d%s" % (min(have, goal), goal, " ч" if key == "minutes" else ""),
+                         font=(FONT, 9, "bold"), fg="#c3c7d1", bg=bg_).pack(side="left")
         sea = current_season()
         if sea:
             done_ = int((s_.get("season") or {}).get(sea["key"], 0))
-            dsection(body, "Сезон «%s»" % sea["title"])
-            srow = tk.Frame(body, bg=BG)
+            sc = pcard(body, "Сезон «%s»" % sea["title"], "ic_hourglass.png", padx=20, pady=16)
+            sc.pack(fill="x", pady=(4, 0))
+            srow = tk.Frame(sc, bg=CARD)
             srow.pack(fill="x")
             try:
-                fim = PILImage.open(os.path.join(ART, "frames", "frame_06.png")).convert("RGBA").resize((44, 44), PILImage.LANCZOS)
+                fim = avatar_pil(p.get("avatar"), 64, p.get("login", ""), None, 6)
                 if done_ < sea["goal"]:
                     g_ = fim.convert("LA").convert("RGBA")
                     g_.putalpha(fim.getchannel("A").point(lambda v: v * 50 // 100))
                     fim = g_
-                tk.Label(srow, image=pil_photo(fim, t._imgs), bg=BG).pack(side="left")
+                tk.Label(srow, image=pil_photo(fim, t._imgs), bg=CARD).pack(side="left")
             except Exception:
                 pass
-            tk.Label(srow, text="  Сыграй %d разных карт до %s - приз: %s.   Готово: %d из %d%s" % (
-                sea["goal"], ".".join(reversed(sea["to"].split("-")[1:])), sea["prize"], min(done_, sea["goal"]), sea["goal"],
-                "  ✓" if done_ >= sea["goal"] else ""), font=(FONT, 10), fg=ACCENT_HI if done_ >= sea["goal"] else TEXT,
-                bg=BG, anchor="w").pack(side="left")
+            sx = tk.Frame(srow, bg=CARD)
+            sx.pack(side="left", fill="x", expand=True, padx=(14, 0))
+            tk.Label(sx, text="Сыграй %d разных карт до %s" % (sea["goal"], ".".join(reversed(sea["to"].split("-")[1:]))),
+                     font=(FONT, 11, "bold"), fg=TEXT, bg=CARD, anchor="w").pack(fill="x")
+            tk.Label(sx, text="Приз: %s" % sea["prize"], font=(FONT, 9), fg=GOLD, bg=CARD, anchor="w").pack(fill="x")
+            pr = tk.Frame(sx, bg=CARD)
+            pr.pack(fill="x", pady=(6, 0))
+            tk.Label(pr, bg=CARD, bd=0, image=pil_photo(render_xp_bar(220, 10, min(1.0, done_ / float(sea["goal"])),
+                                                                      sea["goal"]), t._imgs)).pack(side="left")
+            tk.Label(pr, text="  %d / %d%s" % (min(done_, sea["goal"]), sea["goal"], "  ✓" if done_ >= sea["goal"] else ""),
+                     font=(FONT, 9, "bold"), fg=ACCENT_HI if done_ >= sea["goal"] else "#c3c7d1", bg=CARD).pack(side="left")
 
     def tail_block(t, body, p, s_, parts):
         if s_.get("maps") and "maps" in parts:
@@ -17517,13 +17986,18 @@ def gui():
         lk = tk.Frame(inner, bg=PANEL, padx=14, pady=12)
         island(lk)
         lk.grid(row=row, column=0, columnspan=2, sticky="we", padx=(0, 14), pady=(0, 12))
-        tk.Label(lk, text="Скин по нику:", font=(FONT, 11, "bold"), fg=TEXT, bg=PANEL).pack(side="left")
-        ne = REntry(lk, font=(FONT, 11), bg=CARD_HI, fg=TEXT, insertbackground=TEXT, relief="flat", width=22)
+        # две строки: поиск по нику и кнопки действий (кнопки переносятся - в узком окне раньше одна сжималась в полоску)
+        r1 = tk.Frame(lk, bg=PANEL)
+        r1.pack(fill="x")
+        tk.Label(r1, text="Скин по нику:", font=(FONT, 11, "bold"), fg=TEXT, bg=PANEL).pack(side="left")
+        ne = REntry(r1, font=(FONT, 11), bg=CARD_HI, fg=TEXT, insertbackground=TEXT, relief="flat", width=22)
         ne.insert(0, sk["nick"])
         ne.pack(side="left", padx=10, ipady=4)
         ne.bind("<Return>", lambda e: skins_lookup(ne.get()))
-        big_button(lk, "Найти", lambda: skins_lookup(ne.get()), icon="ic_search.png").pack(side="left")
-        small_button(lk, "Загрузить скин", lambda: import_skin(), bg=PANEL, icon="ic_add.png").pack(side="right")
+        big_button(r1, "Найти", lambda: skins_lookup(ne.get()), icon="ic_search.png").pack(side="left")
+        lk_ = lk
+        lk = tk.Frame(lk_, bg=PANEL)
+        lk.pack(fill="x", pady=(10, 0))
 
         def up_cape():
             f = filedialog.askopenfilename(parent=win, title="Плащ Minecraft (PNG 64x32)", filetypes=[("Картинка PNG", "*.png")])
@@ -17536,14 +18010,16 @@ def gui():
                 return
             toast("Плащ добавлен: %s" % fn[:-4], "ok")
             show("skins", animated=False)
-        small_button(lk, "Загрузить плащ", up_cape, bg=PANEL, icon="ic_cape.png").pack(side="right", padx=4)
-        small_button(lk, "Скрыть мастерскую" if state.get("cape_open") else "Сделать плащ", lambda: (
-            state.update(cape_open=not state.get("cape_open")), show("skins", animated=False)), bg=PANEL,
-            icon="ic_palette.png").pack(side="right", padx=4)
         if skin_maker is not None:
             small_button(lk, "Скрыть мастерскую скинов" if state.get("skinws_open") else "Сделать скин", lambda: (
                 state.update(skinws_open=not state.get("skinws_open")), show("skins", animated=False)), bg=PANEL,
-                icon="ic_add.png").pack(side="right", padx=4)
+                icon="ic_add.png")
+        small_button(lk, "Скрыть мастерскую" if state.get("cape_open") else "Сделать плащ", lambda: (
+            state.update(cape_open=not state.get("cape_open")), show("skins", animated=False)), bg=PANEL,
+            icon="ic_palette.png")
+        small_button(lk, "Загрузить скин", lambda: import_skin(), bg=PANEL, icon="ic_add.png")
+        small_button(lk, "Загрузить плащ", up_cape, bg=PANEL, icon="ic_cape.png")
+        flow_layout(lk, (8, 8))
         row += 1
         if state.get("skinws_open"):
             skin_workshop(row)
@@ -17644,7 +18120,8 @@ def gui():
             grid.grid(row=row, column=0, columnspan=2, sticky="we", pady=(0, 12))
             for i, d in enumerate(sk["defaults"]):
                 cell = tk.Frame(grid, bg=CARD, padx=6, pady=6, cursor="hand2")
-                cell.grid(row=i // 7, column=i % 7, padx=(0, 8), pady=(0, 8))
+                dc = max(5, min(12, (max(canvas.winfo_width(), 700) - 40) // 124))
+                cell.grid(row=i // dc, column=i % dc, padx=(0, 8), pady=(0, 8))
                 lb = tk.Label(cell, bg=CARD, image=blank(104, 96))
                 lb.pack()
                 want_pic("def:%s:%s" % (d["name"], d["slim"]), skin_photo_producer(d["skin"], d["slim"], 3), lb)
@@ -17698,12 +18175,15 @@ def gui():
     def gallery_cells(start):
         sk = skins_state()
         grid = state["gal_grid"]
+        if not start or not state.get("gal_cols"):  # столбцов - сколько влезает (раньше всегда 7: в широком окне пусто справа)
+            state["gal_cols"] = max(5, min(12, (max(canvas.winfo_width(), 700) - 40) // 124))
+        cols = state["gal_cols"]
         old = state.get("gal_more")
         if old is not None and old.winfo_exists():
             old.destroy()
         for i, g in enumerate(sk["gallery"][start:], start):
             cell = tk.Frame(grid, bg=CARD, padx=6, pady=6, cursor="hand2")
-            cell.grid(row=i // 7, column=i % 7, padx=(0, 8), pady=(0, 8))
+            cell.grid(row=i // cols, column=i % cols, padx=(0, 8), pady=(0, 8))
             lb = tk.Label(cell, bg=CARD, image=blank(104, 96))
             lb.pack()
             want_pic("gal:" + g["texture"], lambda g=g: render_skin(texture_png(g["texture"]), None, 3), lb)
